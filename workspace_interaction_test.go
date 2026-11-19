@@ -6,12 +6,15 @@ import (
 	"image"
 	"image/color"
 	"image/draw"
+	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/dongyu-will/folio/internal/notebook"
+	"github.com/egoist/mygo"
 	"github.com/egoist/mygo/ui"
 )
 
@@ -1418,5 +1421,193 @@ func TestSettingsAboutCompactAndHelpers(t *testing.T) {
 	}
 	if !slices.Contains(tester.OpenedURLs(), folioRepoURL) {
 		t.Fatalf("compact settings did not open repo URL: %v", tester.OpenedURLs())
+	}
+}
+
+func TestAppearanceThemeAndRootBackgroundMatchesShell(t *testing.T) {
+	if got := windowBackgroundForAppearance("light"); got != "#f5f5f7" {
+		t.Fatalf("light background = %q, want #f5f5f7", got)
+	}
+	if got := windowBackgroundForAppearance("dark"); got != "#0e0f12" {
+		t.Fatalf("dark background = %q, want #0e0f12", got)
+	}
+	if got := windowBackgroundForAppearance(""); got != "light-dark(#f5f5f7, #0e0f12)" {
+		t.Fatalf("system background = %q, want light-dark(#f5f5f7, #0e0f12)", got)
+	}
+	if got := themeSourceForAppearance("light"); got != mygo.ThemeLight {
+		t.Fatalf("light source = %q, want %q", got, mygo.ThemeLight)
+	}
+	if got := themeSourceForAppearance("dark"); got != mygo.ThemeDark {
+		t.Fatalf("dark source = %q, want %q", got, mygo.ThemeDark)
+	}
+	if got := themeSourceForAppearance(""); got != mygo.ThemeSystem {
+		t.Fatalf("system source = %q, want %q", got, mygo.ThemeSystem)
+	}
+
+	app := &workspace{store: notebook.NewStore(t.TempDir())}
+	tester := ui.NewTester(app.view, 400, 800)
+	// Safe-area insets expose the root element's background along top and bottom bars.
+	tester.SetInsets(40, 0, 28, 0)
+
+	wantRGBA := func(c ui.Color) color.RGBA {
+		return color.RGBA{R: c.R, G: c.G, B: c.B, A: c.A}
+	}
+
+	// System appearance (light in default tester) must still match light.shell, not #ffffff.
+	app.settings.Appearance = ""
+	tester.Frame()
+	if got := tester.Image().RGBAAt(16, 12); got != wantRGBA(light.shell) {
+		t.Fatalf("system top safe-area pixel = %v, want light.shell %v", got, wantRGBA(light.shell))
+	}
+
+	// Explicit light mode.
+	app.settings.Appearance = "light"
+	tester.Frame()
+	img := tester.Image()
+	if got := img.RGBAAt(16, 12); got != wantRGBA(light.shell) {
+		t.Fatalf("light top safe-area pixel = %v, want %v", got, wantRGBA(light.shell))
+	}
+	if got := img.RGBAAt(16, 788); got != wantRGBA(light.shell) {
+		t.Fatalf("light bottom safe-area pixel = %v, want %v", got, wantRGBA(light.shell))
+	}
+
+	// Explicit dark mode.
+	app.settings.Appearance = "dark"
+	tester.Frame()
+	img = tester.Image()
+	if got := img.RGBAAt(16, 12); got != wantRGBA(dark.shell) {
+		t.Fatalf("dark top safe-area pixel = %v, want %v", got, wantRGBA(dark.shell))
+	}
+	if got := img.RGBAAt(16, 788); got != wantRGBA(dark.shell) {
+		t.Fatalf("dark bottom safe-area pixel = %v, want %v", got, wantRGBA(dark.shell))
+	}
+}
+
+func TestStartupFlushImportsDoesNotFlickerBusyWhenEmpty(t *testing.T) {
+	app := &workspace{store: notebook.NewStore(t.TempDir())}
+	uiCh := make(chan func(), 16)
+	app.postUI = func(fn func()) { uiCh <- fn }
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	done := make(chan struct{})
+	app.takeDownloadFn = func(ctx context.Context) (*pendingAndroidDownload, error) {
+		close(started)
+		<-release
+		defer close(done)
+		return nil, nil
+	}
+
+	app.notifyDownloadsReady()
+	select {
+	case fn := <-uiCh:
+		fn()
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for initial flushImports UI callback")
+	}
+	<-started
+	if app.busy {
+		t.Fatal("empty startup download poll must not set busy=true while polling")
+	}
+	close(release)
+	<-done
+
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		app.importMu.Lock()
+		polling := app.downloadsPolling
+		app.importMu.Unlock()
+		if !polling {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if app.busy {
+		t.Fatal("empty startup download poll must leave busy=false after completion")
+	}
+	select {
+	case <-uiCh:
+		t.Fatal("empty download poll should not trigger an extra UI redraw")
+	default:
+	}
+
+	// When "take" returns an actual file path, import runs under busy=true and cleans up the temp file.
+	tmpDir, err := os.MkdirTemp(t.TempDir(), "margin-open-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmpFile := filepath.Join(tmpDir, "bad.txt")
+	if err := os.WriteFile(tmpFile, []byte("not-a-notebook"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	takeDone := make(chan struct{})
+	takeCount := 0
+	app.takeDownloadFn = func(ctx context.Context) (*pendingAndroidDownload, error) {
+		takeCount++
+		if takeCount == 1 {
+			return &pendingAndroidDownload{Path: tmpFile}, nil
+		}
+		if takeCount == 2 {
+			defer close(takeDone)
+		}
+		return nil, nil
+	}
+
+	app.notifyDownloadsReady()
+	sawBusy := false
+	finishDeadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(finishDeadline) {
+		select {
+		case fn := <-uiCh:
+			fn()
+			if app.busy {
+				sawBusy = true
+			}
+		case <-time.After(5 * time.Millisecond):
+			app.importMu.Lock()
+			polling := app.downloadsPolling
+			pending := app.downloadsPending
+			app.importMu.Unlock()
+			if sawBusy && !app.busy && !polling && !pending {
+				goto imported
+			}
+		}
+	}
+imported:
+	select {
+	case <-takeDone:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for follow-up download queue drain")
+	}
+	if !sawBusy {
+		t.Fatal("expected real file import from Android download queue to set busy=true")
+	}
+	if app.busy {
+		t.Fatal("expected busy to clear after file import completes")
+	}
+	if _, err := os.Stat(tmpFile); !os.IsNotExist(err) {
+		t.Fatalf("expected Android staged temp file to be cleaned up, stat err=%v", err)
+	}
+}
+
+func TestAndroidFrameReadySignaledOncePerLaunchAndResume(t *testing.T) {
+	app := &workspace{store: notebook.NewStore(t.TempDir())}
+	readyCount := 0
+	app.androidFrameReadyFn = func() { readyCount++ }
+	app.androidFramePending.Store(true)
+
+	tester := ui.NewTester(app.view, 400, 800)
+	tester.Frame()
+	tester.Frame()
+	tester.Frame()
+	if readyCount != 1 {
+		t.Fatalf("cold-start frameReady count = %d, want 1", readyCount)
+	}
+
+	app.onAndroidSurfaceResumed(nil)
+	tester.Frame()
+	tester.Frame()
+	if readyCount != 2 {
+		t.Fatalf("post-resume frameReady count = %d, want 2", readyCount)
 	}
 }

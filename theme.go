@@ -116,7 +116,6 @@ func svgIcon(body string) *ui.SVG {
 
 var (
 	icImport       = svgIcon(`<path d="M12 4v11m-4-3.5 4 4 4-4"/><path d="M4.5 16.5v2a1.5 1.5 0 0 0 1.5 1.5h12a1.5 1.5 0 0 0 1.5-1.5v-2"/>`)
-	icExport       = svgIcon(`<path d="M12 15V4m-4 4 4-4 4 4"/><path d="M4.5 16.5v2a1.5 1.5 0 0 0 1.5 1.5h12a1.5 1.5 0 0 0 1.5-1.5v-2"/>`)
 	icBook         = svgIcon(`<path d="M4 19.5v-15A2.5 2.5 0 0 1 6.5 2H19a1 1 0 0 1 1 1v18a1 1 0 0 1-1 1H6.5a2.5 2.5 0 0 1 0-5H20"/>`)
 	icChevronDown  = svgIcon(`<path d="m6.5 9.5 5.5 5.5 5.5-5.5"/>`)
 	icChevronRight = svgIcon(`<path d="m9.5 6.5 5.5 5.5-5.5 5.5"/>`)
@@ -140,10 +139,6 @@ func clamp(n, low, high float32) float32 { return max(low, min(n, high)) }
 
 func horizontalRule(c *ui.Context, p palette) {
 	ui.Box(c).FillWidth().Height(1).Shrink(0).Background(p.rule)
-}
-
-func verticalRule(c *ui.Context, p palette) {
-	ui.Box(c).FillHeight().Width(1).Shrink(0).Background(p.rule)
 }
 
 func brandMark(c *ui.Context, p palette, size float32) {

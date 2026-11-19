@@ -31,11 +31,20 @@ class OpenNotesPlugin : MyGoPlugin {
 
     init {
         PluginHost.onIntent = ::open
+        LaunchCover.install(PluginHost.context, PluginHost.activity)
     }
 
     override fun call(method: String, args: JSONObject, reply: PluginReply) {
         when (method) {
             "take" -> reply.success(pending.poll())
+            "setAppearance" -> {
+                LaunchCover.setAppearance(args.optString("appearance", ""))
+                reply.success(null)
+            }
+            "frameReady" -> {
+                LaunchCover.onFrameReady()
+                reply.success(null)
+            }
             "penZones" -> {
                 stylus.update(args.getJSONArray("zones"))
                 reply.success(null)

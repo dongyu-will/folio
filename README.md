@@ -59,7 +59,7 @@ Folio 支持直接导入 MarginNote 导出的 `.marginpkg` / `.marginnotes` 文�
 
 | 平台 | 定位 | 原生能力与实现方式 |
 | --- | --- | --- |
-| **Android（平板）** | 主目标平台 | MyGo 原生 UI（自动启用触控大热区布局）+ Kotlin 插件（`internal/androidopen/android/`）：`PdfRenderer` 双队列渲染 PDF、`StylusBridge` 低延迟压感与防误触、Intent 文件关联打开，以及应用内 APK 更新安装（`REQUEST_INSTALL_PACKAGES` + MyGo 内置 `FileProvider`）；导入的 PencilKit 数据由纯 Go 引擎光栅化。 |
+| **Android（平板）** | 主目标平台 | MyGo 原生 UI（自动启用触控大热区布局）+ Kotlin 插件（`internal/androidopen/android/`）：`PdfRenderer` 双队列渲染 PDF、`StylusBridge` 低延迟压感与防误触、`LaunchCover` 主题同步冷启动/恢复无黑屏过渡、Intent 文件关联打开，以及应用内 APK 更新安装（`REQUEST_INSTALL_PACKAGES` + MyGo 内置 `FileProvider`）；导入的 PencilKit 数据由纯 Go 引擎光栅化。 |
 | **macOS** | 桌面端支持 | MyGo 原生应用（`.app` / `.dmg`），支持拖拽导入、文件关联与 `mygo.Updater` Ed25519 签名自动更新；通过 `scripts/build-ink.sh` 编译通用二进制（`arm64` + `x86_64`，macOS 12.0+）调用原生 `PDFKit` 与 `PencilKit` 渲染器。 |
 
 > **说明**：PDF 页面渲染目前仅针对 Android 与 macOS 实现了原生后端（见 `pdf_render.go`）；核心笔记存储、导入解析、Markdown 导出及单元测试为纯 Go 实现，可在其他操作系统上直接运行测试。
@@ -120,8 +120,12 @@ go tool mygo doctor
    ```sh
    go tool mygo dev -platform android
    ```
-3. 打包 Android 生产版本（输出到 `build/`）：
+3. 打包 Android 生产版本（输出 `.apk` 与 Google Play `.aab` 到 `build/android/`）：
    ```sh
+   # 仅针对主流 64 位 Android 真机/平板打包单 ABI 精简 APK（arm64-v8a，体积约 20 MB，推荐侧载安装）
+   go tool mygo build -platform android/arm64
+
+   # 或构建包含 arm64-v8a / armeabi-v7a / x86_64 的全架构通用 APK 与 Play AAB
    go tool mygo build -platform android
    ```
 
@@ -144,9 +148,9 @@ MGNOTE_DATA_DIR=/path/to/folio-data /path/to/Folio /path/to/notes.marginpkg
 ├── .gitignore                       # Git 忽略规则（构建产物、macOS 编译辅助程序、本地笔记等）
 ├── LICENSE                          # MIT 开源协议
 ├── README.md                        # 项目说明文档
-├── mygo.json                        # MyGo 应用配置、版本号、自动更新公钥/仓库、构建钩子与文件关联声明
+├── mygo.json                        # MyGo 应用配置、版本号、resourcesExclude、自动更新公钥/仓库、构建钩子与文件关联声明
 ├── go.mod / go.sum                  # Go 模块（github.com/dongyu-will/folio）依赖与 MyGo tool 声明
-├── main.go                          # 应用入口、单实例锁、数据目录初始化与窗口生命周期
+├── main.go                          # 应用入口、平台适配初始化、主题背景同步与窗口生命周期
 ├── workspace.go                     # 工作区状态管理、笔记树构建、搜索、导入/导出、更新状态与编辑逻辑
 ├── native_view.go                   # 主界面框架、侧边栏、快捷键绑定、笔记详情弹窗与编辑器
 ├── mindmap.go                       # 脑图无限画布、卡片树/专题框架/精简树布局、缩略图与交互
@@ -155,7 +159,7 @@ MGNOTE_DATA_DIR=/path/to/folio-data /path/to/Folio /path/to/notes.marginpkg
 ├── pdf_render.go                    # 跨平台 PDF 渲染调度与夜间智能反色算法
 ├── ink_view.go                      # 浮动笔盒、离屏双层墨迹缓存、撤销/重做与套索操作
 ├── ink_geometry.go                  # 压感笔迹几何、图形自动规整、套索命中与局部/整笔擦除
-├── android_ink.go                   # Android 触控笔书写区域同步与原生采样事件桥接
+├── android_ink.go                   # Android 触控笔书写区域同步、外观与首帧就绪信号及原生采样桥接
 ├── drawing_save.go                  # 异步手写落盘队列与变更合并
 ├── settings_view.go                 # 设置弹窗、偏好项持久化、笔记本管理与「关于 Folio」更新/仓库入口
 ├── updater.go                       # 跨平台应用更新检查、macOS mygo.Updater 签名更新与 Android APK 校验下载
@@ -183,7 +187,8 @@ MGNOTE_DATA_DIR=/path/to/folio-data /path/to/Folio /path/to/notes.marginpkg
 │       ├── androidopen.go           # Android 原生插件 ID 声明
 │       ├── mygo-plugin.json         # Android 插件配置、VIEW/SEND Intent 与 APK 安装权限声明
 │       └── android/
-│           ├── OpenNotesPlugin.kt   # Android PdfRenderer 渲染、系统文件 Intent 导入与安全 APK 更新安装
+│           ├── LaunchCover.kt       # Android 冷启动与前后台恢复主题过渡遮罩（消除 SurfaceView 黑屏闪烁）
+│           ├── OpenNotesPlugin.kt   # Android PdfRenderer 渲染、文件 Intent 导入、主题/首帧桥接与安全 APK 安装
 │           └── StylusBridge.kt      # Android 压感触控笔采样、低延迟分发与防误触桥接
 ├── resources/
 │   ├── icon.png                     # 应用图标
@@ -217,7 +222,7 @@ MGNOTE_DATA_DIR=/path/to/folio-data /path/to/Folio /path/to/notes.marginpkg
 - **纯 Go 声明式原生 UI，无 CGO**：基于 `github.com/egoist/mygo` 构建原生渲染界面；通过 `modernc.org/sqlite` 纯 Go 驱动以只读不可变模式（`mode=ro&immutable=1&_pragma=trusted_schema(OFF)`）安全解析 `.marginnotes` 数据库。
 - **安全的二进制 Plist 与 HTML 解析**：使用 `howett.net/plist` 解码 MarginNote 数据库内的 Apple `NSKeyedArchiver` 归档（内置递归深度与解码预算限制，不实例化归档类）；使用 `golang.org/x/net/html` 精确提取富文本样式；使用 `github.com/google/uuid` 生成本地新建笔记与画布卡片唯一 ID。
 - **分层离屏渲染与增量日志落盘**：荧光笔与钢笔分别维护离屏 `ui.Canvas` 缓存层，荧光笔整层一次性透明合成以防笔迹重叠加深；手写修改经异步队列合并后以顺序增量 Journal 文件原子落盘，降低高频书写 I/O 开销。
-- **克制的平台原生层**：仅在系统能力必需处使用少量原生代码——Android 端两个 Kotlin 文件负责 `PdfRenderer`、触控笔桥接、Intent 接收与安全 APK 更新安装；macOS 端两个 Swift 脚本负责调用 `PDFKit` 与 `PencilKit`。
+- **克制的平台原生层**：仅在系统能力必需处使用少量原生代码——Android 端三个 Kotlin 文件负责 `PdfRenderer`、触控笔桥接、Intent 接收、冷启动/恢复无黑屏过渡与安全 APK 更新安装；macOS 端两个 Swift 脚本负责调用 `PDFKit` 与 `PencilKit`。
 
 ---
 

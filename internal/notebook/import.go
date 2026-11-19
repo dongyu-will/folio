@@ -72,7 +72,6 @@ type sourceNote struct {
 	ztype             int
 	zindex            int
 	hasZIndex         bool
-	dummyOnly         bool
 	sketchOrDummyOnly bool
 }
 
@@ -614,9 +613,7 @@ func readNotes(ctx context.Context, db *sql.DB, media *mediaImport, configs *boo
 		}
 		n.CreatedAt = coreDataToUnix(highlightDate)
 		n.UpdatedAt = coreDataToUnix(noteDate)
-		info := media.attach(&n.Note, clip, blocks)
-		n.dummyOnly = info.dummyOnly
-		n.sketchOrDummyOnly = info.sketchOrDummyOnly
+		n.sketchOrDummyOnly = media.attach(&n.Note, clip, blocks)
 		grouped[n.topic] = append(grouped[n.topic], n)
 	}
 	return grouped, rows.Err()

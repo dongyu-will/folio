@@ -13,9 +13,13 @@ import (
 	"github.com/egoist/mygo/ui"
 )
 
+func isMobilePlatform() bool {
+	return runtime.GOOS == "android" || runtime.GOOS == "ios"
+}
+
 func main() {
 	mygo.App.SetName("Folio")
-	if !mygo.App.RequestSingleInstanceLock() {
+	if !isMobilePlatform() && !mygo.App.RequestSingleInstanceLock() {
 		return
 	}
 
@@ -83,20 +87,30 @@ func main() {
 	}
 	app.setLibrary(library, initialBook)
 	if runtime.GOOS == "android" {
+		app.androidFramePending.Store(true)
 		mygo.Native(androidopen.PluginID).On("stylus", app.onAndroidStylus)
 		mygo.Native(androidopen.PluginID).On("ready", func([]byte) {
 			app.notifyDownloadsReady()
 		})
+		mygo.Native(androidopen.PluginID).On("surfaceResumed", app.onAndroidSurfaceResumed)
 	}
 	mygo.App.OnOpenFile(func(path string) {
 		app.enqueueImport(path)
 	})
 	mygo.App.WhenReady(func() {
-		win := mygo.NewWindow(mygo.WindowOptions{
+		// Sync theme inside WhenReady (after App.Run initialized the backend)
+		// because mygo.Theme.SetSource calls onMain/backend() which would
+		// prematurely construct mobile.Backend if invoked before App.Run.
+		syncAppTheme(app.settings.Appearance)
+		winOpts := mygo.WindowOptions{
 			Title: "Folio", Content: ui.View(app.view),
 			Width: 1280, Height: 800, MinWidth: 560, MinHeight: 480,
-			StateKey: "workspace", BackgroundColor: "light-dark(#f5f5f7, #0e0f12)",
-		})
+			BackgroundColor: windowBackgroundForAppearance(app.settings.Appearance),
+		}
+		if !isMobilePlatform() {
+			winOpts.StateKey = "workspace"
+		}
+		win := mygo.NewWindow(winOpts)
 		app.setWindow(win)
 		win.OnFileDrop(func(e *mygo.FileDropEvent) {
 			app.enqueueImport(e.Paths...)

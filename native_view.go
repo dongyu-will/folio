@@ -15,16 +15,21 @@ func (a *workspace) view(c *ui.Context) {
 	if a.bookChoice != a.bookID && !a.editing() {
 		a.setLibrary(notebook.Library{Books: a.books}, a.bookChoice)
 	}
-	p := light
+	var th ui.Theme
 	switch a.settings.Appearance {
 	case "light":
-		c.SetTheme(ui.LightTheme())
+		th = *ui.LightTheme()
 	case "dark":
-		c.SetTheme(ui.DarkTheme())
+		th = *ui.DarkTheme()
+	default:
+		th = *c.Theme()
 	}
-	if c.Theme().Dark {
+	p := light
+	if th.Dark {
 		p = dark
 	}
+	th.Background = p.shell
+	c.SetTheme(&th)
 	w, h := c.Size()
 	top, right, bottom, left := c.SafeArea()
 	width := w - left - right
@@ -165,6 +170,9 @@ func (a *workspace) view(c *ui.Context) {
 			a.settingsCard(c, p, width, height)
 		}
 	})
+	if w > 0 && h > 0 {
+		a.markAndroidFramePainted()
+	}
 }
 
 func (a *workspace) statusBanner(c *ui.Context, p palette) bool {

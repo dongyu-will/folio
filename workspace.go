@@ -13,6 +13,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/dongyu-will/folio/internal/androidopen"
@@ -89,13 +90,18 @@ type workspace struct {
 	pdfHighlightNoteID string
 	pdfTOCOpen         bool
 
-	androidInk androidInk
+	androidInk          androidInk
+	androidFramePending atomic.Bool
+	androidFrameReadyFn func()
 
 	busy bool
 
 	importMu         sync.Mutex
+	postUI           func(func())
 	downloadsPending bool
-	importPaths      []string
+	downloadsPolling bool
+	importPaths      []queuedImport
+	takeDownloadFn   func(context.Context) (*pendingAndroidDownload, error)
 
 	updateMu        sync.Mutex
 	update          updateUIState
@@ -106,6 +112,16 @@ type workspace struct {
 	message      string
 	messageError bool
 	messageUntil time.Time
+}
+
+type queuedImport struct {
+	path    string
+	cleanup bool
+}
+
+type pendingAndroidDownload struct {
+	Path  string
+	Error string
 }
 
 type updatePhase uint8
@@ -279,27 +295,6 @@ func noteText(n notebook.Note) string {
 		return n.Body
 	}
 	return n.Excerpt
-}
-
-func noteSnippet(n notebook.Note) string {
-	text := strings.TrimSpace(noteText(n))
-	if text == "" {
-		return ""
-	}
-	title := strings.TrimSpace(n.Title)
-	if title != "" && strings.HasPrefix(text, title) {
-		text = strings.TrimSpace(strings.TrimPrefix(text, title))
-	}
-	if text == "" || text == title {
-		return ""
-	}
-	fields := strings.Fields(text)
-	joined := strings.Join(fields, " ")
-	runes := []rune(joined)
-	if len(runes) > 96 {
-		return string(runes[:96]) + "…"
-	}
-	return joined
 }
 
 func noteHasImage(n notebook.Note) bool {
@@ -664,16 +659,6 @@ func (a *workspace) mediaBitmap(ref string) *ui.Bitmap {
 	return bmp
 }
 
-func blockImages(blocks []notebook.ContentBlock) []string {
-	var refs []string
-	for _, b := range blocks {
-		if b.Image != "" {
-			refs = append(refs, b.Image)
-		}
-	}
-	return refs
-}
-
 func (a *workspace) openNote(id string) {
 	if a.editing() {
 		return
@@ -732,39 +717,64 @@ func (a *workspace) window() *mygo.Window {
 	return a.win
 }
 
+func (a *workspace) hasUI() bool {
+	a.importMu.Lock()
+	defer a.importMu.Unlock()
+	return a.win != nil || a.postUI != nil
+}
+
+func (a *workspace) updateUI(fn func()) {
+	a.importMu.Lock()
+	win := a.win
+	post := a.postUI
+	a.importMu.Unlock()
+	if win != nil {
+		win.Update(fn)
+		return
+	}
+	if post != nil {
+		post(fn)
+	}
+}
+
 func (a *workspace) enqueueImport(paths ...string) {
 	a.importMu.Lock()
 	for _, p := range paths {
 		if p != "" {
-			a.importPaths = append(a.importPaths, p)
+			a.importPaths = append(a.importPaths, queuedImport{path: p})
 		}
 	}
-	win := a.win
+	hasUI := a.win != nil || a.postUI != nil
 	a.importMu.Unlock()
-	if win != nil {
-		win.Update(func() { a.flushImports() })
+	if hasUI {
+		a.updateUI(func() { a.flushImports() })
 	}
 }
 
 func (a *workspace) notifyDownloadsReady() {
 	a.importMu.Lock()
 	a.downloadsPending = true
-	win := a.win
+	hasUI := a.win != nil || a.postUI != nil
 	a.importMu.Unlock()
-	if win != nil {
-		win.Update(func() { a.flushImports() })
+	if hasUI {
+		a.updateUI(func() { a.flushImports() })
 	}
 }
 
-func (a *workspace) popImportPath() (string, bool) {
+func (a *workspace) popImport() (queuedImport, bool) {
 	a.importMu.Lock()
 	defer a.importMu.Unlock()
 	if len(a.importPaths) == 0 {
-		return "", false
+		return queuedImport{}, false
 	}
-	path := a.importPaths[0]
+	item := a.importPaths[0]
 	a.importPaths = a.importPaths[1:]
-	return path, true
+	return item, true
+}
+
+func (a *workspace) popImportPath() (string, bool) {
+	item, ok := a.popImport()
+	return item.path, ok
 }
 
 func (a *workspace) takeDownloadsPending() bool {
@@ -777,16 +787,26 @@ func (a *workspace) takeDownloadsPending() bool {
 	return true
 }
 
+func (a *workspace) startDownloadPoll() bool {
+	a.importMu.Lock()
+	defer a.importMu.Unlock()
+	if !a.downloadsPending || a.downloadsPolling {
+		return false
+	}
+	a.downloadsPending = false
+	a.downloadsPolling = true
+	return true
+}
+
 // work serializes imports, exports, deletes, and saves while the UI stays on MyGo's UI thread.
 func (a *workspace) work(task func() func()) {
-	win := a.window()
-	if a.busy || win == nil {
+	if a.busy || !a.hasUI() {
 		return
 	}
 	a.busy = true
 	go func() {
 		finish := task()
-		win.Update(func() {
+		a.updateUI(func() {
 			a.busy = false
 			finish()
 			if a.preferencesOpen {
@@ -844,13 +864,23 @@ func (a *workspace) chooseImport() {
 	})
 }
 
+func takeAndroidDownload(ctx context.Context) (*pendingAndroidDownload, error) {
+	var opened *pendingAndroidDownload
+	err := mygo.Native(androidopen.PluginID).Call(ctx, "take", nil, &opened)
+	return opened, err
+}
+
 func (a *workspace) flushImports() {
-	if a.window() == nil || a.busy || a.editing() {
+	if !a.hasUI() || a.busy || a.editing() {
 		return
 	}
-	if path, ok := a.popImportPath(); ok {
+	if item, ok := a.popImport(); ok {
 		a.work(func() func() {
-			r, err := a.store.Import(path)
+			r, err := a.store.Import(item.path)
+			if item.cleanup {
+				_ = os.Remove(item.path)
+				_ = os.Remove(filepath.Dir(item.path))
+			}
 			return func() {
 				if err != nil {
 					a.showError(err)
@@ -861,41 +891,53 @@ func (a *workspace) flushImports() {
 		})
 		return
 	}
-	if runtime.GOOS != "android" || !a.takeDownloadsPending() {
+	takeFn := a.takeDownloadFn
+	if takeFn == nil {
+		if runtime.GOOS != "android" {
+			return
+		}
+		takeFn = takeAndroidDownload
+	}
+	if !a.startDownloadPoll() {
 		return
 	}
-	a.work(func() func() {
-		var opened *struct{ Path, Error string }
+	// Poll Android's pending-open queue off the UI thread without setting
+	// a.busy = true unless a non-empty file path is actually returned.
+	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
-		defer cancel()
-		err := mygo.Native(androidopen.PluginID).Call(ctx, "take", nil, &opened)
-		if err == nil && opened == nil {
-			return func() {}
-		}
-		var result notebook.ImportResult
-		if err == nil {
-			if opened.Error != "" {
-				err = errors.New(opened.Error)
-			} else {
-				result, err = a.store.Import(opened.Path)
-				_ = os.Remove(opened.Path)
-				_ = os.Remove(filepath.Dir(opened.Path))
-			}
-		}
-		more := opened != nil
-		return func() {
+		opened, err := takeFn(ctx)
+		cancel()
+
+		if err == nil && (opened == nil || (opened.Path == "" && opened.Error == "")) {
+			a.importMu.Lock()
+			a.downloadsPolling = false
+			more := a.downloadsPending
+			a.importMu.Unlock()
 			if more {
-				a.importMu.Lock()
-				a.downloadsPending = true
-				a.importMu.Unlock()
+				a.updateUI(func() { a.flushImports() })
 			}
+			return
+		}
+
+		a.importMu.Lock()
+		a.downloadsPolling = false
+		if opened != nil {
+			a.downloadsPending = true
+			if err == nil && opened.Error == "" && opened.Path != "" {
+				a.importPaths = append(a.importPaths, queuedImport{path: opened.Path, cleanup: true})
+			}
+		}
+		a.importMu.Unlock()
+
+		a.updateUI(func() {
 			if err != nil {
 				a.showError(err)
-			} else {
-				a.applyImport(result)
+			} else if opened != nil && opened.Error != "" {
+				a.showError(errors.New(opened.Error))
 			}
-		}
-	})
+			a.flushImports()
+		})
+	}()
 }
 
 func (a *workspace) startEditNote() {

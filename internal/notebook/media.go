@@ -156,12 +156,7 @@ func unarchive(data []byte) any {
 	return decode(archive.Top["root"], 0)
 }
 
-type attachInfo struct {
-	dummyOnly         bool
-	sketchOrDummyOnly bool
-}
-
-func (m *mediaImport) attach(n *Note, clipData, noteData []byte) attachInfo {
+func (m *mediaImport) attach(n *Note, clipData, noteData []byte) bool {
 	if clip, ok := unarchive(clipData).(map[string]any); ok {
 		n.Clip = m.saveImage(m.picture(clip))
 		extractHighlightRects(n, clip)
@@ -269,10 +264,7 @@ func (m *mediaImport) attach(n *Note, clipData, noteData []byte) attachInfo {
 			appendTags(n, extractHashtags(b.Text)...)
 		}
 	}
-	return attachInfo{
-		dummyOnly:         sawDummy && !sawSketch && !sawOther,
-		sketchOrDummyOnly: (sawDummy || sawSketch) && !sawOther,
-	}
+	return (sawDummy || sawSketch) && !sawOther
 }
 
 var (

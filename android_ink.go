@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"runtime"
+	"sync"
 	"time"
 
 	"github.com/dongyu-will/folio/internal/androidopen"
@@ -11,6 +12,105 @@ import (
 	"github.com/egoist/mygo"
 	"github.com/egoist/mygo/ui"
 )
+
+func themeSourceForAppearance(appearance string) mygo.ThemeSource {
+	switch appearance {
+	case "light":
+		return mygo.ThemeLight
+	case "dark":
+		return mygo.ThemeDark
+	default:
+		return mygo.ThemeSystem
+	}
+}
+
+func windowBackgroundForAppearance(appearance string) string {
+	switch appearance {
+	case "light":
+		return "#f5f5f7"
+	case "dark":
+		return "#0e0f12"
+	default:
+		return "light-dark(#f5f5f7, #0e0f12)"
+	}
+}
+
+var androidAppearanceSync struct {
+	mu      sync.Mutex
+	latest  string
+	running bool
+}
+
+func syncAndroidAppearance(appearance string) {
+	androidAppearanceSync.mu.Lock()
+	androidAppearanceSync.latest = appearance
+	if androidAppearanceSync.running {
+		androidAppearanceSync.mu.Unlock()
+		return
+	}
+	androidAppearanceSync.running = true
+	androidAppearanceSync.mu.Unlock()
+
+	go func() {
+		for {
+			androidAppearanceSync.mu.Lock()
+			v := androidAppearanceSync.latest
+			androidAppearanceSync.mu.Unlock()
+
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			_ = mygo.Native(androidopen.PluginID).Call(ctx, "setAppearance", map[string]string{"appearance": v}, nil)
+			cancel()
+
+			androidAppearanceSync.mu.Lock()
+			if androidAppearanceSync.latest == v {
+				androidAppearanceSync.running = false
+				androidAppearanceSync.mu.Unlock()
+				return
+			}
+			androidAppearanceSync.mu.Unlock()
+		}
+	}()
+}
+
+// syncAppTheme aligns the platform theme source and Android's launch cover
+// cache with Folio's saved appearance. It is a no-op before App.Run becomes
+// ready (including headless unit tests) so backend() is never initialized early.
+func syncAppTheme(appearance string) {
+	if !mygo.App.IsReady() {
+		return
+	}
+	mygo.Theme.SetSource(themeSourceForAppearance(appearance))
+	if runtime.GOOS == "android" {
+		syncAndroidAppearance(appearance)
+	}
+}
+
+func (a *workspace) onAndroidSurfaceResumed([]byte) {
+	a.androidFramePending.Store(true)
+	if win := a.window(); win != nil {
+		win.Invalidate()
+	}
+}
+
+func (a *workspace) markAndroidFramePainted() {
+	if !a.androidFramePending.CompareAndSwap(true, false) {
+		return
+	}
+	if fn := a.androidFrameReadyFn; fn != nil {
+		fn()
+		return
+	}
+	if runtime.GOOS != "android" {
+		return
+	}
+	// NativePlugin.Call posts to MyGo's mainLoop, which cannot run until the
+	// in-progress runFrame() finishes layout, paint, present(), and eglSwapBuffers().
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = mygo.Native(androidopen.PluginID).Call(ctx, "frameReady", nil, nil)
+	}()
+}
 
 type penZone struct {
 	name   string

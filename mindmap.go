@@ -20,11 +20,9 @@ type mapNode struct {
 	active      bool
 	hasKids     bool
 	expanded    bool
-	indent      float32
 	inGroup     bool // true when card lives inside a 2D leaf-grid group box (single trunk edge instead of spaghetti)
 	isHeading   bool
 	isFrameHead bool // true when rendered as the embedded header/intro inside a framework section
-	bodyLines   int
 	imageHeight []float32
 }
 
@@ -166,35 +164,31 @@ func wrapLineCount(s string, maxW, fontSize float32) int {
 type cardMeasure struct {
 	w, h        float32
 	isHeading   bool
-	bodyLines   int
 	imageHeight []float32
 }
 
-func measureRichTextBlock(blk notebook.ContentBlock, fallbackTxt string, maxW, baseFontSize float32) (int, float32) {
+func measureRichTextBlock(blk notebook.ContentBlock, fallbackTxt string, maxW, baseFontSize float32) float32 {
 	if len(blk.Spans) == 0 {
 		cleaned := cleanCardBody(fallbackTxt)
 		if cleaned == "" {
-			return 0, 0
+			return 0
 		}
 		lines := wrapLineCount(cleaned, maxW, baseFontSize)
-		return lines, float32(lines)*18.6 + 4
+		return float32(lines)*18.6 + 4
 	}
 	if maxW <= 8 {
-		return 0, 0
+		return 0
 	}
 	dominant := dominantSpanFontSize(blk.Spans)
-	totalLines := 0
 	var totalH float32
 	var paraW float32
 	paraMaxScale := float32(1)
 	paraHasText := false
 	flushPara := func() {
 		if !paraHasText {
-			totalLines++
 			totalH += 18.6
 		} else {
 			lines := max(1, int(math.Ceil(float64(paraW/maxW))))
-			totalLines += lines
 			totalH += float32(lines) * (18.6 * paraMaxScale)
 		}
 		paraW = 0
@@ -225,10 +219,10 @@ func measureRichTextBlock(blk notebook.ContentBlock, fallbackTxt string, maxW, b
 		}
 	}
 	if !anyContent {
-		return 0, 0
+		return 0
 	}
 	flushPara()
-	return totalLines, totalH + 4
+	return totalH + 4
 }
 
 func (a *workspace) measureCard(n notebook.Note, fixedWidth float32, depth int, hasKids, noHeader bool) cardMeasure {
@@ -320,13 +314,11 @@ func (a *workspace) measureCard(n notebook.Note, fixedWidth float32, depth int, 
 		items++
 	}
 
-	bodyLines := 0
 	addText := func(blk notebook.ContentBlock, fallbackTxt string) {
-		lines, blockH := measureRichTextBlock(blk, fallbackTxt, innerW, 12.2)
-		if lines == 0 {
+		blockH := measureRichTextBlock(blk, fallbackTxt, innerW, 12.2)
+		if blockH == 0 {
 			return
 		}
-		bodyLines += lines
 		if items > 0 {
 			h += 8
 		}
@@ -366,7 +358,6 @@ func (a *workspace) measureCard(n notebook.Note, fixedWidth float32, depth int, 
 		w:           w,
 		h:           max(minH, h),
 		isHeading:   false,
-		bodyLines:   bodyLines,
 		imageHeight: imgHeights,
 	}
 }
@@ -692,8 +683,7 @@ func (a *workspace) cardMapNodes() ([]mapNode, []boardSection, int) {
 			id: tn.id, x: x, y: cy, w: tn.m.w, h: tn.m.h,
 			parent: parentIdx, depth: depth,
 			active: active, hasKids: tn.hasKids, expanded: tn.expanded,
-			isHeading: tn.m.isHeading, bodyLines: tn.m.bodyLines,
-			imageHeight: tn.m.imageHeight,
+			isHeading: tn.m.isHeading, imageHeight: tn.m.imageHeight,
 		})
 		if slices.Equal(tn.path, trail) {
 			picked = idx
@@ -745,8 +735,7 @@ func (a *workspace) cardMapNodes() ([]mapNode, []boardSection, int) {
 						id: leaf.id, x: lx, y: ly, w: leaf.m.w, h: leaf.m.h,
 						parent: idx, depth: depth + 1,
 						active: leafActive, hasKids: leaf.hasKids, expanded: false, inGroup: true,
-						isHeading: leaf.m.isHeading, bodyLines: leaf.m.bodyLines,
-						imageHeight: leaf.m.imageHeight,
+						isHeading: leaf.m.isHeading, imageHeight: leaf.m.imageHeight,
 					})
 					if slices.Equal(leaf.path, trail) {
 						picked = leafIdx
@@ -800,7 +789,6 @@ func (a *workspace) boardMapNodes() ([]mapNode, []boardSection, int) {
 
 	type miniTreeNode struct {
 		id       string
-		note     notebook.Note
 		depth    int
 		m        cardMeasure
 		hasKids  bool
@@ -813,16 +801,15 @@ func (a *workspace) boardMapNodes() ([]mapNode, []boardSection, int) {
 	}
 
 	type frameBox struct {
-		id       string
-		note     notebook.Note
-		title    string
-		depth    int
-		isLeaf   bool
-		hasKids  bool
-		expanded bool
-		m        cardMeasure
-		w, h     float32
-		count    int
+		id      string
+		note    notebook.Note
+		title   string
+		depth   int
+		isLeaf  bool
+		hasKids bool
+		m       cardMeasure
+		w, h    float32
+		count   int
 
 		// Embedded horizontal mini-tree when sub-branch explicitly uses tree layoutMode (0 or 1).
 		tree *miniTreeNode
@@ -855,7 +842,7 @@ func (a *workspace) boardMapNodes() ([]mapNode, []boardSection, int) {
 		}
 		m := a.measureCard(n, fixedW, depth+1, hasKids, false)
 		mt := &miniTreeNode{
-			id: id, note: n, depth: depth, m: m,
+			id: id, depth: depth, m: m,
 			hasKids: hasKids, expanded: exp, count: 1,
 		}
 		if !exp {
@@ -921,7 +908,7 @@ func (a *workspace) boardMapNodes() ([]mapNode, []boardSection, int) {
 			m := a.measureCard(n, boardCardWidth, depth+1, hasKids, false)
 			return &frameBox{
 				id: id, note: n, title: noteTitle(n), depth: depth,
-				isLeaf: true, hasKids: hasKids, expanded: false,
+				isLeaf: true, hasKids: hasKids,
 				m: m, w: m.w, h: m.h, count: 1,
 			}
 		}
@@ -932,7 +919,7 @@ func (a *workspace) boardMapNodes() ([]mapNode, []boardSection, int) {
 			mt := buildMiniTree(id, depth)
 			return &frameBox{
 				id: id, note: n, title: noteTitle(n), depth: depth,
-				isLeaf: false, hasKids: true, expanded: true,
+				isLeaf: false, hasKids: true,
 				w: mt.w, h: mt.h, count: mt.count, tree: mt,
 			}
 		}
@@ -955,7 +942,7 @@ func (a *workspace) boardMapNodes() ([]mapNode, []boardSection, int) {
 
 		fb := &frameBox{
 			id: id, note: n, title: noteTitle(n), depth: depth,
-			isLeaf: false, hasKids: true, expanded: true,
+			isLeaf: false, hasKids: true,
 			count: totalCount,
 		}
 
@@ -1098,7 +1085,7 @@ func (a *workspace) boardMapNodes() ([]mapNode, []boardSection, int) {
 		cells, gw, gh := packBalancedColumns(ws, hs, cols, boardCardGap, boardCardGap)
 		wrap := &frameBox{
 			id: rootID, note: rootNote, title: title, depth: 0,
-			isLeaf: false, hasKids: true, expanded: true, count: len(looseLeaves),
+			isLeaf: false, hasKids: true, count: len(looseLeaves),
 			w: gw + 2*boardPad, h: boardHeaderH + gh + 2*boardPad,
 		}
 		for _, cell := range cells {
@@ -1120,8 +1107,7 @@ func (a *workspace) boardMapNodes() ([]mapNode, []boardSection, int) {
 			id: mt.id, x: ox, y: cy, w: mt.m.w, h: mt.m.h,
 			parent: parentIdx, depth: mt.depth + 1, active: trailSet[mt.id],
 			hasKids: mt.hasKids, expanded: mt.expanded,
-			isHeading: mt.m.isHeading, bodyLines: mt.m.bodyLines,
-			imageHeight: mt.m.imageHeight,
+			isHeading: mt.m.isHeading, imageHeight: mt.m.imageHeight,
 		})
 		if mt.id == a.selected {
 			picked = idx
@@ -1144,8 +1130,7 @@ func (a *workspace) boardMapNodes() ([]mapNode, []boardSection, int) {
 				id: fb.id, x: ox, y: oy + fb.h/2, w: fb.w, h: fb.h,
 				parent: -1, depth: fb.depth + 1, active: trailSet[fb.id],
 				hasKids: fb.hasKids, expanded: false,
-				isHeading: fb.m.isHeading, bodyLines: fb.m.bodyLines,
-				imageHeight: fb.m.imageHeight,
+				isHeading: fb.m.isHeading, imageHeight: fb.m.imageHeight,
 			})
 			if fb.id == a.selected {
 				picked = idx
@@ -1168,8 +1153,7 @@ func (a *workspace) boardMapNodes() ([]mapNode, []boardSection, int) {
 				id: fb.id, x: ox + boardPad, y: oy + fb.introY + m.h/2, w: m.w, h: m.h,
 				parent: -1, depth: fb.depth + 1, active: trailSet[fb.id],
 				hasKids: false, expanded: false, isFrameHead: true,
-				isHeading: m.isHeading, bodyLines: m.bodyLines,
-				imageHeight: m.imageHeight,
+				isHeading: m.isHeading, imageHeight: m.imageHeight,
 			})
 			if fb.id == a.selected {
 				picked = idx

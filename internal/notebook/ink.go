@@ -18,7 +18,6 @@ const (
 
 type pkInk struct {
 	r, g, b, a float64
-	kind       string
 }
 
 type pkPoint struct {
@@ -293,14 +292,8 @@ func parsePKDrawing(data []byte) ([]pkStroke, bool) {
 func parsePKInk(data []byte) pkInk {
 	ink := pkInk{a: 1}
 	walkProto(data, func(field uint64, wire uint8, _ uint64, raw []byte) bool {
-		if wire != 2 {
-			return true
-		}
-		switch field {
-		case 1:
+		if wire == 2 && field == 1 {
 			ink.r, ink.g, ink.b, ink.a = parsePKColor(raw)
-		case 2:
-			ink.kind = string(raw)
 		}
 		return true
 	})

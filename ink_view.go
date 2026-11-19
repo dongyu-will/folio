@@ -77,8 +77,11 @@ func (d *drawingState) canvasToolActive() bool {
 	return false
 }
 
-var penColors = []string{"", "#0A66FF", "#DF343B", "#149B79"}
-var markerColors = []string{"#F4C545", "#56B4FF", "#FF7D97", "#36BF97"}
+var penColors = [...]string{"", "#0A66FF", "#DF343B", "#149B79"}
+var markerColors = [...]string{"#F4C545", "#56B4FF", "#FF7D97", "#36BF97"}
+var penColorLabels = [...]string{"默认色", "钴蓝", "红色", "绿色"}
+var penWidths = [...]float32{2, 3.5, 6}
+var penWidthLabels = [...]string{"细", "中", "粗"}
 var dockIcons = [2][8]*ui.SVG{
 	{designIcon("lasso"), designIcon("pen"), designIcon("highlighter"), designIcon("eraser"), designIcon("excerpt"), designIcon("card"), designIcon("undo"), designIcon("redo")},
 	{designIcon("lasso-dark"), designIcon("pen-dark"), designIcon("highlighter-dark"), designIcon("eraser-dark"), designIcon("excerpt-dark"), designIcon("card-dark"), designIcon("undo-dark"), designIcon("redo-dark")},
@@ -567,7 +570,7 @@ func (a *workspace) penOptions(c *ui.Context, p palette) {
 	}
 	ui.Row(c).Height(barH).PaddingX(10).Radius(barH / 2).Gap(5).AlignItems(ui.Center).Background(p.elevated).
 		Border(1, p.border).Shadow(0, 4, 12, -2, p.shadow).Children(func() {
-		for i, label := range []string{"默认色", "钴蓝", "红色", "绿色"} {
+		for i, label := range penColorLabels {
 			color := strokeColor(inkStroke{Color: colors[i]}, p)
 			btn := ui.ButtonBase(c.Key(label)).Size(swBtnW, swBtnH).Center().Label(label).Selected(d.color == i).OnClick(func() {
 				d.color = i
@@ -584,9 +587,9 @@ func (a *workspace) penOptions(c *ui.Context, p palette) {
 		if activeW == 0 {
 			activeW = 3.5
 		}
-		for i, width := range []float32{2, 3.5, 6} {
+		for i, width := range penWidths {
 			selected := activeW == width
-			btn := ui.ButtonBase(c.Key(width)).Size(wBtnW, wBtnH).Radius(7).Center().Label([]string{"细", "中", "粗"}[i]).
+			btn := ui.ButtonBase(c.Key(width)).Size(wBtnW, wBtnH).Radius(7).Center().Label(penWidthLabels[i]).
 				Selected(selected).OnClick(func() { d.penWidth = width })
 			if selected {
 				btn.Background(p.tint).Border(1, p.tintBorder)
@@ -603,7 +606,11 @@ func (a *workspace) penOptions(c *ui.Context, p palette) {
 			}
 			btn.Children(func() { ui.Box(c).Size(r, r).Radius(r / 2).Background(dotColor) })
 		}
-		settingButton(c, p, map[bool]string{true: "规整关", false: "规整开"}[d.shapeOff], nil, false, false, func() {
+		shapeLabel := "规整开"
+		if d.shapeOff {
+			shapeLabel = "规整关"
+		}
+		settingButton(c, p, shapeLabel, nil, false, false, func() {
 			d.shapeOff = !d.shapeOff
 		})
 	})

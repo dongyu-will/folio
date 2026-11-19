@@ -15,7 +15,14 @@ func (a *workspace) saveSettings(next notebook.Settings) bool {
 			return false
 		}
 	}
+	appearanceChanged := a.settings.Appearance != next.Appearance
 	a.settings = next
+	if appearanceChanged {
+		syncAppTheme(next.Appearance)
+		if win := a.window(); win != nil {
+			_ = win.SetBackgroundColor(windowBackgroundForAppearance(next.Appearance))
+		}
+	}
 	return true
 }
 

@@ -4,6 +4,7 @@
   "version": "0.2.1",
   "buildCommand": "sh scripts/build-ink.sh",
   "out": "build",
+  "resourcesExclude": ["icon.png", "figma"],
   "updates": {
     "publicKey": "MikyswN2WzB++tVOTFMwJh1W+XSBMZ4vA3tqss9E9N4=",
     "github": "dongyu-will/folio"

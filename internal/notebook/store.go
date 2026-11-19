@@ -198,36 +198,6 @@ func (s *Store) writeAllShards(library Library, dirty map[string]bool) error {
 	return s.writeIndex(makeIndex(library.Books))
 }
 
-func (s *Store) update(change func(*Library) (bool, error)) (Library, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	library, err := s.read()
-	if err != nil {
-		return Library{}, err
-	}
-	oldFiles := make(map[string]bool, len(library.Books))
-	for _, b := range library.Books {
-		oldFiles[bookFileName(b.ID)] = true
-	}
-	write, err := change(&library)
-	if err != nil || !write {
-		return library, err
-	}
-	if err := s.writeAllShards(library, nil); err != nil {
-		return Library{}, err
-	}
-	kept := make(map[string]bool, len(library.Books))
-	for _, b := range library.Books {
-		kept[bookFileName(b.ID)] = true
-	}
-	for file := range oldFiles {
-		if !kept[file] {
-			_ = os.Remove(filepath.Join(s.booksDir(), file))
-		}
-	}
-	return library, nil
-}
-
 func (s *Store) Import(path string) (ImportResult, error) {
 	if strings.EqualFold(filepath.Ext(path), ".pdf") {
 		return s.importPDF(path)
