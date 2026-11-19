@@ -1,0 +1,16 @@
+{
+  "name": "Folio",
+  "identifier": "app.folio.mgnote",
+  "version": "0.2.1",
+  "buildCommand": "sh scripts/build-ink.sh",
+  "out": "build",
+  "updates": {
+    "publicKey": "MikyswN2WzB++tVOTFMwJh1W+XSBMZ4vA3tqss9E9N4=",
+    "github": "dongyu-will/folio"
+  },
+  "fileAssociations": [
+    { "ext": ["marginpkg"], "name": "MarginNote 笔记包", "role": "Viewer" },
+    { "ext": ["marginnotes"], "name": "MarginNote 笔记数据库", "role": "Viewer" },
+    { "ext": ["pdf"], "name": "PDF", "role": "Viewer" }
+  ]
+}

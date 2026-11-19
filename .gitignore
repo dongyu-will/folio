@@ -1,0 +1,35 @@
+# Build outputs & MyGo workspace
+/build/
+/.mygo/
+/mgnote
+/folio
+/Folio
+*.exe
+*.test
+*.out
+coverage.txt
+
+# macOS Swift helper binaries (built by scripts/build-ink.sh)
+/resources/darwin/mgnote-ink*
+/resources/darwin/mgnote-pdf*
+
+# Android / Gradle artifacts
+*.apk
+*.aab
+*.keystore
+*.jks
+local.properties
+
+# Local notebooks / sample data
+*.marginpkg
+*.marginnotes
+
+# OS & editor files
+.DS_Store
+._*
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+*~

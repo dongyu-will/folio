@@ -1,0 +1,17 @@
+{
+  "mobile": {
+    "id": "mgnotedownloads",
+    "android": {
+      "sources": [
+        "android/*.kt"
+      ],
+      "class": "OpenNotesPlugin",
+      "permissions": [
+        "android.permission.REQUEST_INSTALL_PACKAGES"
+      ],
+      "application": [
+        "        <activity-alias\n            android:name=\"app.mgnote.OpenMarginNote\"\n            android:targetActivity=\"dev.mygo.MyGoActivity\"\n            android:exported=\"true\">\n            <intent-filter>\n                <action android:name=\"android.intent.action.VIEW\" />\n                <category android:name=\"android.intent.category.DEFAULT\" />\n                <category android:name=\"android.intent.category.BROWSABLE\" />\n                <data android:scheme=\"content\" />\n                <data android:scheme=\"file\" />\n                <data android:mimeType=\"application/octet-stream\" />\n                <data android:mimeType=\"application/pdf\" />\n                <data android:mimeType=\"application/zip\" />\n                <data android:mimeType=\"application/x-zip-compressed\" />\n                <data android:mimeType=\"application/x-marginnote\" />\n                <data android:mimeType=\"application/x-mgnote-marginpkg\" />\n                <data android:mimeType=\"application/x-mgnote-marginnotes\" />\n                <data android:mimeType=\"application/vnd.marginnote.package\" />\n            </intent-filter>\n            <intent-filter>\n                <action android:name=\"android.intent.action.VIEW\" />\n                <category android:name=\"android.intent.category.DEFAULT\" />\n                <data android:scheme=\"content\" />\n                <data android:scheme=\"file\" />\n                <data android:host=\"*\" />\n                <data android:mimeType=\"*/*\" />\n                <data android:pathPattern=\".*\\\\.marginpkg\" />\n                <data android:pathPattern=\".*\\\\..*\\\\.marginpkg\" />\n                <data android:pathPattern=\".*\\\\.marginnotes\" />\n                <data android:pathPattern=\".*\\\\..*\\\\.marginnotes\" />\n            </intent-filter>\n            <intent-filter>\n                <action android:name=\"android.intent.action.SEND\" />\n                <action android:name=\"android.intent.action.SEND_MULTIPLE\" />\n                <category android:name=\"android.intent.category.DEFAULT\" />\n                <data android:mimeType=\"application/octet-stream\" />\n                <data android:mimeType=\"application/pdf\" />\n                <data android:mimeType=\"application/zip\" />\n                <data android:mimeType=\"application/x-zip-compressed\" />\n                <data android:mimeType=\"application/x-marginnote\" />\n                <data android:mimeType=\"application/x-mgnote-marginpkg\" />\n                <data android:mimeType=\"application/x-mgnote-marginnotes\" />\n            </intent-filter>\n        </activity-alias>"
+      ]
+    }
+  }
+}
