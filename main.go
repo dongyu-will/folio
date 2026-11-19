@@ -120,6 +120,7 @@ func main() {
 		} else {
 			app.flushImports()
 		}
+		app.scheduleAutoCheckUpdates()
 	})
 	if err := mygo.App.Run(); err != nil {
 		log.Fatal(err)

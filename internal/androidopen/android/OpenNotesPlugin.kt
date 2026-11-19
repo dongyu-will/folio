@@ -1,12 +1,15 @@
 package dev.mygo
 
+import android.app.Activity
 import android.content.ActivityNotFoundException
 import android.content.ContentResolver
+import android.content.Context
 import android.content.Intent
 import android.graphics.Bitmap
 import android.graphics.Color
 import android.graphics.Matrix
 import android.graphics.pdf.PdfRenderer
+import android.net.ConnectivityManager
 import android.net.Uri
 import android.os.Build
 import android.os.ParcelFileDescriptor
@@ -28,10 +31,13 @@ class OpenNotesPlugin : MyGoPlugin {
     private val worker = Executors.newSingleThreadExecutor()
     private val pdfForeground = Executors.newSingleThreadExecutor()
     private val pdfBackground = Executors.newSingleThreadExecutor()
+    @Volatile
+    private var deferredInstallPath: String? = null
 
     init {
         PluginHost.onIntent = ::open
         LaunchCover.install(PluginHost.context, PluginHost.activity)
+        LaunchCover.setOnActivityResumedListener(::resumeDeferredInstall)
     }
 
     override fun call(method: String, args: JSONObject, reply: PluginReply) {
@@ -68,6 +74,18 @@ class OpenNotesPlugin : MyGoPlugin {
                     reply.failure(PluginFailure("UpdateCacheDirFailed", err.localizedMessage ?: "无法准备更新缓存目录"))
                 }
             }
+            "canInstallAPK" -> {
+                try {
+                    reply.success(JSONObject().put("allowed", canInstallAPK(PluginHost.context)))
+                } catch (err: PluginFailure) {
+                    reply.failure(err)
+                } catch (err: Exception) {
+                    reply.failure(PluginFailure("CanInstallAPKFailed", err.localizedMessage ?: "无法检查安装权限"))
+                }
+            }
+            "systemProxy" -> {
+                reply.success(JSONObject().put("url", systemProxyUrl(PluginHost.context)))
+            }
             "installAPK" -> {
                 try {
                     reply.success(installAPK(args))
@@ -95,8 +113,65 @@ class OpenNotesPlugin : MyGoPlugin {
         return canonicalDir
     }
 
-    private fun installAPK(args: JSONObject): JSONObject {
-        val rawPath = args.optString("path", "").trim()
+    private fun canInstallAPK(context: Context): Boolean =
+        Build.VERSION.SDK_INT < Build.VERSION_CODES.O ||
+            context.packageManager.canRequestPackageInstalls()
+
+    private fun systemProxyUrl(context: Context): String {
+        val defaultProxy = try {
+            val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+            cm?.defaultProxy
+        } catch (_: SecurityException) {
+            null
+        } catch (_: Exception) {
+            null
+        }
+        if (defaultProxy != null) {
+            formatProxyUrl(defaultProxy.host, defaultProxy.port)?.let { return it }
+        }
+        for ((hostKey, portKey) in arrayOf(
+            "http.proxyHost" to "http.proxyPort",
+            "https.proxyHost" to "https.proxyPort",
+        )) {
+            val host = runCatching { System.getProperty(hostKey) }.getOrNull()
+            val port = runCatching { System.getProperty(portKey) }.getOrNull()?.trim()?.toIntOrNull()
+            if (port != null) {
+                formatProxyUrl(host, port)?.let { return it }
+            }
+        }
+        return ""
+    }
+
+    private fun formatProxyUrl(rawHost: String?, port: Int): String? {
+        val host = rawHost?.trim().orEmpty()
+        if (host.isEmpty() || port !in 1..65535) return null
+        for (ch in host) {
+            if (ch <= ' ' || ch.code == 0x7F || ch == '/' || ch == '\\' || ch == '?' || ch == '#' || ch == '@') {
+                return null
+            }
+        }
+        val firstColon = host.indexOf(':')
+        val formattedHost = when {
+            firstColon < 0 -> {
+                if (host.indexOf('[') >= 0 || host.indexOf(']') >= 0) return null
+                host
+            }
+            host.startsWith('[') && host.endsWith(']') -> {
+                val inner = host.substring(1, host.length - 1)
+                if (inner.isEmpty() || inner.indexOf('[') >= 0 || inner.indexOf(']') >= 0) return null
+                host
+            }
+            firstColon != host.lastIndexOf(':') -> {
+                if (host.indexOf('[') >= 0 || host.indexOf(']') >= 0) return null
+                "[$host]"
+            }
+            else -> return null
+        }
+        return "http://$formattedHost:$port"
+    }
+
+    private fun validateAPKFile(rawPathInput: String): File {
+        val rawPath = rawPathInput.trim()
         if (rawPath.isEmpty()) {
             throw PluginFailure("InvalidPath", "更新安装包路径为空")
         }
@@ -116,40 +191,71 @@ class OpenNotesPlugin : MyGoPlugin {
         ) {
             throw PluginFailure("InvalidAPK", "更新文件不是有效的 APK 安装包")
         }
+        return apkFile
+    }
 
+    private fun installAPK(args: JSONObject): JSONObject {
+        val apkFile = validateAPKFile(args.optString("path", ""))
         val context = PluginHost.context
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O &&
-            !context.packageManager.canRequestPackageInstalls()
-        ) {
-            val settingsIntent = Intent(
-                Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
-                Uri.parse("package:${context.packageName}")
-            ).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-            try {
-                (PluginHost.activity ?: context).startActivity(settingsIntent)
-            } catch (_: ActivityNotFoundException) {
-                val fallback = Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES)
-                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                try {
-                    (PluginHost.activity ?: context).startActivity(fallback)
-                } catch (_: ActivityNotFoundException) {
-                    throw PluginFailure("SettingsUnavailable", "无法打开未知来源应用安装权限设置")
-                }
-            }
+        val activity = LaunchCover.currentResumedActivity()
+        if (activity == null) {
+            deferredInstallPath = apkFile.absolutePath
+            return JSONObject().put("status", "deferred_until_foreground")
+        }
+        deferredInstallPath = null
+        if (!canInstallAPK(context)) {
+            launchUnknownSourcesSettings(activity, context)
             return JSONObject().put("status", "permission_required")
         }
+        launchAPKInstaller(activity, context, apkFile)
+        return JSONObject().put("status", "launched")
+    }
 
+    private fun resumeDeferredInstall(activity: Activity) {
+        val pendingPath = deferredInstallPath ?: return
+        deferredInstallPath = null
+        val apkFile = try {
+            validateAPKFile(pendingPath)
+        } catch (_: Exception) {
+            return
+        }
+        val context = PluginHost.context
+        if (!canInstallAPK(context)) {
+            runCatching { launchUnknownSourcesSettings(activity, context) }
+            return
+        }
+        runCatching { launchAPKInstaller(activity, context, apkFile) }
+    }
+
+    private fun launchUnknownSourcesSettings(activity: Activity, context: Context) {
+        val settingsIntent = Intent(
+            Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
+            Uri.parse("package:${context.packageName}")
+        ).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        try {
+            activity.startActivity(settingsIntent)
+        } catch (_: ActivityNotFoundException) {
+            val fallback = Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES)
+                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            try {
+                activity.startActivity(fallback)
+            } catch (_: ActivityNotFoundException) {
+                throw PluginFailure("SettingsUnavailable", "无法打开未知来源应用安装权限设置")
+            }
+        }
+    }
+
+    private fun launchAPKInstaller(activity: Activity, context: Context, apkFile: File) {
         val authority = "${context.packageName}.mygo.files"
         val contentUri = FileProvider.getUriForFile(context, authority, apkFile)
         val installIntent = Intent(Intent.ACTION_VIEW)
             .setDataAndType(contentUri, "application/vnd.android.package-archive")
             .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
         try {
-            (PluginHost.activity ?: context).startActivity(installIntent)
+            activity.startActivity(installIntent)
         } catch (_: ActivityNotFoundException) {
             throw PluginFailure("InstallerUnavailable", "系统未找到可用的 APK 安装程序")
         }
-        return JSONObject().put("status", "launched")
     }
 
     private fun renderPDF(args: JSONObject): JSONObject {

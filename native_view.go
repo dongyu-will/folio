@@ -120,6 +120,9 @@ func (a *workspace) view(c *ui.Context) {
 			if a.statusBanner(c, p) {
 				availableH -= 30
 			}
+			if a.updateBanner(c, p) {
+				availableH -= a.updateBannerHeight()
+			}
 			if a.bookID == "" {
 				a.emptyState(c, p)
 				return
@@ -197,6 +200,110 @@ func (a *workspace) statusBanner(c *ui.Context, p palette) bool {
 	return true
 }
 
+func (a *workspace) updateBannerHeight() float32 {
+	if a.touchUI() {
+		return 45
+	}
+	return 37
+}
+
+func (a *workspace) updateBanner(c *ui.Context, p palette) bool {
+	if a.preferencesOpen {
+		return false
+	}
+	st, dismissed := a.updateViewState()
+	if dismissed || !st.showsBanner() {
+		return false
+	}
+
+	ver := ""
+	if st.info != nil {
+		ver = strings.TrimSpace(st.info.Version)
+	}
+	var (
+		icon         = icUpdateRefresh
+		bannerText   string
+		primaryLabel string
+		primaryFn    func()
+	)
+	switch {
+	case st.phase == updateRelaunchRequired:
+		if ver != "" {
+			bannerText = fmt.Sprintf("新版本 v%s 已就绪，重启后生效", ver)
+		} else {
+			bannerText = "更新已就绪，重启后生效"
+		}
+		primaryLabel = "立即重启"
+		primaryFn = a.relaunchApp
+	case st.phase == updateAvailable && st.info != nil && st.info.PendingPath != "":
+		icon = icImport
+		if ver != "" {
+			bannerText = fmt.Sprintf("新版本 v%s 安装包已就绪", ver)
+		} else {
+			bannerText = "更新安装包已就绪"
+		}
+		services := c.Services()
+		primaryLabel = "立即安装"
+		primaryFn = func() { a.installUpdate(services) }
+	case st.phase == updatePermissionRequired && st.info != nil && st.info.PendingPath != "":
+		icon = icImport
+		if ver != "" {
+			bannerText = fmt.Sprintf("新版本 v%s 已下载，请开启安装权限", ver)
+		} else {
+			bannerText = "更新已下载，请开启安装权限"
+		}
+		primaryLabel = "查看更新"
+		primaryFn = a.openPreferences
+	default:
+		if ver != "" {
+			bannerText = fmt.Sprintf("发现新版本 v%s", ver)
+		} else {
+			bannerText = "发现新版本"
+		}
+		primaryLabel = "查看更新"
+		primaryFn = a.openPreferences
+	}
+
+	barH := float32(36)
+	btnH := float32(26)
+	padX := float32(16)
+	if a.touchUI() {
+		barH = 44
+		btnH = 32
+		padX = 12
+	}
+	ui.Row(c.Key("update-banner")).Height(barH).FillWidth().Shrink(0).Padding(0, padX).Gap(8).
+		AlignItems(ui.Center).Background(p.tint).Children(func() {
+		ui.Icon(c, icon).Size(14, 14).TextColor(p.accent).Shrink(0)
+		ui.Text(c, bannerText).FontSize(12.5).FontWeight(550).TextColor(p.accent).
+			Grow(1).MinWidth(0).SingleLine().Ellipsis("…")
+		act := ui.ButtonBase(c.Key("update-banner-action")).Height(btnH).PaddingX(10).Radius(6).Center().Shrink(0).
+			Label(primaryLabel).Disabled(a.editing()).FocusRingColor(p.accent).OnClick(primaryFn)
+		if a.editing() {
+			act.Background(p.accent.Alpha(.45))
+		} else if act.Pressed() {
+			act.Background(p.accentBot)
+		} else {
+			act.Background(p.accent)
+		}
+		act.Children(func() {
+			ui.Text(c, primaryLabel).FontSize(11.5).FontWeight(600).TextColor(p.onAccent).SingleLine()
+		})
+		later := ui.ButtonBase(c.Key("update-banner-dismiss")).Height(btnH).PaddingX(8).Radius(6).Center().Shrink(0).
+			Label("稍后").FocusRingColor(p.accent).OnClick(a.dismissUpdateBanner)
+		if later.Pressed() {
+			later.Background(p.pressed)
+		} else if later.Hovered() {
+			later.Background(p.hover)
+		}
+		later.Children(func() {
+			ui.Text(c, "稍后").FontSize(11.5).FontWeight(550).TextColor(p.secondary).SingleLine()
+		})
+	})
+	horizontalRule(c, p)
+	return true
+}
+
 func (a *workspace) emptyState(c *ui.Context, p palette) {
 	ui.Column(c).Grow(1).FillWidth().Center().Padding(24).Children(func() {
 		ui.Column(c).Width(420).MaxWidth(600).FillWidth().Padding(34, 32).Radius(16).Center().Gap(14).
@@ -233,9 +340,34 @@ func (a *workspace) mobileHeader(c *ui.Context, p palette, side bool) {
 			pillButton(c, p, "脑图", icArrowLeft, false, a.editing(), func() { a.page = browse })
 		}
 		a.transferButton(c, p)
-		iconButton(c, p, icSettings, "设置", false, a.editing(), a.openPreferences)
+		a.mobileSettingsButton(c, p)
 	})
 	horizontalRule(c, p)
+}
+
+func (a *workspace) mobileSettingsButton(c *ui.Context, p palette) {
+	disabled := a.editing()
+	b := ui.ButtonBase(c).Label("设置").Size(34, 34).Radius(8).Center().Shrink(0).
+		Disabled(disabled).FocusRingColor(p.accent).OnClick(a.openPreferences)
+	fg := p.quiet
+	if !disabled {
+		if b.Pressed() {
+			b.Background(p.pressed)
+			fg = p.ink
+		} else if b.Hovered() {
+			b.Background(p.hover)
+			fg = p.ink
+		}
+	} else {
+		fg = p.quiet.Alpha(.4)
+	}
+	b.Children(func() {
+		ui.Icon(c, icSettings).Size(15, 15).TextColor(fg)
+		if a.hasUpdateBadge() {
+			ui.Box(c.Key("mobile-update-dot")).Absolute().Top(5).Right(5).Size(7, 7).Radius(99).
+				Background(p.accent).Border(1, p.surface).Label("有可用更新")
+		}
+	})
 }
 
 func (a *workspace) sidebar(c *ui.Context, p palette, width float32, showBrandBar bool) {
@@ -340,7 +472,11 @@ func (a *workspace) sidebar(c *ui.Context, p palette, width float32, showBrandBa
 		settings.Children(func() {
 			ui.Icon(c, icSettings).Size(15, 15).TextColor(p.quiet)
 			ui.Text(c, "设置").FontSize(13).FontWeight(550).TextColor(p.secondary).Grow(1)
-			ui.Text(c, "v0.2.1").FontSize(11).TextColor(p.quiet)
+			if a.hasUpdateBadge() {
+				ui.Box(c.Key("sidebar-update-dot")).Size(7, 7).Radius(99).Shrink(0).
+					Background(p.accent).Label("有可用更新")
+			}
+			ui.Text(c, "v"+currentAppVersion()).FontSize(11).TextColor(p.quiet)
 		})
 
 	})

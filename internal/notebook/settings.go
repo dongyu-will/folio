@@ -17,13 +17,14 @@ const (
 )
 
 type Settings struct {
-	SidebarCollapsed bool   `json:"sidebarCollapsed"`
-	Appearance       string `json:"appearance,omitempty"`
-	GraphZoom        int    `json:"graphZoom,omitempty"`
-	GraphLayout      string `json:"graphLayout,omitempty"`
-	HideGrid         bool   `json:"hideGrid,omitempty"`
-	PDFNight         bool   `json:"pdfNight"`
-	PenTapToSelect   bool   `json:"penTapToSelect,omitempty"`
+	SidebarCollapsed    bool   `json:"sidebarCollapsed"`
+	Appearance          string `json:"appearance,omitempty"`
+	GraphZoom           int    `json:"graphZoom,omitempty"`
+	GraphLayout         string `json:"graphLayout,omitempty"`
+	HideGrid            bool   `json:"hideGrid,omitempty"`
+	PDFNight            bool   `json:"pdfNight"`
+	PenTapToSelect      bool   `json:"penTapToSelect,omitempty"`
+	LastUpdateCheckUnix int64  `json:"lastUpdateCheckUnix,omitempty"`
 }
 
 func (s Settings) LayoutMode() string {

@@ -51,10 +51,16 @@ internal object LaunchCover {
     private var registered = false
     private var cachedAppearance = ""
     private var currentActivity: WeakReference<Activity>? = null
+    private var resumedActivity: WeakReference<Activity>? = null
+    private var onActivityResumedListener: ((Activity) -> Unit)? = null
     private var coverView: View? = null
     private var surfaceLost = false
     private var state = State.IDLE
     private var generation = 0
+
+    @Volatile
+    var isResumed: Boolean = false
+        private set
 
     private var activeFrameCallback: Choreographer.FrameCallback? = null
     private var failSafeRunnable: Runnable? = null
@@ -87,6 +93,17 @@ internal object LaunchCover {
         override fun onActivityResumed(activity: Activity) {
             if (activity !is MyGoActivity) return
             currentActivity = WeakReference(activity)
+            resumedActivity = WeakReference(activity)
+            isResumed = true
+            if (onActivityResumedListener != null) {
+                main.post {
+                    if (isResumed && resumedActivity?.get() === activity &&
+                        !activity.isFinishing && !activity.isDestroyed
+                    ) {
+                        onActivityResumedListener?.invoke(activity)
+                    }
+                }
+            }
             if (!surfaceLost) return
             surfaceLost = false
             applyWindowBackground(activity)
@@ -111,10 +128,20 @@ internal object LaunchCover {
             }
         }
 
-        override fun onActivityPaused(activity: Activity) = Unit
+        override fun onActivityPaused(activity: Activity) {
+            if (activity !is MyGoActivity) return
+            if (resumedActivity?.get() === activity) {
+                resumedActivity = null
+                isResumed = false
+            }
+        }
 
         override fun onActivityStopped(activity: Activity) {
             if (activity !is MyGoActivity) return
+            if (resumedActivity?.get() === activity) {
+                resumedActivity = null
+                isResumed = false
+            }
             if (currentActivity?.get() !== activity) return
             cancelPending()
             generation++
@@ -130,6 +157,10 @@ internal object LaunchCover {
 
         override fun onActivityDestroyed(activity: Activity) {
             if (activity !is MyGoActivity) return
+            if (resumedActivity?.get() === activity) {
+                resumedActivity = null
+                isResumed = false
+            }
             coverView?.let { view ->
                 if (view.context === activity) {
                     removeCoverView(view)
@@ -171,6 +202,19 @@ internal object LaunchCover {
                     startColdPoll(gen)
                 }
             }
+        }
+    }
+
+    fun currentResumedActivity(): Activity? {
+        if (!isResumed) return null
+        val activity = resumedActivity?.get() ?: return null
+        if (activity.isFinishing || activity.isDestroyed) return null
+        return activity
+    }
+
+    fun setOnActivityResumedListener(listener: ((Activity) -> Unit)?) {
+        runOnMain {
+            onActivityResumedListener = listener
         }
     }
 

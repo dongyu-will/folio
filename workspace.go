@@ -103,11 +103,18 @@ type workspace struct {
 	importPaths      []queuedImport
 	takeDownloadFn   func(context.Context) (*pendingAndroidDownload, error)
 
-	updateMu        sync.Mutex
-	update          updateUIState
-	checkUpdateFn   func(context.Context) (*updateInfo, error)
-	installUpdateFn func(context.Context, *updateInfo, func(downloaded, total int64)) (updateInstallResult, error)
-	relaunchFn      func()
+	updateMu                    sync.Mutex
+	update                      updateUIState
+	updateBannerDismissed       bool
+	updateCancel                context.CancelFunc
+	updateDownloadGen           uint64
+	updateCanceledGen           uint64
+	autoCheckRunning            bool
+	checkUpdateFn               func(context.Context) (*updateInfo, error)
+	installUpdateFn             func(context.Context, *updateInfo, func(downloaded, total int64)) (updateInstallResult, error)
+	relaunchFn                  func()
+	checkPendingAndroidUpdateFn func() (*updateInfo, bool)
+	isOnlineFn                  func() bool
 
 	message      string
 	messageError bool
@@ -135,8 +142,14 @@ const (
 	updateDownloading
 	updateRelaunchRequired
 	updatePermissionRequired
+	updateDeferredForeground
 	updateInstallerLaunched
 	updateError
+)
+
+const (
+	autoUpdateCheckDelay    = 2 * time.Second
+	autoUpdateCheckInterval = 12 * time.Hour
 )
 
 type updateUIState struct {
@@ -145,6 +158,28 @@ type updateUIState struct {
 	downloaded int64
 	total      int64
 	errText    string
+}
+
+func (st updateUIState) hasAttention() bool {
+	switch st.phase {
+	case updateAvailable, updateRelaunchRequired, updateDeferredForeground:
+		return true
+	case updatePermissionRequired:
+		return st.info != nil && st.info.PendingPath != ""
+	default:
+		return false
+	}
+}
+
+func (st updateUIState) showsBanner() bool {
+	switch st.phase {
+	case updateAvailable, updateRelaunchRequired:
+		return true
+	case updatePermissionRequired:
+		return st.info != nil && st.info.PendingPath != ""
+	default:
+		return false
+	}
 }
 
 type noteTree struct {
@@ -1113,6 +1148,29 @@ func (a *workspace) updateSnapshot() updateUIState {
 	return st
 }
 
+func (a *workspace) updateViewState() (updateUIState, bool) {
+	a.updateMu.Lock()
+	defer a.updateMu.Unlock()
+	st := a.update
+	if st.info != nil {
+		cp := *st.info
+		st.info = &cp
+	}
+	return st, a.updateBannerDismissed
+}
+
+func (a *workspace) hasUpdateBadge() bool {
+	a.updateMu.Lock()
+	defer a.updateMu.Unlock()
+	return a.update.hasAttention()
+}
+
+func (a *workspace) dismissUpdateBanner() {
+	a.updateMu.Lock()
+	a.updateBannerDismissed = true
+	a.updateMu.Unlock()
+}
+
 func (a *workspace) setUpdateState(services ui.Services, fn func(*updateUIState)) {
 	if win := a.window(); win != nil {
 		win.Update(func() {
@@ -1126,6 +1184,135 @@ func (a *workspace) setUpdateState(services ui.Services, fn func(*updateUIState)
 	fn(&a.update)
 	a.updateMu.Unlock()
 	services.Invalidate()
+}
+
+func (a *workspace) scheduleAutoCheckUpdates() {
+	go func() {
+		time.Sleep(autoUpdateCheckDelay)
+		a.maybeAutoCheckUpdates()
+	}()
+}
+
+func (a *workspace) readLastUpdateCheckUnix() int64 {
+	if a.window() != nil && a.store != nil {
+		if s, err := a.store.ReadSettings(); err == nil {
+			return s.LastUpdateCheckUnix
+		}
+		return 0
+	}
+	return a.settings.LastUpdateCheckUnix
+}
+
+func (a *workspace) recordUpdateCheckUnix(nowUnix int64) {
+	apply := func() {
+		if a.settings.LastUpdateCheckUnix >= nowUnix {
+			return
+		}
+		next := a.settings
+		next.LastUpdateCheckUnix = nowUnix
+		a.settings = next
+		if a.store != nil {
+			_ = a.store.SaveSettings(next)
+		}
+	}
+	if a.hasUI() {
+		a.updateUI(apply)
+		return
+	}
+	apply()
+}
+
+func (a *workspace) isNetworkOnline() bool {
+	if a.isOnlineFn != nil {
+		return a.isOnlineFn()
+	}
+	// mygo.Network.Status() requires App.Run to have started; skip it in headless tests.
+	if a.window() == nil {
+		return true
+	}
+	return mygo.Network.Status().Online
+}
+
+func (a *workspace) maybeAutoCheckUpdates() {
+	a.updateMu.Lock()
+	if a.update.phase != updateIdle || a.autoCheckRunning {
+		a.updateMu.Unlock()
+		return
+	}
+	a.autoCheckRunning = true
+	pendingFn := a.checkPendingAndroidUpdateFn
+	if pendingFn == nil && runtime.GOOS == "android" {
+		pendingFn = checkPendingAndroidUpdate
+	}
+	checkFn := a.checkUpdateFn
+	if checkFn == nil {
+		checkFn = checkAppUpdate
+	}
+	a.updateMu.Unlock()
+
+	defer func() {
+		a.updateMu.Lock()
+		a.autoCheckRunning = false
+		a.updateMu.Unlock()
+	}()
+
+	// 1. On Android, check first for an already-downloaded verified pending APK
+	// (e.g. after Android restarted the app when granting Unknown Sources permission).
+	if pendingFn != nil {
+		if pendingInfo, canInstallNow := pendingFn(); pendingInfo != nil {
+			cp := *pendingInfo
+			targetPhase := updateAvailable
+			if !canInstallNow {
+				targetPhase = updatePermissionRequired
+			}
+			a.setUpdateState(ui.Services{}, func(st *updateUIState) {
+				if st.phase != updateIdle {
+					return
+				}
+				*st = updateUIState{
+					phase: targetPhase,
+					info:  &cp,
+				}
+				a.updateBannerDismissed = false
+			})
+			return
+		}
+	}
+
+	// 2. Throttle automatic background checks to once every 12 hours.
+	lastCheckUnix := a.readLastUpdateCheckUnix()
+	if lastCheckUnix > 0 && time.Since(time.Unix(lastCheckUnix, 0)) < autoUpdateCheckInterval {
+		return
+	}
+
+	// 3. Avoid unnecessary requests while offline.
+	if !a.isNetworkOnline() {
+		return
+	}
+
+	// 4. Run a silent check: persist timestamp on success (including up-to-date
+	// and errNoPublishedRelease), stay completely silent on network errors.
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	info, err := checkFn(ctx)
+	if err != nil && !errors.Is(err, errNoPublishedRelease) {
+		return
+	}
+	a.recordUpdateCheckUnix(time.Now().Unix())
+	if info == nil {
+		return
+	}
+	cp := *info
+	a.setUpdateState(ui.Services{}, func(st *updateUIState) {
+		if st.phase != updateIdle && st.phase != updateUpToDate && st.phase != updateNoRelease {
+			return
+		}
+		*st = updateUIState{
+			phase: updateAvailable,
+			info:  &cp,
+		}
+		a.updateBannerDismissed = false
+	})
 }
 
 func (a *workspace) checkForUpdates(services ui.Services) {
@@ -1163,17 +1350,55 @@ func (a *workspace) checkForUpdates(services ui.Services) {
 					phase: updateAvailable,
 					info:  &cp,
 				}
+				a.updateBannerDismissed = false
 			}
 		})
+		if (err == nil || errors.Is(err, errNoPublishedRelease)) && a.window() != nil {
+			a.recordUpdateCheckUnix(time.Now().Unix())
+		}
 	}()
 }
 
-func (a *workspace) installUpdate(services ui.Services) {
+func (a *workspace) isDownloadSuperseded(gen uint64) bool {
 	a.updateMu.Lock()
-	if a.update.phase == updateChecking || a.update.phase == updateDownloading || a.update.info == nil {
+	defer a.updateMu.Unlock()
+	return a.updateDownloadGen != gen || a.updateCanceledGen == gen
+}
+
+func (a *workspace) cancelUpdateDownload() {
+	a.updateMu.Lock()
+	if a.update.phase != updateDownloading {
 		a.updateMu.Unlock()
 		return
 	}
+	cancel := a.updateCancel
+	a.updateCancel = nil
+	a.updateCanceledGen = a.updateDownloadGen
+	info := a.update.info
+	a.update = updateUIState{
+		phase: updateAvailable,
+		info:  info,
+	}
+	a.updateMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	if win := a.window(); win != nil {
+		win.Update(func() {})
+	}
+}
+
+func (a *workspace) installUpdate(services ui.Services) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	a.updateMu.Lock()
+	if a.update.phase == updateChecking || a.update.phase == updateDownloading || a.update.info == nil {
+		a.updateMu.Unlock()
+		cancel()
+		return
+	}
+	a.updateDownloadGen++
+	gen := a.updateDownloadGen
+	a.updateCancel = cancel
 	infoCopy := *a.update.info
 	a.update = updateUIState{
 		phase: updateDownloading,
@@ -1187,7 +1412,6 @@ func (a *workspace) installUpdate(services ui.Services) {
 	services.Invalidate()
 
 	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 		defer cancel()
 
 		var (
@@ -1215,7 +1439,7 @@ func (a *workspace) installUpdate(services ui.Services) {
 			progMu.Unlock()
 
 			a.setUpdateState(services, func(st *updateUIState) {
-				if st.phase != updateDownloading {
+				if st.phase != updateDownloading || a.updateDownloadGen != gen || a.updateCanceledGen == gen {
 					return
 				}
 				st.downloaded = downloaded
@@ -1225,9 +1449,16 @@ func (a *workspace) installUpdate(services ui.Services) {
 
 		res, err := installFn(ctx, &infoCopy, progress)
 		a.setUpdateState(services, func(st *updateUIState) {
+			if a.updateDownloadGen == gen {
+				a.updateCancel = nil
+			}
+			if a.updateDownloadGen != gen || a.updateCanceledGen == gen {
+				return
+			}
 			if err != nil {
 				*st = updateUIState{
 					phase:   updateError,
+					info:    &infoCopy,
 					errText: summarizeUpdateError(err),
 				}
 				return
@@ -1237,13 +1468,15 @@ func (a *workspace) installUpdate(services ui.Services) {
 				st.phase = updateRelaunchRequired
 			case res.PermissionRequired:
 				st.phase = updatePermissionRequired
+			case res.DeferredUntilForeground:
+				st.phase = updateDeferredForeground
 			case res.FallbackURL != "":
 				st.phase = updateAvailable
 			default:
 				st.phase = updateInstallerLaunched
 			}
 		})
-		if err == nil && res.FallbackURL != "" && ui.SafeToOpen(res.FallbackURL) {
+		if err == nil && res.FallbackURL != "" && ui.SafeToOpen(res.FallbackURL) && !a.isDownloadSuperseded(gen) {
 			if win := a.window(); win != nil {
 				urlToOpen := res.FallbackURL
 				win.Update(func() { services.OpenURL(urlToOpen) })
@@ -1263,6 +1496,9 @@ func (a *workspace) relaunchApp() {
 func summarizeUpdateError(err error) string {
 	if err == nil {
 		return ""
+	}
+	if errors.Is(err, errDownloadStalled) {
+		return errDownloadStalled.Error()
 	}
 	if errors.Is(err, context.DeadlineExceeded) {
 		return "连接超时，请检查网络连接后重试"

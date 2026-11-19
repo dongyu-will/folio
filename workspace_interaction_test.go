@@ -1611,3 +1611,369 @@ func TestAndroidFrameReadySignaledOncePerLaunchAndResume(t *testing.T) {
 		t.Fatalf("post-resume frameReady count = %d, want 2", readyCount)
 	}
 }
+
+func TestAutoCheckUpdatesThrottleSilentAndBanner(t *testing.T) {
+	app := &workspace{store: notebook.NewStore(t.TempDir())}
+	book := notebook.Book{
+		ID:    "auto-update-book",
+		Title: "自动更新测试",
+		Roots: []string{"n1"},
+		Notes: []notebook.Note{{ID: "n1", Title: "节点一", Body: "内容"}},
+	}
+	app.setLibrary(notebook.Library{Books: []notebook.Book{book}}, book.ID)
+
+	// Verify sidebar displays dynamic currentAppVersion() and has no update dot/banner initially.
+	tester := ui.NewTester(app.view, 1280, 800)
+	tester.Frame()
+	wantSidebarVer := "v" + currentAppVersion()
+	if !tester.HasText(wantSidebarVer) {
+		t.Fatalf("expected sidebar version %q, texts=%v", wantSidebarVer, tester.Texts())
+	}
+	if _, ok := tester.Find("有可用更新"); ok {
+		t.Fatal("did not expect update badge dot before any update is found")
+	}
+
+	// 1. Offline skips network check without touching LastUpdateCheckUnix.
+	checkCalls := 0
+	app.isOnlineFn = func() bool { return false }
+	app.checkUpdateFn = func(ctx context.Context) (*updateInfo, error) {
+		checkCalls++
+		return nil, nil
+	}
+	app.maybeAutoCheckUpdates()
+	if checkCalls != 0 || app.settings.LastUpdateCheckUnix != 0 {
+		t.Fatalf("offline check should skip cleanly: calls=%d lastCheck=%d", checkCalls, app.settings.LastUpdateCheckUnix)
+	}
+
+	// 2. Network error stays completely silent (no updateError phase, no banner, no timestamp bump).
+	app.isOnlineFn = func() bool { return true }
+	app.checkUpdateFn = func(ctx context.Context) (*updateInfo, error) {
+		checkCalls++
+		return nil, errors.New("dial tcp: network unreachable")
+	}
+	app.maybeAutoCheckUpdates()
+	if checkCalls != 1 {
+		t.Fatalf("expected 1 check attempt, got %d", checkCalls)
+	}
+	if st := app.updateSnapshot(); st.phase != updateIdle || st.errText != "" {
+		t.Fatalf("startup network error must stay silent, got %+v", st)
+	}
+	if app.settings.LastUpdateCheckUnix != 0 {
+		t.Fatalf("failed startup check must not advance LastUpdateCheckUnix, got %d", app.settings.LastUpdateCheckUnix)
+	}
+	tester.Frame()
+	if tester.HasText("network unreachable") || tester.HasText("检查更新失败") {
+		t.Fatalf("startup network error leaked into UI: texts=%v", tester.Texts())
+	}
+
+	// 3. Up-to-date check persists LastUpdateCheckUnix and activates 12h throttle.
+	app.checkUpdateFn = func(ctx context.Context) (*updateInfo, error) {
+		checkCalls++
+		return nil, nil
+	}
+	app.maybeAutoCheckUpdates()
+	if checkCalls != 2 {
+		t.Fatalf("expected 2 total check calls, got %d", checkCalls)
+	}
+	if app.settings.LastUpdateCheckUnix <= 0 {
+		t.Fatal("expected LastUpdateCheckUnix persisted in workspace settings")
+	}
+	if saved, err := app.store.ReadSettings(); err != nil || saved.LastUpdateCheckUnix != app.settings.LastUpdateCheckUnix {
+		t.Fatalf("expected LastUpdateCheckUnix persisted to disk: saved=%+v err=%v", saved, err)
+	}
+
+	// Within 12h throttle -> skip!
+	app.maybeAutoCheckUpdates()
+	app.settings.LastUpdateCheckUnix = time.Now().Add(-11 * time.Hour).Unix()
+	app.maybeAutoCheckUpdates()
+	if checkCalls != 2 {
+		t.Fatalf("expected checks within 12h throttle to be skipped, got %d calls", checkCalls)
+	}
+
+	// 4. Stale (>12h) check with errNoPublishedRelease persists timestamp & stays silent.
+	app.settings.LastUpdateCheckUnix = time.Now().Add(-13 * time.Hour).Unix()
+	app.checkUpdateFn = func(ctx context.Context) (*updateInfo, error) {
+		checkCalls++
+		return nil, errNoPublishedRelease
+	}
+	app.maybeAutoCheckUpdates()
+	if checkCalls != 3 {
+		t.Fatalf("expected stale check to run (calls=%d)", checkCalls)
+	}
+	if time.Since(time.Unix(app.settings.LastUpdateCheckUnix, 0)) > time.Minute {
+		t.Fatalf("expected errNoPublishedRelease to refresh LastUpdateCheckUnix, got %d", app.settings.LastUpdateCheckUnix)
+	}
+	if st := app.updateSnapshot(); st.phase != updateIdle {
+		t.Fatalf("expected silent idle state for errNoPublishedRelease on startup, got %+v", st)
+	}
+
+	// 5. Stale check finds a newer version -> surfaces banner + badge dot (resetting dismissal).
+	app.settings.LastUpdateCheckUnix = time.Now().Add(-13 * time.Hour).Unix()
+	app.updateBannerDismissed = true
+	app.checkUpdateFn = func(ctx context.Context) (*updateInfo, error) {
+		checkCalls++
+		return &updateInfo{
+			Version:    "0.9.0",
+			Notes:      "新增自动更新提示",
+			ReleaseURL: folioReleasesURL,
+			UsingMyGo:  true,
+		}, nil
+	}
+	app.maybeAutoCheckUpdates()
+	if checkCalls != 4 {
+		t.Fatalf("expected stale check to run (calls=%d)", checkCalls)
+	}
+	if st := app.updateSnapshot(); st.phase != updateAvailable || st.info == nil || st.info.Version != "0.9.0" {
+		t.Fatalf("expected updateAvailable v0.9.0, got %+v", st)
+	}
+	if app.updateBannerDismissed {
+		t.Fatal("expected newly discovered update to clear updateBannerDismissed")
+	}
+
+	// Desktop UI shows banner + sidebar badge dot.
+	tester.Frame()
+	for _, want := range []string{"发现新版本 v0.9.0", "查看更新", "稍后"} {
+		if !tester.HasText(want) {
+			t.Fatalf("expected %q in desktop update banner; texts=%v", want, tester.Texts())
+		}
+	}
+	if _, ok := tester.Find("有可用更新"); !ok {
+		t.Fatal("expected Settings badge dot in desktop sidebar when updateAvailable")
+	}
+
+	// Clicking "查看更新" opens Settings and hides the top banner while Settings is open.
+	if err := tester.Click("查看更新"); err != nil {
+		t.Fatalf("click 查看更新: %v", err)
+	}
+	if !app.preferencesOpen {
+		t.Fatal("expected 查看更新 to open Settings")
+	}
+	if tester.HasText("稍后") {
+		t.Fatal("expected update banner hidden while Settings is open")
+	}
+	tester.Key(0, ui.KeyEscape)
+	if app.preferencesOpen || !tester.HasText("发现新版本 v0.9.0") {
+		t.Fatalf("expected banner visible again after closing Settings: prefs=%v", app.preferencesOpen)
+	}
+
+	// Clicking "稍后" dismisses banner cleanly while keeping the Settings badge dot.
+	if err := tester.Click("稍后"); err != nil {
+		t.Fatalf("click 稍后: %v", err)
+	}
+	if !app.updateBannerDismissed {
+		t.Fatal("expected 稍后 to set updateBannerDismissed=true")
+	}
+	if tester.HasText("发现新版本 v0.9.0") {
+		t.Fatal("expected banner hidden after clicking 稍后")
+	}
+	if _, ok := tester.Find("有可用更新"); !ok {
+		t.Fatal("expected Settings badge dot to remain visible after dismissing banner")
+	}
+
+	// Narrow mobile layout also renders mobile header badge dot and compact banner cleanly.
+	app.updateMu.Lock()
+	app.updateBannerDismissed = false
+	app.updateMu.Unlock()
+	app.forceTouchUI = true
+	mobile := ui.NewTester(app.view, 400, 800)
+	mobile.Frame()
+	if !mobile.HasText("发现新版本 v0.9.0") || !mobile.HasText("查看更新") || !mobile.HasText("稍后") {
+		t.Fatalf("expected compact update banner on mobile; texts=%v", mobile.Texts())
+	}
+	if _, ok := mobile.Find("有可用更新"); !ok {
+		t.Fatal("expected Settings badge dot in mobile header")
+	}
+}
+
+func TestAutoCheckUpdatesPendingAndroidAPKOneTapInstall(t *testing.T) {
+	// Even when offline and checked seconds ago, a verified pending Android APK surfaces immediately.
+	app := &workspace{store: notebook.NewStore(t.TempDir()), forceTouchUI: true}
+	app.settings.LastUpdateCheckUnix = time.Now().Unix()
+	app.isOnlineFn = func() bool { return false }
+	remoteChecks := 0
+	app.checkUpdateFn = func(ctx context.Context) (*updateInfo, error) {
+		remoteChecks++
+		return nil, nil
+	}
+	app.checkPendingAndroidUpdateFn = func() (*updateInfo, bool) {
+		return &updateInfo{
+			Version:     "0.9.1",
+			PendingPath: "/cache/updates/folio-0.9.1-arm64.apk",
+			ReleaseURL:  folioReleasesURL,
+		}, true
+	}
+
+	app.maybeAutoCheckUpdates()
+	if remoteChecks != 0 {
+		t.Fatalf("pending Android APK should bypass network check, got %d remote calls", remoteChecks)
+	}
+	if st := app.updateSnapshot(); st.phase != updateAvailable || st.info == nil || st.info.PendingPath == "" {
+		t.Fatalf("expected ready pending APK state, got %+v", st)
+	}
+
+	installCalled := make(chan string, 1)
+	app.installUpdateFn = func(ctx context.Context, info *updateInfo, progress func(int64, int64)) (updateInstallResult, error) {
+		installCalled <- info.PendingPath
+		return updateInstallResult{}, nil
+	}
+	tester := ui.NewTester(app.view, 400, 800)
+	tester.Frame()
+	if !tester.HasText("新版本 v0.9.1 安装包已就绪") || !tester.HasText("立即安装") {
+		t.Fatalf("expected 1-tap pending APK banner; texts=%v", tester.Texts())
+	}
+	if err := tester.Click("立即安装"); err != nil {
+		t.Fatalf("click 立即安装: %v", err)
+	}
+	select {
+	case gotPath := <-installCalled:
+		if gotPath != "/cache/updates/folio-0.9.1-arm64.apk" {
+			t.Fatalf("installUpdateFn received path %q, want pending APK path", gotPath)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for 1-tap pending APK install invocation")
+	}
+
+	// When Unknown Sources permission is still missing, pending APK surfaces permission guidance.
+	permApp := &workspace{store: notebook.NewStore(t.TempDir()), forceTouchUI: true}
+	permApp.checkPendingAndroidUpdateFn = func() (*updateInfo, bool) {
+		return &updateInfo{
+			Version:     "0.9.1",
+			PendingPath: "/cache/updates/folio-0.9.1-arm64.apk",
+			ReleaseURL:  folioReleasesURL,
+		}, false
+	}
+	permApp.maybeAutoCheckUpdates()
+	if st := permApp.updateSnapshot(); st.phase != updatePermissionRequired {
+		t.Fatalf("expected updatePermissionRequired when canInstallNow=false, got %+v", st)
+	}
+	if !permApp.hasUpdateBadge() {
+		t.Fatal("expected badge dot when pending APK awaits install permission")
+	}
+}
+
+func TestUpdateDownloadFailureRetryCancelDeferredAndTouchTargets(t *testing.T) {
+	relURL := "https://github.com/dongyu-will/folio/releases/tag/v0.9.2"
+	app := &workspace{store: notebook.NewStore(t.TempDir()), forceTouchUI: true}
+	app.updateMu.Lock()
+	app.update = updateUIState{
+		phase: updateAvailable,
+		info: &updateInfo{
+			Version:    "0.9.2",
+			Notes:      "修复移动端下载稳定性",
+			ReleaseURL: relURL,
+			UsingMyGo:  true,
+		},
+	}
+	app.updateMu.Unlock()
+	app.openPreferences()
+
+	tester := ui.NewTester(app.view, 480, 800)
+	scrollToBottom := func() {
+		tester.Frame()
+		tester.Scroll(240, 400, 0, 2000)
+		tester.Frame()
+	}
+	waitPhase := func(want updatePhase) {
+		t.Helper()
+		deadline := time.Now().Add(2 * time.Second)
+		for time.Now().Before(deadline) {
+			if app.updateSnapshot().phase == want {
+				scrollToBottom()
+				return
+			}
+			time.Sleep(2 * time.Millisecond)
+		}
+		t.Fatalf("timed out waiting for phase %d, got %+v", want, app.updateSnapshot())
+	}
+
+	scrollToBottom()
+	// 1. Verify touchUI bumps settingPrimaryButton & settingButton height to 36.
+	primaryRect, ok := tester.Find("下载并更新")
+	if !ok || primaryRect.H != 36 {
+		t.Fatalf("expected touch settingPrimaryButton height=36, got ok=%v rect=%+v", ok, primaryRect)
+	}
+	secRect, ok := tester.Find("前往发布页")
+	if !ok || secRect.H != 36 {
+		t.Fatalf("expected touch settingButton height=36, got ok=%v rect=%+v", ok, secRect)
+	}
+
+	// 2. Download failure retains st.info so user keeps "重试下载" + "前往发布页" right beside the error.
+	app.installUpdateFn = func(ctx context.Context, info *updateInfo, progress func(int64, int64)) (updateInstallResult, error) {
+		return updateInstallResult{}, errDownloadStalled
+	}
+	if err := tester.Click("下载并更新"); err != nil {
+		t.Fatalf("click 下载并更新: %v", err)
+	}
+	waitPhase(updateError)
+	if st := app.updateSnapshot(); st.info == nil || st.info.Version != "0.9.2" {
+		t.Fatalf("download failure must preserve st.info, got %+v", st)
+	}
+	for _, want := range []string{errDownloadStalled.Error(), "重试下载", "前往发布页"} {
+		if !tester.HasText(want) {
+			t.Fatalf("expected %q after download failure; texts=%v", want, tester.Texts())
+		}
+	}
+	if err := tester.Click("前往发布页"); err != nil {
+		t.Fatalf("click 前往发布页 after failure: %v", err)
+	}
+	if !slices.Contains(tester.OpenedURLs(), relURL) {
+		t.Fatalf("expected OpenURL(%q), got %v", relURL, tester.OpenedURLs())
+	}
+
+	// 3. Clicking "取消" while downloading cancels the in-flight context and returns cleanly to updateAvailable.
+	started := make(chan struct{})
+	ctxCanceled := make(chan struct{})
+	returned := make(chan struct{})
+	app.installUpdateFn = func(ctx context.Context, info *updateInfo, progress func(int64, int64)) (updateInstallResult, error) {
+		progress(25, 100)
+		close(started)
+		<-ctx.Done()
+		close(ctxCanceled)
+		defer close(returned)
+		return updateInstallResult{}, ctx.Err()
+	}
+	if err := tester.Click("重试下载"); err != nil {
+		t.Fatalf("click 重试下载: %v", err)
+	}
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for retry download to start")
+	}
+	scrollToBottom()
+	if !tester.HasText("下载中…") || !tester.HasText("取消") {
+		t.Fatalf("expected 下载中… and 取消 while downloading; texts=%v", tester.Texts())
+	}
+	if err := tester.Click("取消"); err != nil {
+		t.Fatalf("click 取消: %v", err)
+	}
+	select {
+	case <-ctxCanceled:
+	case <-time.After(2 * time.Second):
+		t.Fatal("cancelUpdateDownload did not cancel in-flight download context")
+	}
+	select {
+	case <-returned:
+	case <-time.After(2 * time.Second):
+		t.Fatal("download goroutine did not exit after cancel")
+	}
+	scrollToBottom()
+	if st := app.updateSnapshot(); st.phase != updateAvailable || st.info == nil || st.info.Version != "0.9.2" {
+		t.Fatalf("expected clean return to updateAvailable with info preserved after cancel, got %+v", st)
+	}
+	if !tester.HasText("下载并更新") {
+		t.Fatalf("expected 下载并更新 button restored after cancel; texts=%v", tester.Texts())
+	}
+
+	// 4. DeferredUntilForeground renders the exact Chinese hint cleanly.
+	app.installUpdateFn = func(ctx context.Context, info *updateInfo, progress func(int64, int64)) (updateInstallResult, error) {
+		return updateInstallResult{DeferredUntilForeground: true}, nil
+	}
+	if err := tester.Click("下载并更新"); err != nil {
+		t.Fatalf("click 下载并更新 (deferred): %v", err)
+	}
+	waitPhase(updateDeferredForeground)
+	if !tester.HasText("下载已完成，返回应用将自动打开安装器") || !tester.HasText("安装更新") {
+		t.Fatalf("expected deferred foreground guidance and 安装更新 button; texts=%v", tester.Texts())
+	}
+}

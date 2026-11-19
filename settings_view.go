@@ -154,12 +154,23 @@ func settingRow(c *ui.Context, p palette, compact bool, title, hint string, cont
 	})
 }
 
-func settingButton(c *ui.Context, p palette, title string, icon *ui.SVG, danger, disabled bool, action func()) {
+func settingButtonHeight(touch bool) float32 {
+	if touch {
+		return 36
+	}
+	return 30
+}
+
+func settingButtonWithHeight(c *ui.Context, p palette, h float32, title string, icon *ui.SVG, danger, disabled bool, action func()) ui.Element {
 	fg, bg, border := p.ink, p.elevated, p.border
 	if danger {
 		fg, bg, border = p.danger, p.dangerWash, p.danger.Alpha(.35)
 	}
-	button := ui.ButtonBase(c).Height(30).PaddingX(10).Gap(6).Center().Radius(8).Shrink(0).
+	padX := float32(10)
+	if h >= 36 {
+		padX = 12
+	}
+	button := ui.ButtonBase(c).Height(h).PaddingX(padX).Gap(6).Center().Radius(8).Shrink(0).
 		Background(bg).Border(1, border).Shadow(0, 1, 2, 0, p.shadowSoft).
 		Label(title).Disabled(disabled).FocusRingColor(p.accent).OnClick(action)
 	if disabled {
@@ -173,6 +184,15 @@ func settingButton(c *ui.Context, p palette, title string, icon *ui.SVG, danger,
 		}
 		ui.Text(c, title).FontSize(12).TextColor(fg).SingleLine()
 	})
+	return button
+}
+
+func settingButton(c *ui.Context, p palette, title string, icon *ui.SVG, danger, disabled bool, action func()) ui.Element {
+	return settingButtonWithHeight(c, p, settingButtonHeight(isMobilePlatform()), title, icon, danger, disabled, action)
+}
+
+func (a *workspace) settingButton(c *ui.Context, p palette, title string, icon *ui.SVG, danger, disabled bool, action func()) ui.Element {
+	return settingButtonWithHeight(c, p, settingButtonHeight(a.touchUI()), title, icon, danger, disabled, action)
 }
 
 var (
@@ -180,8 +200,12 @@ var (
 	icExternalLink  = svgIcon(`<path d="M14 5h5v5"/><path d="M10 14 19 5"/><path d="M19 13v5a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2h5"/>`)
 )
 
-func settingPrimaryButton(c *ui.Context, p palette, title string, icon *ui.SVG, disabled bool, action func()) {
-	button := ui.ButtonBase(c).Height(30).PaddingX(11).Gap(6).Center().Radius(8).Shrink(0).
+func settingPrimaryButtonWithHeight(c *ui.Context, p palette, h float32, title string, icon *ui.SVG, disabled bool, action func()) ui.Element {
+	padX := float32(11)
+	if h >= 36 {
+		padX = 13
+	}
+	button := ui.ButtonBase(c).Height(h).PaddingX(padX).Gap(6).Center().Radius(8).Shrink(0).
 		Label(title).Disabled(disabled).FocusRingColor(p.accent).OnClick(action)
 	if disabled {
 		button.Background(p.accent.Alpha(.45))
@@ -200,6 +224,15 @@ func settingPrimaryButton(c *ui.Context, p palette, title string, icon *ui.SVG, 
 		}
 		ui.Text(c, title).FontSize(12).FontWeight(550).TextColor(p.onAccent).SingleLine()
 	})
+	return button
+}
+
+func settingPrimaryButton(c *ui.Context, p palette, title string, icon *ui.SVG, disabled bool, action func()) ui.Element {
+	return settingPrimaryButtonWithHeight(c, p, settingButtonHeight(isMobilePlatform()), title, icon, disabled, action)
+}
+
+func (a *workspace) settingPrimaryButton(c *ui.Context, p palette, title string, icon *ui.SVG, disabled bool, action func()) ui.Element {
+	return settingPrimaryButtonWithHeight(c, p, settingButtonHeight(a.touchUI()), title, icon, disabled, action)
 }
 
 func (a *workspace) settingsCard(c *ui.Context, p palette, width, height float32) {
@@ -327,13 +360,13 @@ func (a *workspace) storageSettings(c *ui.Context, p palette, compact bool) {
 	settingGroup(c, p, "存储与数据", func() {
 		settingRow(c, p, compact, "导入与导出", "MarginNote、PDF 或带图 Markdown", func() {
 			ui.Row(c).Gap(8).Shrink(0).Children(func() {
-				settingButton(c, p, "导入笔记", icSettingImport, false, a.busy, a.chooseImport)
-				settingButton(c, p, "导出 MD", icSettingExport, false, a.busy || a.bookID == "", a.exportMarkdown)
+				a.settingButton(c, p, "导入笔记", icSettingImport, false, a.busy, a.chooseImport)
+				a.settingButton(c, p, "导出 MD", icSettingExport, false, a.busy || a.bookID == "", a.exportMarkdown)
 			})
 		})
 		horizontalRule(c, p)
 		settingRow(c, p, compact, "本地存储与缓存", usage, func() {
-			settingButton(c, p, "清理缓存", nil, false, false, a.clearRenderCache)
+			a.settingButton(c, p, "清理缓存", nil, false, false, a.clearRenderCache)
 		})
 	})
 }
@@ -347,21 +380,21 @@ func (a *workspace) bookSettings(c *ui.Context, p palette, compact bool) {
 		settingRow(c, p, compact, "重命名当前笔记本", title, func() {
 			if a.renameOpen {
 				ui.Row(c).AlignItems(ui.Center).Gap(6).Width(245).Shrink(0).Children(func() {
-					if ui.TextInput(c.Key("book-name"), &a.bookName).Grow(1).MinWidth(0).Height(30).Label("笔记本名称").Submitted() {
+					if ui.TextInput(c.Key("book-name"), &a.bookName).Grow(1).MinWidth(0).Height(settingButtonHeight(a.touchUI())).Label("笔记本名称").Submitted() {
 						a.renameBook()
 					}
-					settingButton(c, p, "保存", nil, false, a.busy || strings.TrimSpace(a.bookName) == "", a.renameBook)
-					settingButton(c, p, "取消", nil, false, a.busy, func() { a.renameOpen = false })
+					a.settingButton(c, p, "保存", nil, false, a.busy || strings.TrimSpace(a.bookName) == "", a.renameBook)
+					a.settingButton(c, p, "取消", nil, false, a.busy, func() { a.renameOpen = false })
 				})
 				return
 			}
-			settingButton(c, p, "重命名", nil, false, a.busy || a.bookID == "", func() {
+			a.settingButton(c, p, "重命名", nil, false, a.busy || a.bookID == "", func() {
 				a.renameOpen, a.bookName = true, a.tree.book.Title
 			})
 		})
 		horizontalRule(c, p)
 		settingRow(c, p, compact, "删除当前笔记本", title, func() {
-			settingButton(c, p, "删除笔记本", icSettingDelete, true, a.busy || a.bookID == "", a.confirmDeleteBook)
+			a.settingButton(c, p, "删除笔记本", icSettingDelete, true, a.busy || a.bookID == "", a.confirmDeleteBook)
 		})
 	})
 }
@@ -393,58 +426,105 @@ func (a *workspace) aboutSettings(c *ui.Context, p palette, compact bool) {
 		releaseURL = strings.TrimSpace(st.info.ReleaseURL)
 	}
 
+	controlsRow := func(children func()) {
+		row := ui.Row(c).Gap(8).AlignItems(ui.Center)
+		if compact {
+			row.FillWidth().Wrap()
+		} else {
+			row.Shrink(0)
+		}
+		row.Children(children)
+	}
+
 	controls := func() {
 		switch st.phase {
 		case updateChecking:
-			settingButton(c, p, "检查更新", icUpdateRefresh, false, true, nil)
+			a.settingButton(c, p, "检查更新", icUpdateRefresh, false, true, nil)
 		case updateDownloading:
-			settingButton(c, p, "下载中…", icImport, false, true, nil)
+			controlsRow(func() {
+				a.settingButton(c, p, "下载中…", icImport, false, true, nil)
+				a.settingButton(c, p, "取消", nil, false, false, a.cancelUpdateDownload)
+			})
 		case updateAvailable:
-			ui.Row(c).Gap(8).Shrink(0).AlignItems(ui.Center).Children(func() {
+			controlsRow(func() {
 				if st.info != nil && st.info.canDirectInstall() {
 					label := "下载并安装"
-					if st.info.UsingMyGo {
+					if st.info.PendingPath != "" {
+						label = "安装更新"
+					} else if st.info.UsingMyGo {
 						label = "下载并更新"
 					}
-					settingPrimaryButton(c, p, label, icImport, false, func() {
+					a.settingPrimaryButton(c, p, label, icImport, false, func() {
 						a.installUpdate(services)
 					})
-					settingButton(c, p, "前往发布页", icExternalLink, false, false, func() {
+					a.settingButton(c, p, "前往发布页", icExternalLink, false, false, func() {
 						a.openExternalURL(c, releaseURL)
 					})
 				} else {
-					settingPrimaryButton(c, p, "前往发布页", icExternalLink, false, func() {
+					a.settingPrimaryButton(c, p, "前往发布页", icExternalLink, false, func() {
 						a.openExternalURL(c, releaseURL)
 					})
-					settingButton(c, p, "重新检查", icUpdateRefresh, false, false, func() {
+					a.settingButton(c, p, "重新检查", icUpdateRefresh, false, false, func() {
 						a.checkForUpdates(services)
 					})
 				}
 			})
 		case updateRelaunchRequired:
-			settingPrimaryButton(c, p, "立即重启", icUpdateRefresh, false, a.relaunchApp)
+			a.settingPrimaryButton(c, p, "立即重启", icUpdateRefresh, false, a.relaunchApp)
 		case updatePermissionRequired:
-			ui.Row(c).Gap(8).Shrink(0).AlignItems(ui.Center).Children(func() {
-				settingPrimaryButton(c, p, "安装更新", icImport, false, func() {
+			controlsRow(func() {
+				a.settingPrimaryButton(c, p, "安装更新", icImport, false, func() {
 					a.installUpdate(services)
 				})
-				settingButton(c, p, "前往发布页", icExternalLink, false, false, func() {
+				a.settingButton(c, p, "前往发布页", icExternalLink, false, false, func() {
 					a.openExternalURL(c, releaseURL)
 				})
 			})
-		case updateInstallerLaunched:
-			ui.Row(c).Gap(8).Shrink(0).AlignItems(ui.Center).Children(func() {
+		case updateDeferredForeground:
+			controlsRow(func() {
 				if st.info != nil && st.info.canDirectInstall() {
-					settingButton(c, p, "安装更新", icImport, false, false, func() {
+					a.settingPrimaryButton(c, p, "安装更新", icImport, false, func() {
 						a.installUpdate(services)
 					})
 				}
-				settingButton(c, p, "重新检查", icUpdateRefresh, false, false, func() {
+				a.settingButton(c, p, "重新检查", icUpdateRefresh, false, false, func() {
 					a.checkForUpdates(services)
 				})
 			})
+		case updateInstallerLaunched:
+			controlsRow(func() {
+				if st.info != nil && st.info.canDirectInstall() {
+					a.settingButton(c, p, "安装更新", icImport, false, false, func() {
+						a.installUpdate(services)
+					})
+				}
+				a.settingButton(c, p, "重新检查", icUpdateRefresh, false, false, func() {
+					a.checkForUpdates(services)
+				})
+			})
+		case updateError:
+			if st.info != nil {
+				controlsRow(func() {
+					if st.info.canDirectInstall() {
+						a.settingPrimaryButton(c, p, "重试下载", icImport, false, func() {
+							a.installUpdate(services)
+						})
+					} else {
+						a.settingPrimaryButton(c, p, "重新检查", icUpdateRefresh, false, func() {
+							a.checkForUpdates(services)
+						})
+					}
+					a.settingButton(c, p, "前往发布页", icExternalLink, false, false, func() {
+						a.openExternalURL(c, releaseURL)
+					})
+				})
+			} else {
+				a.settingButton(c, p, "检查更新", icUpdateRefresh, false, false, func() {
+					a.checkForUpdates(services)
+				})
+			}
 		default:
-			settingButton(c, p, "检查更新", icUpdateRefresh, false, false, func() {
+			a.settingButton(c, p, "检查更新", icUpdateRefresh, false, false, func() {
 				a.checkForUpdates(services)
 			})
 		}
@@ -476,7 +556,7 @@ func (a *workspace) aboutSettings(c *ui.Context, p palette, compact bool) {
 					ui.Box(c).FillHeight().WidthPercent(ratio * 100).Radius(99).Background(p.accent)
 				})
 			}
-			if st.info != nil && (st.phase == updateAvailable || st.phase == updateRelaunchRequired || st.phase == updatePermissionRequired) {
+			if st.info != nil && (st.phase == updateAvailable || st.phase == updateRelaunchRequired || st.phase == updatePermissionRequired || st.phase == updateDeferredForeground) {
 				if notes := formatReleaseNotesPreview(st.info.Notes); notes != "" {
 					ui.Column(c).FillWidth().Padding(8, 10).Radius(8).
 						Background(p.inputBg).Border(1, p.rule).Children(func() {
@@ -487,7 +567,7 @@ func (a *workspace) aboutSettings(c *ui.Context, p palette, compact bool) {
 		})
 		horizontalRule(c, p)
 		settingRow(c, p, compact, "开源仓库", "github.com/dongyu-will/folio", func() {
-			settingButton(c, p, "打开 GitHub", icExternalLink, false, false, func() {
+			a.settingButton(c, p, "打开 GitHub", icExternalLink, false, false, func() {
 				a.openExternalURL(c, folioRepoURL)
 			})
 		})
@@ -516,6 +596,12 @@ func updateStatusPresentation(p palette, st updateUIState, curVer string) (strin
 	case updateNoRelease:
 		return "暂无已发布版本", p.quiet
 	case updateAvailable:
+		if st.info != nil && st.info.PendingPath != "" {
+			if st.info.Version != "" {
+				return fmt.Sprintf("新版本 v%s 已下载完成，点击即可安装", st.info.Version), p.accent
+			}
+			return "更新安装包已下载完成，点击即可安装", p.accent
+		}
 		if st.info != nil && st.info.Version != "" {
 			return fmt.Sprintf("发现新版本 v%s", st.info.Version), p.accent
 		}
@@ -526,6 +612,8 @@ func updateStatusPresentation(p palette, st updateUIState, curVer string) (strin
 		return "更新已就绪，重启后生效", p.accent
 	case updatePermissionRequired:
 		return "请在系统设置中允许 Folio 安装未知来源应用，授权后再次点击「安装更新」", p.secondary
+	case updateDeferredForeground:
+		return "下载已完成，返回应用将自动打开安装器", p.accent
 	case updateInstallerLaunched:
 		return "已打开系统安装器，请按提示完成更新", p.accent
 	case updateError:
