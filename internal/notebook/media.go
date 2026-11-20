@@ -10,13 +10,16 @@ import (
 	"image/draw"
 	_ "image/gif"
 	_ "image/jpeg"
-	"image/png"
+	_ "image/png"
 	"math"
 	"os/exec"
 	"regexp"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/net/html"
@@ -68,35 +71,330 @@ func (n Note) BlocksCoverBody(body string) bool {
 	return strings.Join(strings.Fields(text.String()), " ") == strings.Join(strings.Fields(body), " ")
 }
 
-type mediaImport struct {
-	sources map[string][]byte
-	files   map[string][]byte
-	ink     string
+type mediaSink interface {
+	save(name string, data []byte) error
 }
 
-func readMedia(ctx context.Context, db *sql.DB, ink string) (*mediaImport, error) {
-	m := &mediaImport{sources: make(map[string][]byte), files: make(map[string][]byte), ink: ink}
+type inkCacheKey struct {
+	hash   [32]byte
+	width  int
+	height int
+	pixels int
+}
+
+type inkCacheEntry struct {
+	ready chan struct{}
+	png   []byte
+	rem   atomic.Int32
+}
+
+type mediaRefPlan struct {
+	needed  map[string]bool
+	needRaw map[string]bool
+}
+
+func newMediaRefPlan() *mediaRefPlan {
+	return &mediaRefPlan{
+		needed:  make(map[string]bool),
+		needRaw: make(map[string]bool),
+	}
+}
+
+func (p *mediaRefPlan) addPicture(pic map[string]any) {
+	if pic == nil {
+		return
+	}
+	hasDrawing := false
+	switch v := pic["drawing"].(type) {
+	case string:
+		if v != "" {
+			hasDrawing = true
+			p.needed[v] = true
+			p.needRaw[v] = true
+		}
+	case []byte:
+		if len(v) > 0 {
+			hasDrawing = true
+		}
+	}
+	for _, field := range []string{"paint", "img", "pic"} {
+		if key, ok := pic[field].(string); ok && key != "" {
+			p.needed[key] = true
+			if hasDrawing {
+				p.needRaw[key] = true
+			}
+		}
+	}
+}
+
+func (p *mediaRefPlan) addParsedNote(clip map[string]any, blocks []any) {
+	if clip != nil {
+		p.addPicture(clip)
+	}
+	for _, value := range blocks {
+		block, ok := value.(map[string]any)
+		if !ok {
+			continue
+		}
+		switch block["type"] {
+		case "LinkNote":
+			if qpic, ok := block["q_hpic"].(map[string]any); ok {
+				p.addPicture(qpic)
+			}
+		case "PaintNote", "PicNote", "ImageNote", "MergedImageNote", "SketchNote":
+			p.addPicture(block)
+		}
+	}
+}
+
+type mediaImport struct {
+	sources   map[string][]byte
+	savedKeys map[string]string
+	ink       string
+	sink      mediaSink
+
+	filesMu sync.Mutex
+	files   map[string][]byte
+
+	inkCounts map[inkCacheKey]int
+	inkMu     sync.Mutex
+	inkCache  map[inkCacheKey]*inkCacheEntry
+
+	largeCanvasSem chan struct{}
+
+	errMu    sync.Mutex
+	firstErr error
+}
+
+const largeCanvasPixels = 2_000_000
+
+func newMediaImport(ink string, sink mediaSink) *mediaImport {
+	largeCap := 2
+	if runtime.GOOS == "android" || runtime.GOOS == "ios" {
+		largeCap = 1
+	}
+	m := &mediaImport{
+		sources:        make(map[string][]byte),
+		savedKeys:      make(map[string]string),
+		ink:            ink,
+		sink:           sink,
+		largeCanvasSem: make(chan struct{}, largeCap),
+	}
+	if sink == nil {
+		m.files = make(map[string][]byte)
+	}
+	return m
+}
+
+func (m *mediaImport) acquireLargeCanvas(pixels int64) func() {
+	if m.largeCanvasSem == nil || pixels <= largeCanvasPixels {
+		return func() {}
+	}
+	m.largeCanvasSem <- struct{}{}
+	return func() { <-m.largeCanvasSem }
+}
+
+func (m *mediaImport) recordErr(err error) {
+	if err == nil {
+		return
+	}
+	m.errMu.Lock()
+	if m.firstErr == nil {
+		m.firstErr = err
+	}
+	m.errMu.Unlock()
+}
+
+func (m *mediaImport) err() error {
+	m.errMu.Lock()
+	err := m.firstErr
+	m.errMu.Unlock()
+	return err
+}
+
+// releaseTransient drops raw source blobs and ink memoization tables once note
+// media attachment finishes so peak memory falls before PDF/shard writes.
+func (m *mediaImport) releaseTransient() {
+	m.sources = nil
+	m.savedKeys = nil
+	m.inkCounts = nil
+	m.inkMu.Lock()
+	m.inkCache = nil
+	m.inkMu.Unlock()
+}
+
+func readMediaFiltered(ctx context.Context, db *sql.DB, m *mediaImport, plan *mediaRefPlan) error {
+	if plan != nil && len(plan.needed) == 0 {
+		return nil
+	}
 	var present bool
 	if err := db.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='ZMEDIA')").Scan(&present); err != nil || !present {
-		return m, err
+		return err
 	}
-	rows, err := db.QueryContext(ctx, "SELECT ZMD5, ZDATA FROM ZMEDIA WHERE ZMD5 IS NOT NULL AND ZDATA IS NOT NULL")
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	for rows.Next() {
-		var key string
-		var data []byte
-		if err := rows.Scan(&key, &data); err != nil {
-			return nil, err
+
+	nestedKeys := make(map[string]bool)
+	storeRaw := func(key string, data []byte) {
+		if _, seen := m.sources[key]; seen {
+			return
 		}
-		if unpacked, ok := unarchive(data).([]byte); ok {
-			data = unpacked
+		unarchived := unarchive(data)
+		if unpacked, ok := unarchived.([]byte); ok {
+			m.sources[key] = unpacked
+			return
 		}
 		m.sources[key] = data
+		if wrapped, ok := unarchived.(map[string]any); ok {
+			for _, field := range []string{"drawing2", "drawing1"} {
+				if nested, ok := wrapped[field].(string); ok && nested != "" {
+					nestedKeys[nested] = true
+				}
+			}
+		}
 	}
-	return m, rows.Err()
+
+	if err := func() error {
+		rows, err := db.QueryContext(ctx, "SELECT ZMD5, ZDATA FROM ZMEDIA WHERE ZMD5 IS NOT NULL AND ZDATA IS NOT NULL")
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var key string
+			var data []byte
+			if err := rows.Scan(&key, &data); err != nil {
+				return err
+			}
+			if plan != nil && !plan.needed[key] && !nestedKeys[key] {
+				continue
+			}
+			needRaw := plan == nil || plan.needRaw[key] || nestedKeys[key]
+			if !needRaw && m.sink != nil {
+				if _, seen := m.savedKeys[key]; seen {
+					continue
+				}
+				if unpacked, ok := unarchive(data).([]byte); ok {
+					data = unpacked
+				}
+				_, ext, ok := imageConfig(data)
+				if !ok {
+					m.savedKeys[key] = ""
+					continue
+				}
+				name := fmt.Sprintf("%x.%s", sha256.Sum256(data), ext)
+				if err := m.sink.save(name, data); err != nil {
+					return err
+				}
+				m.savedKeys[key] = name
+				continue
+			}
+			storeRaw(key, data)
+		}
+		return rows.Err()
+	}(); err != nil {
+		return err
+	}
+
+	// Fetch any nested drawing1/drawing2 keys referenced by wrapped bplist
+	// entries that appeared earlier in ZMEDIA than their wrapper row.
+	const batchSize = 500
+	for depth := 0; depth < 3 && len(nestedKeys) > 0; depth++ {
+		var missing []string
+		for k := range nestedKeys {
+			if _, have := m.sources[k]; !have {
+				missing = append(missing, k)
+			}
+		}
+		clear(nestedKeys)
+		if len(missing) == 0 {
+			break
+		}
+		for start := 0; start < len(missing); start += batchSize {
+			batch := missing[start:min(start+batchSize, len(missing))]
+			if err := func() error {
+				placeholders := strings.TrimSuffix(strings.Repeat("?,", len(batch)), ",")
+				args := make([]any, len(batch))
+				for i, k := range batch {
+					args[i] = k
+				}
+				rows, err := db.QueryContext(ctx, "SELECT ZMD5, ZDATA FROM ZMEDIA WHERE ZMD5 IN ("+placeholders+") AND ZDATA IS NOT NULL", args...)
+				if err != nil {
+					return err
+				}
+				defer rows.Close()
+				for rows.Next() {
+					var key string
+					var data []byte
+					if err := rows.Scan(&key, &data); err != nil {
+						return err
+					}
+					storeRaw(key, data)
+				}
+				return rows.Err()
+			}(); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func (m *mediaImport) countInkRefs(notes []rawSourceNote) {
+	counts := make(map[inkCacheKey]int)
+	hashByKey := make(map[string][32]byte)
+	hashOf := func(val any, raw []byte) [32]byte {
+		if k, ok := val.(string); ok && k != "" {
+			if h, exists := hashByKey[k]; exists {
+				return h
+			}
+			h := sha256.Sum256(raw)
+			hashByKey[k] = h
+			return h
+		}
+		return sha256.Sum256(raw)
+	}
+	visitPic := func(pic map[string]any) {
+		if pic == nil {
+			return
+		}
+		drawingVal := pic["drawing"]
+		drawing := m.source(drawingVal)
+		if len(drawing) == 0 {
+			return
+		}
+		paint := m.picturePaint(pic)
+		cfg, _, _ := imageConfig(paint)
+		width, height := pictureInkSize(pic, cfg)
+		pixels := cfg.Width
+		if wrapped, ok := unarchive(drawing).(map[string]any); ok {
+			for _, field := range []string{"drawing2", "drawing1"} {
+				if cand := m.source(wrapped[field]); len(cand) > 0 {
+					key := inkCacheKey{hash: hashOf(wrapped[field], cand), width: width, height: height, pixels: pixels}
+					counts[key]++
+				}
+			}
+			return
+		}
+		key := inkCacheKey{hash: hashOf(drawingVal, drawing), width: width, height: height, pixels: pixels}
+		counts[key]++
+	}
+	for i := range notes {
+		visitPic(notes[i].clip)
+		for _, value := range notes[i].blocks {
+			block, ok := value.(map[string]any)
+			if !ok {
+				continue
+			}
+			switch block["type"] {
+			case "LinkNote":
+				if qpic, ok := block["q_hpic"].(map[string]any); ok {
+					visitPic(qpic)
+				}
+			case "PaintNote", "PicNote", "ImageNote", "MergedImageNote", "SketchNote":
+				visitPic(block)
+			}
+		}
+	}
+	m.inkCounts = counts
 }
 
 // The property list can contain Foundation object references. Interpret only
@@ -157,11 +455,16 @@ func unarchive(data []byte) any {
 }
 
 func (m *mediaImport) attach(n *Note, clipData, noteData []byte) bool {
-	if clip, ok := unarchive(clipData).(map[string]any); ok {
-		n.Clip = m.saveImage(m.picture(clip))
+	clip, _ := unarchive(clipData).(map[string]any)
+	blocks, _ := unarchive(noteData).([]any)
+	return m.attachParsed(n, clip, blocks)
+}
+
+func (m *mediaImport) attachParsed(n *Note, clip map[string]any, blocks []any) bool {
+	if clip != nil {
+		n.Clip = m.savePicture(clip)
 		extractHighlightRects(n, clip)
 	}
-	blocks, _ := unarchive(noteData).([]any)
 	var content []ContentBlock
 	var hasImage, hasRich, sawDummy, sawSketch, sawOther bool
 	addLink := func(raw string) {
@@ -211,7 +514,7 @@ func (m *mediaImport) attach(n *Note, clipData, noteData []byte) bool {
 			}
 			var mergedImg string
 			if qpic, ok := block["q_hpic"].(map[string]any); ok {
-				mergedImg = m.saveImage(m.picture(qpic))
+				mergedImg = m.savePicture(qpic)
 				extractHighlightRects(n, qpic)
 				if mergedImg != "" {
 					content = append(content, ContentBlock{Image: mergedImg})
@@ -226,13 +529,13 @@ func (m *mediaImport) attach(n *Note, clipData, noteData []byte) bool {
 			}
 		case "PaintNote", "PicNote", "ImageNote", "MergedImageNote":
 			sawOther = true
-			if file := m.saveImage(m.picture(block)); file != "" {
+			if file := m.savePicture(block); file != "" {
 				content = append(content, ContentBlock{Image: file})
 				hasImage = true
 			}
 		case "SketchNote":
 			sawSketch = true
-			if file := m.saveImage(m.picture(block)); file != "" {
+			if file := m.savePicture(block); file != "" {
 				content = append(content, ContentBlock{Image: file})
 				hasImage = true
 			}
@@ -1000,7 +1303,7 @@ func normalizeLines(s string) string {
 	return strings.TrimSpace(strings.Join(kept, "\n"))
 }
 
-func (m *mediaImport) picture(block map[string]any) []byte {
+func (m *mediaImport) picturePaint(block map[string]any) []byte {
 	paint := m.source(block["paint"])
 	if len(paint) == 0 {
 		paint = m.source(block["img"])
@@ -1008,11 +1311,10 @@ func (m *mediaImport) picture(block map[string]any) []byte {
 	if len(paint) == 0 {
 		paint = m.source(block["pic"])
 	}
-	cfg, _, _ := imageConfig(paint)
-	drawing := m.source(block["drawing"])
-	if len(drawing) == 0 {
-		return paint
-	}
+	return paint
+}
+
+func pictureInkSize(block map[string]any, cfg image.Config) (int, int) {
 	width, height := cfg.Width, cfg.Height
 	if size, _ := block["size"].(string); width > 0 && size != "" {
 		x, y, ok := strings.Cut(strings.Trim(size, "{}"), ",")
@@ -1022,31 +1324,145 @@ func (m *mediaImport) picture(block map[string]any) []byte {
 			}
 		}
 	}
-	ink := m.renderInk(drawing, width, height, cfg.Width)
-	if len(ink) == 0 {
+	return width, height
+}
+
+func (m *mediaImport) savePicture(block map[string]any) string {
+	drawing := m.source(block["drawing"])
+	if len(drawing) == 0 {
+		for _, field := range []string{"paint", "img", "pic"} {
+			val := block[field]
+			if key, ok := val.(string); ok {
+				if name, saved := m.savedKeys[key]; saved {
+					return name
+				}
+				if raw := m.sources[key]; len(raw) > 0 {
+					return m.saveImage(raw)
+				}
+				continue
+			}
+			if raw, ok := val.([]byte); ok && len(raw) > 0 {
+				return m.saveImage(raw)
+			}
+		}
+		return ""
+	}
+	return m.saveImage(m.picture(block))
+}
+
+func toRGBAInPlace(img image.Image) *image.RGBA {
+	switch v := img.(type) {
+	case *image.RGBA:
+		return v
+	case *image.NRGBA:
+		pix := v.Pix
+		for i := 0; i < len(pix); i += 4 {
+			a := uint32(pix[i+3])
+			if a == 255 {
+				continue
+			}
+			if a == 0 {
+				pix[i+0], pix[i+1], pix[i+2] = 0, 0, 0
+				continue
+			}
+			pix[i+0] = uint8((uint32(pix[i+0])*a + 127) / 255)
+			pix[i+1] = uint8((uint32(pix[i+1])*a + 127) / 255)
+			pix[i+2] = uint8((uint32(pix[i+2])*a + 127) / 255)
+		}
+		return &image.RGBA{Pix: v.Pix, Stride: v.Stride, Rect: v.Rect}
+	default:
+		bounds := img.Bounds()
+		dst := image.NewRGBA(bounds)
+		draw.Draw(dst, bounds, img, bounds.Min, draw.Src)
+		return dst
+	}
+}
+
+func (m *mediaImport) inkCandidates(data []byte) [][]byte {
+	if wrapped, ok := unarchive(data).(map[string]any); ok {
+		return [][]byte{m.source(wrapped["drawing2"]), m.source(wrapped["drawing1"])}
+	}
+	return [][]byte{data}
+}
+
+func (m *mediaImport) picture(block map[string]any) []byte {
+	paint := m.picturePaint(block)
+	cfg, _, _ := imageConfig(paint)
+	drawing := m.source(block["drawing"])
+	if len(drawing) == 0 {
 		return paint
 	}
-	if cfg.Width == 0 {
-		return ink
+	width, height := pictureInkSize(block, cfg)
+
+	// Fast pure-Go composite path: for unshared drawings over a base clip,
+	// rasterize strokes directly onto the decoded base RGBA image (avoiding a
+	// separate overlay RGBA buffer, draw.Draw pass, and intermediate PNG).
+	if m.ink == "" && cfg.Width > 0 {
+		candidates := m.inkCandidates(drawing)
+		if len(candidates) == 1 && len(candidates[0]) > 0 {
+			key := inkCacheKey{
+				hash:   sha256.Sum256(candidates[0]),
+				width:  width,
+				height: height,
+				pixels: cfg.Width,
+			}
+			shared := m.inkCounts == nil || m.inkCounts[key] > 1
+			if !shared {
+				strokes, ok := parsePKDrawing(candidates[0])
+				if !ok || len(strokes) == 0 {
+					return paint
+				}
+				release := m.acquireLargeCanvas(int64(cfg.Width) * int64(cfg.Height))
+				defer release()
+				base, _, err := image.Decode(bytes.NewReader(paint))
+				if err != nil {
+					return paint
+				}
+				dst := toRGBAInPlace(base)
+				if !compositePKStrokesOnto(dst, strokes, float64(width), float64(height), cfg.Width) {
+					return paint
+				}
+				if out := encodeFastPNG(dst); len(out) > 0 {
+					return out
+				}
+				return paint
+			}
+		}
+	}
+
+	wantPNGOnly := cfg.Width == 0
+	inkPNG, inkRGBA := m.renderInk(drawing, width, height, cfg.Width, wantPNGOnly)
+	if len(inkPNG) == 0 && inkRGBA == nil {
+		return paint
+	}
+	if wantPNGOnly {
+		if len(inkPNG) > 0 {
+			return inkPNG
+		}
+		return encodeFastPNG(inkRGBA)
 	}
 	// PencilKit exports annotate the same canvas as the original raster clip.
+	release := m.acquireLargeCanvas(int64(cfg.Width) * int64(cfg.Height))
+	defer release()
 	base, _, err := image.Decode(bytes.NewReader(paint))
 	if err != nil {
 		return paint
 	}
-	overlay, _, err := image.Decode(bytes.NewReader(ink))
-	if err != nil {
-		return paint
+	var overlay image.Image
+	if inkRGBA != nil {
+		overlay = inkRGBA
+	} else {
+		overlay, _, err = image.Decode(bytes.NewReader(inkPNG))
+		if err != nil {
+			return paint
+		}
 	}
-	bounds := base.Bounds()
-	composite := image.NewRGBA(bounds)
-	draw.Draw(composite, bounds, base, bounds.Min, draw.Src)
-	draw.Draw(composite, bounds, overlay, overlay.Bounds().Min, draw.Over)
-	var output bytes.Buffer
-	if err := png.Encode(&output, composite); err != nil {
-		return paint
+	composite := toRGBAInPlace(base)
+	draw.Draw(composite, composite.Bounds(), overlay, overlay.Bounds().Min, draw.Over)
+	if out := encodeFastPNG(composite); len(out) > 0 {
+		return out
 	}
-	return output.Bytes()
+	return paint
 }
 
 func (m *mediaImport) source(value any) []byte {
@@ -1059,30 +1475,113 @@ func (m *mediaImport) source(value any) []byte {
 	return nil
 }
 
-func (m *mediaImport) renderInk(data []byte, width, height, pixels int) []byte {
-	candidates := [][]byte{data}
-	if wrapped, ok := unarchive(data).(map[string]any); ok {
-		candidates = [][]byte{m.source(wrapped["drawing2"]), m.source(wrapped["drawing1"])}
-	}
-	for _, candidate := range candidates {
+func (m *mediaImport) renderInk(data []byte, width, height, pixels int, wantPNGOnly bool) ([]byte, *image.RGBA) {
+	for _, candidate := range m.inkCandidates(data) {
 		if len(candidate) == 0 {
 			continue
 		}
-		if m.ink != "" {
-			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-			command := exec.CommandContext(ctx, m.ink, strconv.Itoa(width), strconv.Itoa(height), strconv.Itoa(pixels))
-			command.Stdin = bytes.NewReader(candidate)
-			png, err := command.Output()
-			cancel()
-			if err == nil && len(png) > 0 {
-				return png
-			}
+		key := inkCacheKey{
+			hash:   sha256.Sum256(candidate),
+			width:  width,
+			height: height,
+			pixels: pixels,
 		}
-		if png := renderPKDrawing(candidate, width, height, pixels); len(png) > 0 {
-			return png
+		shared := m.inkCounts == nil || m.inkCounts[key] > 1
+		if !shared {
+			pngBytes, rgba := m.renderInkCandidate(candidate, width, height, pixels, wantPNGOnly)
+			if len(pngBytes) > 0 || rgba != nil {
+				return pngBytes, rgba
+			}
+			continue
+		}
+		if pngBytes := m.renderInkMemoized(key, candidate, width, height, pixels); len(pngBytes) > 0 {
+			return pngBytes, nil
 		}
 	}
-	return nil
+	return nil, nil
+}
+
+func (m *mediaImport) renderInkMemoized(key inkCacheKey, candidate []byte, width, height, pixels int) []byte {
+	total := 0
+	if m.inkCounts != nil {
+		total = m.inkCounts[key]
+	}
+
+	m.inkMu.Lock()
+	if m.inkCache == nil {
+		m.inkCache = make(map[inkCacheKey]*inkCacheEntry)
+	}
+	if entry, ok := m.inkCache[key]; ok {
+		m.inkMu.Unlock()
+		<-entry.ready
+		res := entry.png
+		if total > 1 && entry.rem.Add(-1) == 0 {
+			m.inkMu.Lock()
+			if m.inkCache[key] == entry {
+				delete(m.inkCache, key)
+			}
+			m.inkMu.Unlock()
+		}
+		return res
+	}
+	entry := &inkCacheEntry{ready: make(chan struct{})}
+	if total > 1 {
+		entry.rem.Store(int32(total))
+	}
+	m.inkCache[key] = entry
+	m.inkMu.Unlock()
+
+	pngBytes, rgba := m.renderInkCandidate(candidate, width, height, pixels, true)
+	if len(pngBytes) == 0 && rgba != nil {
+		pngBytes = encodeFastPNG(rgba)
+	}
+	entry.png = pngBytes
+	close(entry.ready)
+	if total > 1 && entry.rem.Add(-1) == 0 {
+		m.inkMu.Lock()
+		if m.inkCache[key] == entry {
+			delete(m.inkCache, key)
+		}
+		m.inkMu.Unlock()
+	}
+	// Return the cached PNG bytes to Consumer 1 as well as Consumers 2..N so
+	// every consumer composites the exact same pixel representation and
+	// produces identical deterministic SHA-256 hashes.
+	return pngBytes
+}
+
+func (m *mediaImport) renderInkCandidate(candidate []byte, width, height, pixels int, wantPNGOnly bool) ([]byte, *image.RGBA) {
+	strokes, parsed := parsePKDrawing(candidate)
+	if parsed && len(strokes) == 0 {
+		// Valid PencilKit drawing with zero visible strokes: skip external
+		// renderer and Go rasterizer completely.
+		return nil, nil
+	}
+	if m.ink != "" {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		command := exec.CommandContext(ctx, m.ink, strconv.Itoa(width), strconv.Itoa(height), strconv.Itoa(pixels))
+		command.Stdin = bytes.NewReader(candidate)
+		out, err := command.Output()
+		cancel()
+		if err == nil && len(out) > 0 {
+			return out, nil
+		}
+	}
+	if !parsed || len(strokes) == 0 {
+		return nil, nil
+	}
+	rectX, rectY, scale, outW, outH, ok := pkCanvasLayout(strokes, float64(width), float64(height), pixels)
+	if !ok {
+		return nil, nil
+	}
+	release := m.acquireLargeCanvas(int64(outW) * int64(outH))
+	defer release()
+	canvas := image.NewRGBA(image.Rect(0, 0, outW, outH))
+	rasterizePKStrokesOnto(canvas, strokes, rectX, rectY, scale, outW, outH)
+	if wantPNGOnly {
+		return encodeFastPNG(canvas), nil
+	}
+	return nil, canvas
 }
 
 func imageConfig(data []byte) (image.Config, string, bool) {
@@ -1099,6 +1598,18 @@ func (m *mediaImport) saveImage(data []byte) string {
 		return ""
 	}
 	name := fmt.Sprintf("%x.%s", sha256.Sum256(data), ext)
+	if m.sink != nil {
+		if err := m.sink.save(name, data); err != nil {
+			m.recordErr(err)
+			return ""
+		}
+		return name
+	}
+	m.filesMu.Lock()
+	if m.files == nil {
+		m.files = make(map[string][]byte)
+	}
 	m.files[name] = data
+	m.filesMu.Unlock()
 	return name
 }

@@ -2,6 +2,7 @@ package notebook
 
 import (
 	"archive/zip"
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"database/sql"
@@ -15,14 +16,21 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	_ "modernc.org/sqlite"
 )
 
 const maxImportSize = 512 << 20
+
+// sqliteReadTimeout bounds pure SQLite reads during import; media rendering and
+// compositing run strictly after the database and all cursors are closed.
+var sqliteReadTimeout = 60 * time.Second
 
 var backupSuffix = regexp.MustCompile(`\s*\(\d{4}-\d\d-\d\d-\d\d-\d\d-\d\d\)$`)
 
@@ -75,7 +83,23 @@ type sourceNote struct {
 	sketchOrDummyOnly bool
 }
 
+type sourceTopic struct {
+	id, title, roots, hashtags string
+}
+
+type rawSourceNote struct {
+	note      sourceNote
+	rawClip   []byte
+	rawBlocks []byte
+	clip      map[string]any
+	blocks    []any
+}
+
 func readMarginNote(path, ink string) ([]Book, map[string][]byte, *bookConfigIndex, error) {
+	return readMarginNoteWithSink(path, ink, nil)
+}
+
+func readMarginNoteWithSink(path, ink string, sink mediaSink) ([]Book, map[string][]byte, *bookConfigIndex, error) {
 	info, err := os.Stat(path)
 	if err != nil {
 		return nil, nil, nil, err
@@ -88,16 +112,17 @@ func readMarginNote(path, ink string) ([]Book, map[string][]byte, *bookConfigInd
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	defer read.Close()
 
 	temp, err := os.CreateTemp("", "mgnote-import-*.sqlite")
 	if err != nil {
+		read.Close()
 		return nil, nil, nil, err
 	}
-	defer os.Remove(temp.Name())
+	tempPath := temp.Name()
+	defer os.Remove(tempPath)
 	hash := sha256.New()
 	n, copyErr := io.Copy(io.MultiWriter(temp, hash), io.LimitReader(read, maxImportSize+1))
-	closeErr := temp.Close()
+	closeErr := errors.Join(temp.Close(), read.Close())
 	if err := errors.Join(copyErr, closeErr); err != nil {
 		return nil, nil, nil, err
 	}
@@ -105,28 +130,124 @@ func readMarginNote(path, ink string) ([]Book, map[string][]byte, *bookConfigInd
 		return nil, nil, nil, errors.New("解压后的笔记数据库超过 512 MB")
 	}
 
-	uri := (&url.URL{Scheme: "file", Path: filepath.ToSlash(temp.Name())}).String()
+	media := newMediaImport(ink, sink)
+	topics, rawNotes, configs, err := loadMarginSQLite(tempPath, media)
+	// Remove the extracted SQLite temp file immediately after closing the DB
+	// so peak flash usage drops before ink rendering and PDF extraction.
+	_ = os.Remove(tempPath)
+	if err != nil {
+		media.releaseTransient()
+		return nil, nil, nil, err
+	}
+
+	media.countInkRefs(rawNotes)
+	attachNotesParallel(rawNotes, media)
+	attachErr := media.err()
+	media.releaseTransient()
+	if attachErr != nil {
+		return nil, nil, nil, fmt.Errorf("无法保存笔记附件：%w", attachErr)
+	}
+
+	books := assembleBooks(topics, rawNotes, hex.EncodeToString(hash.Sum(nil)), filepath.Base(path), media.ink)
+	if len(books) == 0 {
+		return nil, nil, nil, errors.New("文件里没有可导入的笔记")
+	}
+	return books, pruneUnusedMedia(books, media.files), configs, nil
+}
+
+func loadMarginSQLite(tempPath string, media *mediaImport) ([]sourceTopic, []rawSourceNote, *bookConfigIndex, error) {
+	uri := (&url.URL{Scheme: "file", Path: filepath.ToSlash(tempPath)}).String()
 	db, err := sql.Open("sqlite", uri+"?mode=ro&immutable=1&_pragma=trusted_schema(OFF)")
 	if err != nil {
 		return nil, nil, nil, err
 	}
 	defer db.Close()
-	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
+
+	ctx, cancel := context.WithTimeout(context.Background(), sqliteReadTimeout)
 	defer cancel()
 
-	media, err := readMedia(ctx, db, ink)
-	if err != nil {
-		return nil, nil, nil, fmt.Errorf("无法读取笔记附件：%w", err)
-	}
 	configs := readBookConfigs(ctx, db)
-	books, err := readBooks(ctx, db, hex.EncodeToString(hash.Sum(nil)), filepath.Base(path), media, configs)
+	topics, err := readTopics(ctx, db)
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("无法读取 MarginNote 笔记数据库：%w", err)
 	}
-	if len(books) == 0 {
-		return nil, nil, nil, errors.New("文件里没有可导入的笔记")
+	rawNotes, err := readRawNotes(ctx, db, configs)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("无法读取 MarginNote 笔记数据库：%w", err)
 	}
-	return books, pruneUnusedMedia(books, media.files), configs, nil
+
+	// Unarchive note clip/block bplists after closing ZBOOKNOTE rows so we can
+	// load only referenced ZMEDIA rows and skip unreferenced PDF-page JSON blobs.
+	plan := newMediaRefPlan()
+	for i := range rawNotes {
+		if len(rawNotes[i].rawClip) > 0 {
+			rawNotes[i].clip, _ = unarchive(rawNotes[i].rawClip).(map[string]any)
+			rawNotes[i].rawClip = nil
+		}
+		if len(rawNotes[i].rawBlocks) > 0 {
+			rawNotes[i].blocks, _ = unarchive(rawNotes[i].rawBlocks).([]any)
+			rawNotes[i].rawBlocks = nil
+		}
+		plan.addParsedNote(rawNotes[i].clip, rawNotes[i].blocks)
+	}
+
+	if err := readMediaFiltered(ctx, db, media, plan); err != nil {
+		return nil, nil, nil, fmt.Errorf("无法读取笔记附件：%w", err)
+	}
+	return topics, rawNotes, configs, nil
+}
+
+func importRenderWorkers() int {
+	if runtime.GOOS == "android" || runtime.GOOS == "ios" {
+		return 2
+	}
+	n := runtime.GOMAXPROCS(0)
+	if n > 4 {
+		n = 4
+	}
+	if n < 1 {
+		n = 1
+	}
+	return n
+}
+
+func attachNotesParallel(rawNotes []rawSourceNote, media *mediaImport) {
+	if len(rawNotes) == 0 {
+		return
+	}
+	workers := min(importRenderWorkers(), len(rawNotes))
+	if workers <= 1 {
+		for i := range rawNotes {
+			if media.err() != nil {
+				break
+			}
+			rawNotes[i].note.sketchOrDummyOnly = media.attachParsed(&rawNotes[i].note.Note, rawNotes[i].clip, rawNotes[i].blocks)
+			rawNotes[i].clip = nil
+			rawNotes[i].blocks = nil
+		}
+		return
+	}
+	var next atomic.Int64
+	var wg sync.WaitGroup
+	wg.Add(workers)
+	for range workers {
+		go func() {
+			defer wg.Done()
+			for {
+				if media.err() != nil {
+					return
+				}
+				idx := int(next.Add(1) - 1)
+				if idx >= len(rawNotes) {
+					return
+				}
+				rawNotes[idx].note.sketchOrDummyOnly = media.attachParsed(&rawNotes[idx].note.Note, rawNotes[idx].clip, rawNotes[idx].blocks)
+				rawNotes[idx].clip = nil
+				rawNotes[idx].blocks = nil
+			}
+		}()
+	}
+	wg.Wait()
 }
 
 func pruneUnusedMedia(books []Book, files map[string][]byte) map[string][]byte {
@@ -162,8 +283,35 @@ type zipPayload struct {
 
 func (p zipPayload) Close() error { return errors.Join(p.ReadCloser.Close(), p.archive.Close()) }
 
+// detectImportFormat returns ".marginpkg", ".marginnotes", or ".pdf" based on
+// the file extension, falling back to magic-byte sniffing of the first 16 bytes
+// when the extension is empty or unrecognized (common with Android SAF picks).
+func detectImportFormat(path string) string {
+	switch ext := strings.ToLower(filepath.Ext(path)); ext {
+	case ".marginpkg", ".marginnotes", ".pdf":
+		return ext
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+	var hdr [16]byte
+	n, _ := io.ReadFull(f, hdr[:])
+	b := hdr[:n]
+	switch {
+	case bytes.HasPrefix(b, []byte("PK\x03\x04")):
+		return ".marginpkg"
+	case bytes.HasPrefix(b, []byte("SQLite format 3\x00")):
+		return ".marginnotes"
+	case bytes.HasPrefix(b, []byte("%PDF-")):
+		return ".pdf"
+	}
+	return ""
+}
+
 func openPayload(path string) (io.ReadCloser, error) {
-	switch strings.ToLower(filepath.Ext(path)) {
+	switch detectImportFormat(path) {
 	case ".marginnotes":
 		return os.Open(path)
 	case ".marginpkg":
@@ -393,7 +541,7 @@ func parseBookOptionsTOC(raw string) []TOCEntry {
 	return out
 }
 
-func readBooks(ctx context.Context, db *sql.DB, digest, source string, media *mediaImport, configs *bookConfigIndex) ([]Book, error) {
+func readTopics(ctx context.Context, db *sql.DB) ([]sourceTopic, error) {
 	topicCols := tableColumns(ctx, db, "ZTOPIC")
 	hashtagsExpr := "''"
 	if topicCols["ZHASHTAGS"] {
@@ -405,24 +553,27 @@ func readBooks(ctx context.Context, db *sql.DB, digest, source string, media *me
 	if err != nil {
 		return nil, err
 	}
-	type topic struct{ id, title, roots, hashtags string }
-	var topics []topic
+	defer rows.Close()
+	var topics []sourceTopic
 	for rows.Next() {
-		var t topic
+		var t sourceTopic
 		if err := rows.Scan(&t.id, &t.title, &t.roots, &t.hashtags); err != nil {
-			rows.Close()
 			return nil, err
 		}
 		topics = append(topics, t)
 	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
+	return topics, rows.Err()
+}
 
-	notes, err := readNotes(ctx, db, media, configs)
-	if err != nil {
-		return nil, err
+func assembleBooks(topics []sourceTopic, rawNotes []rawSourceNote, digest, source, ink string) []Book {
+	notes := make(map[string][]sourceNote)
+	var topicOrder []string
+	for i := range rawNotes {
+		n := rawNotes[i].note
+		if _, exists := notes[n.topic]; !exists {
+			topicOrder = append(topicOrder, n.topic)
+		}
+		notes[n.topic] = append(notes[n.topic], n)
 	}
 	books := []Book{}
 	for _, t := range topics {
@@ -437,24 +588,26 @@ func readBooks(ctx context.Context, db *sql.DB, digest, source string, media *me
 		if title == "" {
 			title = strings.TrimSuffix(source, filepath.Ext(source))
 		}
-		book := Book{ID: digest + "/" + t.id, Title: title, Source: source, MediaVersion: mediaVersion(media.ink)}
+		book := Book{ID: digest + "/" + t.id, Title: title, Source: source, MediaVersion: mediaVersion(ink)}
 		book.Notes, book.Roots = connectNotes(list, topicRoots)
 		books = append(books, book)
 	}
 	// Older exports may carry notes without a matching topic row.
 	if len(notes) > 0 {
 		var orphans []sourceNote
-		for _, list := range notes {
-			orphans = append(orphans, list...)
+		for _, topicID := range topicOrder {
+			if list, ok := notes[topicID]; ok {
+				orphans = append(orphans, list...)
+			}
 		}
 		orphans = filterSourceNotes(orphans)
 		if len(orphans) > 0 {
-			book := Book{ID: digest, Title: strings.TrimSuffix(source, filepath.Ext(source)), Source: source, MediaVersion: mediaVersion(media.ink)}
+			book := Book{ID: digest, Title: strings.TrimSuffix(source, filepath.Ext(source)), Source: source, MediaVersion: mediaVersion(ink)}
 			book.Notes, book.Roots = connectNotes(orphans, nil)
 			books = append(books, book)
 		}
 	}
-	return books, nil
+	return books
 }
 
 func applyTopicHashtags(list []sourceNote, topicRoots []string, raw string) {
@@ -540,7 +693,7 @@ func filterSourceNotes(list []sourceNote) []sourceNote {
 	return out
 }
 
-func readNotes(ctx context.Context, db *sql.DB, media *mediaImport, configs *bookConfigIndex) (map[string][]sourceNote, error) {
+func readRawNotes(ctx context.Context, db *sql.DB, configs *bookConfigIndex) ([]rawSourceNote, error) {
 	cols := tableColumns(ctx, db, "ZBOOKNOTE")
 	hasMedia := cols["ZHIGHLIGHT_PIC"] && cols["ZNOTES"]
 	mediaExpr := "NULL, NULL"
@@ -580,11 +733,9 @@ func readNotes(ctx context.Context, db *sql.DB, media *mediaImport, configs *boo
 		return nil, err
 	}
 	defer rows.Close()
-	grouped := map[string][]sourceNote{}
-	count := 0
+	var out []rawSourceNote
 	for rows.Next() {
-		count++
-		if count > 20000 {
+		if len(out) >= 20000 {
 			return nil, errors.New("单次最多导入 20,000 条笔记")
 		}
 		var n sourceNote
@@ -613,10 +764,13 @@ func readNotes(ctx context.Context, db *sql.DB, media *mediaImport, configs *boo
 		}
 		n.CreatedAt = coreDataToUnix(highlightDate)
 		n.UpdatedAt = coreDataToUnix(noteDate)
-		n.sketchOrDummyOnly = media.attach(&n.Note, clip, blocks)
-		grouped[n.topic] = append(grouped[n.topic], n)
+		out = append(out, rawSourceNote{
+			note:      n,
+			rawClip:   bytes.Clone(clip),
+			rawBlocks: bytes.Clone(blocks),
+		})
 	}
-	return grouped, rows.Err()
+	return out, rows.Err()
 }
 
 func parseLayoutMode(raw string) *int {

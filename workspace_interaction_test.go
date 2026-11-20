@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"encoding/json"
+	"encoding/xml"
 	"errors"
 	"image"
 	"image/color"
@@ -1975,5 +1977,404 @@ func TestUpdateDownloadFailureRetryCancelDeferredAndTouchTargets(t *testing.T) {
 	waitPhase(updateDeferredForeground)
 	if !tester.HasText("下载已完成，返回应用将自动打开安装器") || !tester.HasText("安装更新") {
 		t.Fatalf("expected deferred foreground guidance and 安装更新 button; texts=%v", tester.Texts())
+	}
+}
+
+func TestImportLiveStatusBannerDuringAndAfterImport(t *testing.T) {
+	app := &workspace{store: notebook.NewStore(t.TempDir())}
+	uiCh := make(chan func(), 16)
+	app.postUI = func(fn func()) { uiCh <- fn }
+
+	drainNextUI := func(label string) {
+		t.Helper()
+		select {
+		case fn := <-uiCh:
+			fn()
+		case <-time.After(2 * time.Second):
+			t.Fatalf("timed out waiting for UI callback: %s", label)
+		}
+	}
+
+	book := notebook.Book{
+		ID:    "imported-book",
+		Title: "示例笔记集",
+		Roots: []string{"n1"},
+		Notes: []notebook.Note{{ID: "n1", Title: "第一章", Body: "导入内容"}},
+	}
+	lib := notebook.Library{Books: []notebook.Book{book}}
+
+	// 1. Queued import shows persistent non-error "正在导入笔记本…" while busy,
+	// does not expire prematurely during long imports, and updates cleanly on finish.
+	started := make(chan struct{})
+	release := make(chan struct{})
+	app.importFileFn = func(path string) (notebook.ImportResult, error) {
+		close(started)
+		<-release
+		return notebook.ImportResult{Library: lib, BookID: book.ID, Added: 1}, nil
+	}
+
+	tester := ui.NewTester(app.view, 1280, 800)
+	tester.Frame()
+
+	app.enqueueImport("/synthetic/sample.marginpkg")
+	drainNextUI("flush queued import")
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for queued import to start")
+	}
+
+	tester.Frame()
+	if !app.busy || !app.messagePending || app.messageError || app.message != importingNotebookMessage {
+		t.Fatalf("expected pending non-error import status while busy: busy=%v pending=%v err=%v msg=%q",
+			app.busy, app.messagePending, app.messageError, app.message)
+	}
+	if !tester.HasText(importingNotebookMessage) {
+		t.Fatalf("expected status banner %q while importing; texts=%v", importingNotebookMessage, tester.Texts())
+	}
+
+	// Simulate an import running longer than the 5s normal toast duration: banner must remain visible.
+	tester.Advance(10 * time.Second)
+	if !tester.HasText(importingNotebookMessage) {
+		t.Fatalf("expected pending import banner to stay visible past 5s; texts=%v", tester.Texts())
+	}
+
+	close(release)
+	drainNextUI("finish queued import")
+	tester.Frame()
+	if app.busy || app.messagePending || app.messageError || app.message != "已导入笔记本" {
+		t.Fatalf("expected completed import banner: busy=%v pending=%v err=%v msg=%q",
+			app.busy, app.messagePending, app.messageError, app.message)
+	}
+	if tester.HasText(importingNotebookMessage) || !tester.HasText("已导入笔记本") {
+		t.Fatalf("expected progress banner replaced with completion banner; texts=%v", tester.Texts())
+	}
+
+	// Completed toast expires cleanly once messageUntil has passed.
+	app.messageUntil = time.Now().Add(-time.Second)
+	tester.Frame()
+	if tester.HasText("已导入笔记本") {
+		t.Fatalf("expected completed import banner to auto-dismiss after timeout; texts=%v", tester.Texts())
+	}
+
+	// 2. Canceling the in-app file picker does not leave a progress banner behind.
+	app.openImportDialogFn = func(opts mygo.OpenDialogOptions) ([]string, error) {
+		return nil, nil
+	}
+	app.chooseImport()
+	drainNextUI("cancel chooseImport")
+	tester.Frame()
+	if app.busy || app.messagePending || tester.HasText(importingNotebookMessage) {
+		t.Fatalf("canceled file picker must not show import progress: busy=%v pending=%v msg=%q",
+			app.busy, app.messagePending, app.message)
+	}
+
+	// 3. In-app file picker import shows "正在导入笔记本…" while importing and replaces it with error on failure.
+	pickStarted := make(chan struct{})
+	pickRelease := make(chan struct{})
+	app.openImportDialogFn = func(opts mygo.OpenDialogOptions) ([]string, error) {
+		return []string{"/synthetic/corrupt.marginpkg"}, nil
+	}
+	app.importFileFn = func(path string) (notebook.ImportResult, error) {
+		close(pickStarted)
+		<-pickRelease
+		return notebook.ImportResult{}, errors.New("无法解析笔记包")
+	}
+
+	app.chooseImport()
+	select {
+	case <-pickStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for chooseImport import to start")
+	}
+	drainNextUI("show chooseImport progress")
+	tester.Frame()
+	if !app.busy || !app.messagePending || app.messageError || !tester.HasText(importingNotebookMessage) {
+		t.Fatalf("expected %q during chooseImport: busy=%v pending=%v err=%v texts=%v",
+			importingNotebookMessage, app.busy, app.messagePending, app.messageError, tester.Texts())
+	}
+
+	close(pickRelease)
+	drainNextUI("finish chooseImport with error")
+	tester.Frame()
+	if app.busy || app.messagePending || !app.messageError {
+		t.Fatalf("expected error state after failed chooseImport: busy=%v pending=%v err=%v msg=%q",
+			app.busy, app.messagePending, app.messageError, app.message)
+	}
+	if tester.HasText(importingNotebookMessage) || !tester.HasText("无法解析笔记包") {
+		t.Fatalf("expected error message to replace progress banner; texts=%v", tester.Texts())
+	}
+}
+
+func TestAndroidPickedCacheCleanupSafety(t *testing.T) {
+	androidCache := "/data/user/0/app.mgnote/cache"
+	cacheDirs := []string{androidCache}
+
+	predicateCases := []struct {
+		name      string
+		goos      string
+		path      string
+		cacheDirs []string
+		want      bool
+	}{
+		{
+			name:      "android picked nanotime subdir file",
+			goos:      "android",
+			path:      "/data/user/0/app.mgnote/cache/picked/123456789/sample.marginpkg",
+			cacheDirs: cacheDirs,
+			want:      true,
+		},
+		{
+			name:      "android picked direct file",
+			goos:      "android",
+			path:      "/data/user/0/app.mgnote/cache/picked/sample.marginpkg",
+			cacheDirs: cacheDirs,
+			want:      true,
+		},
+		{
+			name:      "desktop darwin never matches even inside picked path",
+			goos:      "darwin",
+			path:      "/data/user/0/app.mgnote/cache/picked/123456789/sample.marginpkg",
+			cacheDirs: cacheDirs,
+			want:      false,
+		},
+		{
+			name:      "desktop linux never matches",
+			goos:      "linux",
+			path:      "/data/user/0/app.mgnote/cache/picked/123456789/sample.marginpkg",
+			cacheDirs: cacheDirs,
+			want:      false,
+		},
+		{
+			name:      "desktop windows never matches",
+			goos:      "windows",
+			path:      "/data/user/0/app.mgnote/cache/picked/123456789/sample.marginpkg",
+			cacheDirs: cacheDirs,
+			want:      false,
+		},
+		{
+			name:      "picked directory itself is rejected",
+			goos:      "android",
+			path:      "/data/user/0/app.mgnote/cache/picked",
+			cacheDirs: cacheDirs,
+			want:      false,
+		},
+		{
+			name:      "parent traversal out of picked is rejected",
+			goos:      "android",
+			path:      "/data/user/0/app.mgnote/cache/picked/../updates/release.apk",
+			cacheDirs: cacheDirs,
+			want:      false,
+		},
+		{
+			name:      "prefix collision picked2 is rejected",
+			goos:      "android",
+			path:      "/data/user/0/app.mgnote/cache/picked2/sample.marginpkg",
+			cacheDirs: cacheDirs,
+			want:      false,
+		},
+		{
+			name:      "sibling cache directory is rejected",
+			goos:      "android",
+			path:      "/data/user/0/app.mgnote/cache/updates/release.apk",
+			cacheDirs: cacheDirs,
+			want:      false,
+		},
+		{
+			name:      "user downloads storage is rejected",
+			goos:      "android",
+			path:      "/sdcard/Download/sample.marginpkg",
+			cacheDirs: cacheDirs,
+			want:      false,
+		},
+		{
+			name:      "relative path is rejected",
+			goos:      "android",
+			path:      "picked/123456789/sample.marginpkg",
+			cacheDirs: cacheDirs,
+			want:      false,
+		},
+		{
+			name:      "filesystem root cache dir is rejected",
+			goos:      "android",
+			path:      "/picked/sample.marginpkg",
+			cacheDirs: []string{"/"},
+			want:      false,
+		},
+	}
+
+	for _, tc := range predicateCases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isAndroidPickedCacheFile(tc.goos, tc.path, tc.cacheDirs); got != tc.want {
+				t.Fatalf("isAndroidPickedCacheFile(%q, %q, %v) = %v, want %v", tc.goos, tc.path, tc.cacheDirs, got, tc.want)
+			}
+		})
+	}
+
+	// Real filesystem safety checks using temp directories.
+	root := t.TempDir()
+	cacheDir := filepath.Join(root, "cache")
+	pickedRoot := filepath.Join(cacheDir, "picked")
+	pickedSub := filepath.Join(pickedRoot, "987654321")
+	updatesDir := filepath.Join(cacheDir, "updates")
+	userDir := filepath.Join(root, "user-docs")
+	for _, dir := range []string{pickedSub, updatesDir, userDir} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	pickedFile := filepath.Join(pickedSub, "book.marginpkg")
+	directFile := filepath.Join(pickedRoot, "direct.marginpkg")
+	updateFile := filepath.Join(updatesDir, "keep.apk")
+	userFile := filepath.Join(userDir, "important.marginpkg")
+	for _, p := range []string{pickedFile, directFile, updateFile, userFile} {
+		if err := os.WriteFile(p, []byte("payload"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Desktop GOOS must never delete anything.
+	if cleanupAndroidPickedFile("darwin", pickedFile, []string{cacheDir}) {
+		t.Fatal("desktop GOOS must never delete pickedFile")
+	}
+	if _, err := os.Stat(pickedFile); err != nil {
+		t.Fatalf("pickedFile should still exist after desktop call: %v", err)
+	}
+
+	// Files outside <cacheDir>/picked/ must never be deleted even when GOOS=android.
+	if cleanupAndroidPickedFile("android", updateFile, []string{cacheDir}) {
+		t.Fatal("file in sibling updates dir must not be deleted")
+	}
+	if cleanupAndroidPickedFile("android", userFile, []string{cacheDir}) {
+		t.Fatal("arbitrary user file must not be deleted")
+	}
+	if _, err := os.Stat(updateFile); err != nil {
+		t.Fatalf("updateFile should remain intact: %v", err)
+	}
+	if _, err := os.Stat(userFile); err != nil {
+		t.Fatalf("userFile should remain intact: %v", err)
+	}
+
+	// Symlink escapes inside <cacheDir>/picked/ must never delete external targets.
+	symlinkFile := filepath.Join(pickedSub, "link.marginpkg")
+	if err := os.Symlink(userFile, symlinkFile); err != nil {
+		t.Fatal(err)
+	}
+	if cleanupAndroidPickedFile("android", symlinkFile, []string{cacheDir}) {
+		t.Fatal("symlink file inside picked dir must not be deleted")
+	}
+	_ = os.Remove(symlinkFile)
+
+	symlinkDir := filepath.Join(pickedRoot, "escape-dir")
+	if err := os.Symlink(userDir, symlinkDir); err != nil {
+		t.Fatal(err)
+	}
+	if cleanupAndroidPickedFile("android", filepath.Join(symlinkDir, "important.marginpkg"), []string{cacheDir}) {
+		t.Fatal("file accessed via symlinked subdir escaping picked must not be deleted")
+	}
+	if _, err := os.Stat(userFile); err != nil {
+		t.Fatalf("userFile must remain intact after symlink escape attempt: %v", err)
+	}
+	_ = os.Remove(symlinkDir)
+
+	// Valid Android picked files inside <cacheDir>/picked/<nanotime>/ and <cacheDir>/picked/ are deleted cleanly,
+	// while <cacheDir>/picked itself is preserved.
+	if !cleanupAndroidPickedFile("android", pickedFile, []string{cacheDir}) {
+		t.Fatal("expected valid Android picked file in subdir to be cleaned up")
+	}
+	if _, err := os.Stat(pickedFile); !os.IsNotExist(err) {
+		t.Fatalf("expected pickedFile removed, stat err=%v", err)
+	}
+	if _, err := os.Stat(pickedSub); !os.IsNotExist(err) {
+		t.Fatalf("expected empty per-pick subdir removed, stat err=%v", err)
+	}
+	if _, err := os.Stat(pickedRoot); err != nil {
+		t.Fatalf("picked root dir itself must be preserved: %v", err)
+	}
+
+	if !cleanupAndroidPickedFile("android", directFile, []string{cacheDir}) {
+		t.Fatal("expected direct Android picked file to be cleaned up")
+	}
+	if _, err := os.Stat(directFile); !os.IsNotExist(err) {
+		t.Fatalf("expected directFile removed, stat err=%v", err)
+	}
+	if _, err := os.Stat(pickedRoot); err != nil {
+		t.Fatalf("picked root dir must still exist after direct file cleanup: %v", err)
+	}
+}
+
+func TestAndroidOpenPluginManifestIncludesMarginNoteShareMIME(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join("internal", "androidopen", "mygo-plugin.json"))
+	if err != nil {
+		t.Fatalf("read mygo-plugin.json: %v", err)
+	}
+	var cfg struct {
+		Mobile struct {
+			Android struct {
+				Application []string `json:"application"`
+			} `json:"android"`
+		} `json:"mobile"`
+	}
+	if err := json.Unmarshal(raw, &cfg); err != nil {
+		t.Fatalf("unmarshal mygo-plugin.json: %v", err)
+	}
+	if len(cfg.Mobile.Android.Application) == 0 {
+		t.Fatal("expected Android application manifest fragment")
+	}
+
+	type xmlAttr struct {
+		Name string `xml:"name,attr"`
+		MIME string `xml:"mimeType,attr"`
+	}
+	type intentFilter struct {
+		Actions []xmlAttr `xml:"action"`
+		Data    []xmlAttr `xml:"data"`
+	}
+	type activityAlias struct {
+		Filters []intentFilter `xml:"intent-filter"`
+	}
+
+	// Wrap with android namespace so encoding/xml validates every element cleanly.
+	wrapped := `<manifest xmlns:android="http://schemas.android.com/apk/res/android">` +
+		strings.Join(cfg.Mobile.Android.Application, "\n") + `</manifest>`
+	var manifest struct {
+		Aliases []activityAlias `xml:"activity-alias"`
+	}
+	if err := xml.Unmarshal([]byte(wrapped), &manifest); err != nil {
+		t.Fatalf("invalid Android manifest XML in mygo-plugin.json: %v", err)
+	}
+
+	const wantMIME = "application/vnd.marginnote.package"
+	var viewHasMIME, sendHasMIME bool
+	for _, alias := range manifest.Aliases {
+		for _, f := range alias.Filters {
+			hasView, hasSend, hasSendMultiple, hasMIME := false, false, false, false
+			for _, a := range f.Actions {
+				switch a.Name {
+				case "android.intent.action.VIEW":
+					hasView = true
+				case "android.intent.action.SEND":
+					hasSend = true
+				case "android.intent.action.SEND_MULTIPLE":
+					hasSendMultiple = true
+				}
+			}
+			for _, d := range f.Data {
+				if d.MIME == wantMIME {
+					hasMIME = true
+				}
+			}
+			if hasView && hasMIME {
+				viewHasMIME = true
+			}
+			if hasSend && hasSendMultiple && hasMIME {
+				sendHasMIME = true
+			}
+		}
+	}
+	if !viewHasMIME || !sendHasMIME {
+		t.Fatalf("expected %q in both VIEW and SEND/SEND_MULTIPLE filters: view=%v send=%v",
+			wantMIME, viewHasMIME, sendHasMIME)
 	}
 }

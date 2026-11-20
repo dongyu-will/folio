@@ -182,21 +182,28 @@ func (a *workspace) statusBanner(c *ui.Context, p palette) bool {
 	if a.message == "" {
 		return false
 	}
-	left := time.Until(a.messageUntil)
-	if left <= 0 {
-		return false
+	var left time.Duration
+	if !a.messagePending {
+		left = time.Until(a.messageUntil)
+		if left <= 0 {
+			return false
+		}
 	}
 	fg, bg, ic := p.accent, p.tint, icCheck
 	if a.messageError {
 		fg, bg, ic = p.danger, p.dangerWash, icAlert
+	} else if a.messagePending {
+		ic = icImport
 	}
-	ui.Row(c).FillWidth().Shrink(0).Padding(7, 16).Gap(8).AlignItems(ui.Center).
+	ui.Row(c.Key("status-banner")).FillWidth().Shrink(0).Padding(7, 16).Gap(8).AlignItems(ui.Center).
 		Background(bg).Children(func() {
-		ui.Icon(c, ic).Size(14, 14).TextColor(fg)
-		ui.Text(c, a.message).FontSize(12.5).FontWeight(550).TextColor(fg).Grow(1).MinWidth(0).SingleLine()
+		ui.Icon(c, ic).Size(14, 14).TextColor(fg).Shrink(0)
+		ui.Text(c, a.message).FontSize(12.5).FontWeight(550).TextColor(fg).Grow(1).MinWidth(0).SingleLine().Ellipsis("…")
 	})
 	horizontalRule(c, p)
-	c.After(left)
+	if !a.messagePending {
+		c.After(left)
+	}
 	return true
 }
 

@@ -4,17 +4,22 @@ import (
 	"bytes"
 	"compress/gzip"
 	"encoding/binary"
+	"errors"
 	"image"
 	"image/png"
 	"io"
 	"math"
+	"sync"
 )
 
 const (
 	maxPKDecompressed = 16 << 20
 	maxPKStrokes      = 50_000
 	maxPKPoints       = 500_000
+	maxPooledCovBuf   = 1 << 20
 )
+
+var errInvalidPKDrawing = errors.New("invalid PencilKit drawing")
 
 type pkInk struct {
 	r, g, b, a float64
@@ -31,6 +36,17 @@ type pkStroke struct {
 	points []pkPoint
 }
 
+var covBufPool sync.Pool
+
+func encodeFastPNG(img image.Image) []byte {
+	var out bytes.Buffer
+	enc := png.Encoder{CompressionLevel: png.BestSpeed}
+	if err := enc.Encode(&out, img); err != nil {
+		return nil
+	}
+	return out.Bytes()
+}
+
 // renderPKDrawing parses an Apple PencilKit PKDrawing blob (raw or gzip-wrapped
 // "wrd\xf0" protobuf) and rasterizes all visible strokes into a transparent PNG.
 // This enables handwriting annotations on platforms without Apple PencilKit
@@ -40,10 +56,31 @@ func renderPKDrawing(data []byte, width, height, pixels int) []byte {
 	if !ok || len(strokes) == 0 {
 		return nil
 	}
+	return renderPKStrokesPNG(strokes, float64(width), float64(height), pixels)
+}
 
-	var rectX, rectY, rectW, rectH float64
+// renderPKDrawingImage parses an Apple PencilKit PKDrawing blob and rasterizes
+// all visible strokes directly into an *image.RGBA without PNG encoding.
+// Returns (nil, nil) for a valid drawing with zero visible strokes.
+func renderPKDrawingImage(raw []byte, width, height float64, pixels int) (*image.RGBA, error) {
+	strokes, ok := parsePKDrawing(raw)
+	if !ok {
+		return nil, errInvalidPKDrawing
+	}
+	if len(strokes) == 0 {
+		return nil, nil
+	}
+	return rasterizePKStrokes(strokes, width, height, pixels), nil
+}
+
+func pkCanvasLayout(strokes []pkStroke, width, height float64, pixels int) (rectX, rectY, scale float64, outW, outH int, ok bool) {
+	if len(strokes) == 0 {
+		return 0, 0, 0, 0, 0, false
+	}
+
+	var rectW, rectH float64
 	if width > 0 && height > 0 {
-		rectW, rectH = float64(width), float64(height)
+		rectW, rectH = width, height
 	} else {
 		minX, minY := math.Inf(1), math.Inf(1)
 		maxX, maxY := math.Inf(-1), math.Inf(-1)
@@ -57,7 +94,7 @@ func renderPKDrawing(data []byte, width, height, pixels int) []byte {
 			}
 		}
 		if math.IsInf(minX, 0) || math.IsNaN(minX) || maxX <= minX || maxY <= minY {
-			return nil
+			return 0, 0, 0, 0, 0, false
 		}
 		rectX = math.Floor(minX - 4)
 		rectY = math.Floor(minY - 4)
@@ -65,31 +102,82 @@ func renderPKDrawing(data []byte, width, height, pixels int) []byte {
 		rectH = math.Ceil(maxY+4) - rectY
 	}
 	if rectW <= 0 || rectH <= 0 {
-		return nil
+		return 0, 0, 0, 0, 0, false
 	}
 
-	scale := 2.0
+	scale = 2.0
 	if pixels > 0 {
 		scale = float64(pixels) / rectW
 	}
 	if math.IsNaN(scale) || math.IsInf(scale, 0) || scale <= 0 {
-		return nil
+		return 0, 0, 0, 0, 0, false
 	}
-	outW := int(math.Round(rectW * scale))
-	outH := int(math.Round(rectH * scale))
+	outW = int(math.Round(rectW * scale))
+	outH = int(math.Round(rectH * scale))
 	if outW < 1 || outH < 1 || int64(outW)*int64(outH) > 28_000_000 {
+		return 0, 0, 0, 0, 0, false
+	}
+	return rectX, rectY, scale, outW, outH, true
+}
+
+func rasterizePKStrokes(strokes []pkStroke, width, height float64, pixels int) *image.RGBA {
+	rectX, rectY, scale, outW, outH, ok := pkCanvasLayout(strokes, width, height, pixels)
+	if !ok {
 		return nil
 	}
-
 	canvas := image.NewRGBA(image.Rect(0, 0, outW, outH))
+	rasterizePKStrokesOnto(canvas, strokes, rectX, rectY, scale, outW, outH)
+	return canvas
+}
+
+// renderPKStrokesPNG rasterizes strokes into a fresh RGBA canvas and
+// immediately encodes to PNG using fast compression and a pooled encoder buffer.
+func renderPKStrokesPNG(strokes []pkStroke, width, height float64, pixels int) []byte {
+	canvas := rasterizePKStrokes(strokes, width, height, pixels)
+	if canvas == nil {
+		return nil
+	}
+	return encodeFastPNG(canvas)
+}
+
+// compositePKStrokesOnto rasterizes strokes directly onto an existing
+// premultiplied RGBA destination image using Porter-Duff Over, avoiding a
+// separate full-frame overlay RGBA allocation and blit.
+func compositePKStrokesOnto(dst *image.RGBA, strokes []pkStroke, width, height float64, pixels int) bool {
+	rectX, rectY, scale, outW, outH, ok := pkCanvasLayout(strokes, width, height, pixels)
+	if !ok {
+		return false
+	}
+	clipW := min(outW, dst.Rect.Dx())
+	clipH := min(outH, dst.Rect.Dy())
+	if clipW < 1 || clipH < 1 {
+		return false
+	}
+	rasterizePKStrokesOnto(dst, strokes, rectX, rectY, scale, clipW, clipH)
+	return true
+}
+
+func rasterizePKStrokesOnto(canvas *image.RGBA, strokes []pkStroke, rectX, rectY, scale float64, clipW, clipH int) {
 	var covBuf []uint8
+	if bp, ok := covBufPool.Get().(*[]uint8); ok && bp != nil {
+		covBuf = *bp
+	}
+	defer func() {
+		if cap(covBuf) > 0 && cap(covBuf) <= maxPooledCovBuf {
+			buf := covBuf
+			covBufPool.Put(&buf)
+		}
+	}()
+
+	originX := canvas.Rect.Min.X
+	originY := canvas.Rect.Min.Y
 
 	for _, s := range strokes {
 		if len(s.points) == 0 {
 			continue
 		}
 		// Compute pixel bounding box of this stroke on the output canvas.
-		minX, minY := outW, outH
+		minX, minY := clipW, clipH
 		maxX, maxY := -1, -1
 		for _, p := range s.points {
 			px := (p.x - rectX) * scale
@@ -97,8 +185,8 @@ func renderPKDrawing(data []byte, width, height, pixels int) []byte {
 			pr := max(0.6, p.radius*scale) + 1.5
 			x0 := max(0, int(math.Floor(px-pr)))
 			y0 := max(0, int(math.Floor(py-pr)))
-			x1 := min(outW-1, int(math.Ceil(px+pr)))
-			y1 := min(outH-1, int(math.Ceil(py+pr)))
+			x1 := min(clipW-1, int(math.Ceil(px+pr)))
+			y1 := min(clipH-1, int(math.Ceil(py+pr)))
 			if x0 <= x1 && y0 <= y1 {
 				minX = min(minX, x0)
 				minY = min(minY, y0)
@@ -140,21 +228,39 @@ func renderPKDrawing(data []byte, width, height, pixels int) []byte {
 		sr := clamp01(s.ink.r)
 		sg := clamp01(s.ink.g)
 		sb := clamp01(s.ink.b)
+		srByte := toByte(sr)
+		sgByte := toByte(sg)
+		sbByte := toByte(sb)
+		baseOff := canvas.PixOffset(originX+minX, originY+minY)
 		for y := 0; y < bh; y++ {
 			rowOff := y * bw
-			pixOff := (minY+y)*canvas.Stride + minX*4
+			pixOff := baseOff + y*canvas.Stride
 			for x := 0; x < bw; x++ {
 				cov := covBuf[rowOff+x]
 				if cov == 0 {
 					continue
 				}
-				sa := float64(cov) / 255.0
-				inv := 1.0 - sa
 				i := pixOff + x*4
-				dr := float64(canvas.Pix[i+0]) / 255.0
-				dg := float64(canvas.Pix[i+1]) / 255.0
-				db := float64(canvas.Pix[i+2]) / 255.0
-				da := float64(canvas.Pix[i+3]) / 255.0
+				if cov == 255 {
+					canvas.Pix[i+0] = srByte
+					canvas.Pix[i+1] = sgByte
+					canvas.Pix[i+2] = sbByte
+					canvas.Pix[i+3] = 255
+					continue
+				}
+				sa := float64(cov) * (1.0 / 255.0)
+				if canvas.Pix[i+3] == 0 {
+					canvas.Pix[i+0] = toByte(sr * sa)
+					canvas.Pix[i+1] = toByte(sg * sa)
+					canvas.Pix[i+2] = toByte(sb * sa)
+					canvas.Pix[i+3] = cov
+					continue
+				}
+				inv := 1.0 - sa
+				dr := float64(canvas.Pix[i+0]) * (1.0 / 255.0)
+				dg := float64(canvas.Pix[i+1]) * (1.0 / 255.0)
+				db := float64(canvas.Pix[i+2]) * (1.0 / 255.0)
+				da := float64(canvas.Pix[i+3]) * (1.0 / 255.0)
 				canvas.Pix[i+0] = toByte(sr*sa + dr*inv)
 				canvas.Pix[i+1] = toByte(sg*sa + dg*inv)
 				canvas.Pix[i+2] = toByte(sb*sa + db*inv)
@@ -162,12 +268,6 @@ func renderPKDrawing(data []byte, width, height, pixels int) []byte {
 			}
 		}
 	}
-
-	var out bytes.Buffer
-	if err := png.Encode(&out, canvas); err != nil {
-		return nil
-	}
-	return out.Bytes()
 }
 
 func rasterCapsule(buf []uint8, bw, bh, offX, offY int, x0, y0, r0, op0, x1, y1, r1, op1 float64) {
@@ -182,32 +282,40 @@ func rasterCapsule(buf []uint8, bw, bh, offX, offY int, x0, y0, r0, op0, x1, y1,
 
 	dx, dy := x1-x0, y1-y0
 	lenSq := dx*dx + dy*dy
+	invLenSq := 0.0
+	if lenSq > 1e-9 {
+		invLenSq = 1.0 / lenSq
+	}
+	dr := r1 - r0
+	dop := op1 - op0
 	for y := by0; y <= by1; y++ {
 		py := float64(offY+y) + 0.5
+		pyDotDy := (py - y0) * dy
 		row := y * bw
 		for x := bx0; x <= bx1; x++ {
 			px := float64(offX+x) + 0.5
 			var t float64
-			if lenSq > 1e-9 {
-				t = ((px-x0)*dx + (py-y0)*dy) / lenSq
+			if invLenSq != 0 {
+				t = ((px-x0)*dx + pyDotDy) * invLenSq
 				if t < 0 {
 					t = 0
 				} else if t > 1 {
 					t = 1
 				}
 			}
-			cx := x0 + dx*t
-			cy := y0 + dy*t
-			dist := math.Hypot(px-cx, py-cy)
-			r := r0 + (r1-r0)*t
-			aa := r + 0.5 - dist
-			if aa <= 0 {
+			ddx := px - (x0 + dx*t)
+			ddy := py - (y0 + dy*t)
+			r := r0 + dr*t
+			edge := r + 0.5
+			distSq := ddx*ddx + ddy*ddy
+			if distSq >= edge*edge {
 				continue
 			}
+			aa := edge - math.Sqrt(distSq)
 			if aa > 1 {
 				aa = 1
 			}
-			op := op0 + (op1-op0)*t
+			op := op0 + dop*t
 			cov := toByte(aa * op)
 			if cov > buf[row+x] {
 				buf[row+x] = cov

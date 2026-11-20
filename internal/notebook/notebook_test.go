@@ -461,3 +461,172 @@ func TestConnectNotesCycleAndZipValidationAndMarkdown(t *testing.T) {
 		t.Fatalf("expected multi-db zip rejection, got %v", err)
 	}
 }
+
+func TestImportExtensionlessMagicByteFallback(t *testing.T) {
+	tmp := t.TempDir()
+	img := makePNG(t, 12, 12, 21)
+
+	// 1. Extensionless SQLite (.marginnotes) file.
+	extlessDB := filepath.Join(tmp, "picked_sqlite_blob")
+	createTestMarginDB(t, extlessDB, "TOPIC-MAGIC-DB", "无后缀数据库", []struct{ id, title, body, parent, links string }{
+		{id: "n-db", title: "SQLite节点", body: "魔数识别"},
+	}, img)
+
+	// 2. Extensionless ZIP (.marginpkg) file with embedded PDF, plus unrecognized ".bin" extension.
+	dbRaw, err := os.ReadFile(extlessDB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pdfBytes := []byte("%PDF-1.7\n%%EOF\n")
+	var pkgBuf bytes.Buffer
+	zw := zip.NewWriter(&pkgBuf)
+	for name, data := range map[string][]byte{
+		"inner.marginnotes":                 dbRaw,
+		"VersionBackupSubset/docs/讲义原文.pdf": pdfBytes,
+	} {
+		w, err := zw.Create(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := w.Write(data); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	extlessPkg := filepath.Join(tmp, "picked_package_blob")
+	if err := os.WriteFile(extlessPkg, pkgBuf.Bytes(), 0600); err != nil {
+		t.Fatal(err)
+	}
+	binPkg := filepath.Join(tmp, "picked_package.bin")
+	if err := os.WriteFile(binPkg, pkgBuf.Bytes(), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	// 3. Extensionless 15-byte PDF file (shorter than 16-byte sniff buffer).
+	extlessPDF := filepath.Join(tmp, "picked_pdf_blob")
+	if err := os.WriteFile(extlessPDF, pdfBytes, 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	// 4. Extensionless unrecognized plain text file.
+	extlessBad := filepath.Join(tmp, "picked_plain_text")
+	if err := os.WriteFile(extlessBad, []byte("plain text without magic"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := detectImportFormat(extlessPkg); got != ".marginpkg" {
+		t.Fatalf("detectImportFormat(extlessPkg) = %q, want .marginpkg", got)
+	}
+	if got := detectImportFormat(binPkg); got != ".marginpkg" {
+		t.Fatalf("detectImportFormat(binPkg) = %q, want .marginpkg", got)
+	}
+	if got := detectImportFormat(extlessDB); got != ".marginnotes" {
+		t.Fatalf("detectImportFormat(extlessDB) = %q, want .marginnotes", got)
+	}
+	if got := detectImportFormat(extlessPDF); got != ".pdf" {
+		t.Fatalf("detectImportFormat(extlessPDF) = %q, want .pdf", got)
+	}
+	if got := detectImportFormat(extlessBad); got != "" {
+		t.Fatalf("detectImportFormat(extlessBad) = %q, want empty", got)
+	}
+
+	// Import extensionless .marginpkg -> must import notes AND embedded PDF documents.
+	storePkg := NewStore(filepath.Join(tmp, "store-pkg"))
+	resPkg, err := storePkg.Import(extlessPkg)
+	if err != nil {
+		t.Fatalf("extensionless .marginpkg import failed: %v", err)
+	}
+	if resPkg.Added != 1 || len(resPkg.Library.Books) != 1 || len(resPkg.Library.Books[0].Notes) != 1 {
+		t.Fatalf("unexpected extensionless .marginpkg books: %+v", resPkg.Library.Books)
+	}
+	if len(resPkg.Library.Books[0].Documents) != 1 || resPkg.Library.Books[0].Documents[0].Title != "讲义原文" {
+		t.Fatalf("extensionless .marginpkg did not import embedded PDF: %+v", resPkg.Library.Books[0].Documents)
+	}
+
+	// Import unrecognized .bin .marginpkg.
+	storeBin := NewStore(filepath.Join(tmp, "store-bin"))
+	resBin, err := storeBin.Import(binPkg)
+	if err != nil || resBin.Added != 1 || len(resBin.Library.Books[0].Documents) != 1 {
+		t.Fatalf(".bin .marginpkg import failed: res=%+v err=%v", resBin, err)
+	}
+
+	// Import extensionless .marginnotes.
+	storeDB := NewStore(filepath.Join(tmp, "store-db"))
+	resDB, err := storeDB.Import(extlessDB)
+	if err != nil || resDB.Added != 1 || len(resDB.Library.Books[0].Notes) != 1 {
+		t.Fatalf("extensionless .marginnotes import failed: res=%+v err=%v", resDB, err)
+	}
+
+	// Import extensionless .pdf.
+	resPDF, err := storeDB.Import(extlessPDF)
+	if err != nil || resPDF.Added != 1 || !strings.HasPrefix(resPDF.BookID, "pdf-") {
+		t.Fatalf("extensionless .pdf import failed: res=%+v err=%v", resPDF, err)
+	}
+
+	// Invalid extensionless file still fails cleanly.
+	if _, err := storeDB.Import(extlessBad); err == nil || !strings.Contains(err.Error(), ".marginpkg") {
+		t.Fatalf("expected clean rejection for invalid extensionless file, got %v", err)
+	}
+}
+
+func TestReimportSkipsExistingMediaFilesOnDisk(t *testing.T) {
+	tmp := t.TempDir()
+	dbPath := filepath.Join(tmp, "reimport.marginnotes")
+	img := makePNG(t, 16, 16, 77)
+	createTestMarginDB(t, dbPath, "TOPIC-SKIP", "跳过已有媒体", []struct{ id, title, body, parent, links string }{
+		{id: "n1", title: "节点1", body: "正文"},
+	}, img)
+
+	store := NewStore(filepath.Join(tmp, "store"))
+	first, err := store.Import(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	clipName := first.Library.Books[0].Notes[0].Clip
+	if clipName == "" {
+		t.Fatal("expected saved clip on first import")
+	}
+	mediaPath := store.MediaPath(clipName)
+	oldTime := time.Now().Add(-10 * time.Minute).Truncate(time.Second)
+	if err := os.Chtimes(mediaPath, oldTime, oldTime); err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. No-op re-import must skip rewriting the existing media file.
+	second, err := store.Import(dbPath)
+	if err != nil || second.Added != 0 || second.Updated != 0 {
+		t.Fatalf("unexpected no-op re-import result: added=%d updated=%d err=%v", second.Added, second.Updated, err)
+	}
+	info, err := os.Stat(mediaPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !info.ModTime().Equal(oldTime) {
+		t.Fatalf("no-op re-import rewrote existing media file (was %v, now %v)", oldTime, info.ModTime())
+	}
+
+	// 2. Active MediaVersion upgrade re-import must also skip rewriting existing media on disk.
+	if _, err := store.update(func(l *Library) (bool, error) {
+		l.Books[0].MediaVersion = 0
+		return true, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	upgraded, err := store.Import(dbPath)
+	if err != nil || upgraded.Updated != 1 {
+		t.Fatalf("unexpected upgrade re-import result: updated=%d err=%v", upgraded.Updated, err)
+	}
+	info2, err := os.Stat(mediaPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !info2.ModTime().Equal(oldTime) {
+		t.Fatalf("upgrade re-import rewrote existing media file (was %v, now %v)", oldTime, info2.ModTime())
+	}
+	saved, err := os.ReadFile(mediaPath)
+	if err != nil || !bytes.Equal(saved, img) {
+		t.Fatalf("existing media file content corrupted (err=%v)", err)
+	}
+}

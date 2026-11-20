@@ -41,6 +41,8 @@ type Store struct {
 	drawingMu       sync.Mutex
 	drawingJournals map[string]drawingJournal
 	inkRenderer     string
+	inFlightMu      sync.Mutex
+	inFlightMedia   map[string]int
 }
 
 type ImportResult struct {
@@ -199,14 +201,18 @@ func (s *Store) writeAllShards(library Library, dirty map[string]bool) error {
 }
 
 func (s *Store) Import(path string) (ImportResult, error) {
-	if strings.EqualFold(filepath.Ext(path), ".pdf") {
+	if detectImportFormat(path) == ".pdf" {
 		return s.importPDF(path)
 	}
 	return s.importFile(path, false)
 }
 
 func (s *Store) importFile(path string, existingOnly bool) (ImportResult, error) {
-	books, files, configs, err := readMarginNote(path, s.inkRenderer)
+	format := detectImportFormat(path)
+	sink := s.newMediaSink()
+	defer sink.cleanup()
+
+	books, files, configs, err := readMarginNoteWithSink(path, s.inkRenderer, sink)
 	if err != nil {
 		return ImportResult{}, err
 	}
@@ -218,7 +224,7 @@ func (s *Store) importFile(path string, existingOnly bool) (ImportResult, error)
 		return ImportResult{}, err
 	}
 	result := ImportResult{BookID: books[0].ID}
-	if strings.EqualFold(filepath.Ext(path), ".marginpkg") && (!existingOnly || slices.ContainsFunc(books, func(b Book) bool {
+	if format == ".marginpkg" && (!existingOnly || slices.ContainsFunc(books, func(b Book) bool {
 		return indexBook(&library, b.ID) >= 0
 	})) {
 		documents, err := s.importPackagePDFs(path, configs)
@@ -287,7 +293,7 @@ func (s *Store) importFile(path string, existingOnly bool) (ImportResult, error)
 				return ImportResult{}, err
 			}
 			for name, data := range files {
-				if err := WriteFile(s.MediaPath(name), data); err != nil {
+				if _, err := writeImmutableFile(s.MediaPath(name), data); err != nil {
 					return ImportResult{}, err
 				}
 			}
@@ -298,9 +304,12 @@ func (s *Store) importFile(path string, existingOnly bool) (ImportResult, error)
 		for _, oldFile := range staleBookFiles {
 			_ = os.Remove(filepath.Join(s.booksDir(), oldFile))
 		}
+		sink.finalize(referencedMedia(library.Books))
 		if mergedUpdate {
 			s.gcMedia(library.Books)
 		}
+	} else {
+		sink.finalize(nil)
 	}
 	result.Library = library
 	return result, nil
@@ -716,7 +725,7 @@ func (s *Store) DeleteBook(bookID string) (Library, error) {
 	return library, nil
 }
 
-func (s *Store) gcMedia(books []Book) {
+func referencedMedia(books []Book) map[string]bool {
 	referenced := make(map[string]bool)
 	for _, b := range books {
 		for _, n := range b.Notes {
@@ -730,6 +739,138 @@ func (s *Store) gcMedia(books []Book) {
 			}
 		}
 	}
+	return referenced
+}
+
+func (s *Store) addInFlightMedia(name string) {
+	s.inFlightMu.Lock()
+	if s.inFlightMedia == nil {
+		s.inFlightMedia = make(map[string]int)
+	}
+	s.inFlightMedia[name]++
+	s.inFlightMu.Unlock()
+}
+
+func (s *Store) releaseInFlightMedia(name string) int {
+	s.inFlightMu.Lock()
+	defer s.inFlightMu.Unlock()
+	if s.inFlightMedia == nil {
+		return 0
+	}
+	n := s.inFlightMedia[name] - 1
+	if n <= 0 {
+		delete(s.inFlightMedia, name)
+		return 0
+	}
+	s.inFlightMedia[name] = n
+	return n
+}
+
+func (s *Store) isInFlightMedia(name string) bool {
+	s.inFlightMu.Lock()
+	n := s.inFlightMedia[name]
+	s.inFlightMu.Unlock()
+	return n > 0
+}
+
+type storeMediaSink struct {
+	store     *Store
+	dirOnce   sync.Once
+	dirErr    error
+	mu        sync.Mutex
+	seen      map[string]bool
+	created   map[string]bool
+	inFlight  map[string]chan struct{}
+	finalized bool
+}
+
+func (s *Store) newMediaSink() *storeMediaSink {
+	return &storeMediaSink{
+		store:    s,
+		seen:     make(map[string]bool),
+		created:  make(map[string]bool),
+		inFlight: make(map[string]chan struct{}),
+	}
+}
+
+func (w *storeMediaSink) save(name string, data []byte) error {
+	path := w.store.MediaPath(name)
+	if path == "" {
+		return errors.New("无效的媒体文件名")
+	}
+	var ch chan struct{}
+	for {
+		w.mu.Lock()
+		if w.seen[name] {
+			w.mu.Unlock()
+			return nil
+		}
+		if waitCh, busy := w.inFlight[name]; busy {
+			w.mu.Unlock()
+			<-waitCh
+			continue
+		}
+		ch = make(chan struct{})
+		w.inFlight[name] = ch
+		w.mu.Unlock()
+		break
+	}
+
+	w.dirOnce.Do(func() {
+		w.dirErr = os.MkdirAll(w.store.mediaDir(), 0700)
+	})
+	if w.dirErr != nil {
+		w.mu.Lock()
+		delete(w.inFlight, name)
+		close(ch)
+		w.mu.Unlock()
+		return w.dirErr
+	}
+
+	w.store.addInFlightMedia(name)
+	created, err := writeImmutableFile(path, data)
+	w.mu.Lock()
+	delete(w.inFlight, name)
+	if err == nil {
+		w.seen[name] = true
+		if created {
+			w.created[name] = true
+		}
+	} else {
+		w.store.releaseInFlightMedia(name)
+	}
+	close(ch)
+	w.mu.Unlock()
+	return err
+}
+
+func (w *storeMediaSink) finalize(referenced map[string]bool) {
+	w.mu.Lock()
+	if w.finalized {
+		w.mu.Unlock()
+		return
+	}
+	w.finalized = true
+	seen := w.seen
+	created := w.created
+	w.seen = nil
+	w.created = nil
+	w.mu.Unlock()
+
+	for name := range seen {
+		remaining := w.store.releaseInFlightMedia(name)
+		if remaining == 0 && created[name] && (referenced == nil || !referenced[name]) {
+			_ = os.Remove(w.store.MediaPath(name))
+		}
+	}
+}
+
+func (w *storeMediaSink) cleanup() {
+	w.finalize(nil)
+}
+
+func (s *Store) gcMedia(books []Book) {
+	referenced := referencedMedia(books)
 	entries, err := os.ReadDir(s.mediaDir())
 	if err != nil {
 		return
@@ -739,7 +880,7 @@ func (s *Store) gcMedia(books []Book) {
 			continue
 		}
 		name := entry.Name()
-		if mediaName.MatchString(name) && !referenced[name] {
+		if mediaName.MatchString(name) && !referenced[name] && !s.isInFlightMedia(name) {
 			_ = os.Remove(filepath.Join(s.mediaDir(), name))
 		}
 	}
@@ -778,6 +919,32 @@ func indexBookByTopic(library *Library, bookID string) int {
 
 func indexNote(book *Book, id string) int {
 	return slices.IndexFunc(book.Notes, func(note Note) bool { return note.ID == id })
+}
+
+// writeImmutableFile atomically writes a content-addressed media blob without
+// per-file fsync, skipping the write when the immutable target already exists.
+// Returns created=true only when this call newly created the file on disk.
+func writeImmutableFile(path string, data []byte) (created bool, err error) {
+	if _, err := os.Stat(path); err == nil {
+		return false, nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return false, err
+	}
+	f, err := os.CreateTemp(filepath.Dir(path), ".mgnote-media-*")
+	if err != nil {
+		return false, err
+	}
+	tmpName := f.Name()
+	defer os.Remove(tmpName)
+	_, writeErr := f.Write(data)
+	closeErr := f.Close()
+	if err := errors.Join(writeErr, closeErr); err != nil {
+		return false, err
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func WriteFile(path string, data []byte) error {

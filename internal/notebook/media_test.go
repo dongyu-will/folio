@@ -3,16 +3,23 @@ package notebook
 import (
 	"archive/zip"
 	"bytes"
+	"compress/gzip"
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/binary"
 	"encoding/json"
 	"image"
+	"image/color"
 	"image/png"
 	"math"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
+	"strings"
 	"testing"
+	"time"
 
 	"howett.net/plist"
 )
@@ -666,6 +673,465 @@ func TestMergedLinkNoteAndPicNoteBlocks(t *testing.T) {
 	}
 	if n.Blocks[0].Image == "" || n.Blocks[1].Text != "合并的纯文本摘录段落" || n.Blocks[2].Image == "" {
 		t.Fatalf("unexpected block contents: %+v", n.Blocks)
+	}
+}
+
+func buildEmptyPKDrawing(t *testing.T, gzipped, tombstonedOnly bool) []byte {
+	t.Helper()
+	var proto []byte
+	if tombstonedOnly {
+		var constBuf [6]byte
+		binary.LittleEndian.PutUint32(constBuf[0:4], math.Float32bits(6))
+		binary.LittleEndian.PutUint16(constBuf[4:6], 32767)
+		var pt [12]byte
+		binary.LittleEndian.PutUint32(pt[0:4], math.Float32bits(10))
+		binary.LittleEndian.PutUint32(pt[4:8], math.Float32bits(10))
+		var path []byte
+		path = appendTag(path, 3, 0)
+		path = appendVarint(path, 1)
+		path = appendTag(path, 4, 0)
+		path = appendVarint(path, 3)
+		path = appendTag(path, 5, 0)
+		path = appendVarint(path, (1<<2)|(1<<8))
+		path = appendBytesField(path, 6, constBuf[:])
+		path = appendBytesField(path, 7, pt[:])
+		var stroke []byte
+		stroke = appendTag(stroke, 4, 0)
+		stroke = appendVarint(stroke, 0)
+		stroke = appendBytesField(stroke, 5, path)
+		stroke = appendTag(stroke, 8, 0)
+		stroke = appendVarint(stroke, 1) // tombstoned flag
+		proto = appendBytesField(proto, 5, stroke)
+	}
+	raw := append([]byte{'w', 'r', 'd', 0xf0, 0x02, 0x00}, proto...)
+	if !gzipped {
+		return raw
+	}
+	var buf bytes.Buffer
+	zw := gzip.NewWriter(&buf)
+	if _, err := zw.Write(raw); err != nil {
+		t.Fatal(err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return buf.Bytes()
+}
+
+func writeMockInkRenderer(t *testing.T, dir, logPath, sleepSec string, pngBytes []byte) string {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX shell mock ink renderer not supported on Windows")
+	}
+	pngPath := filepath.Join(dir, "mock-ink-out.png")
+	if err := os.WriteFile(pngPath, pngBytes, 0600); err != nil {
+		t.Fatal(err)
+	}
+	scriptPath := filepath.Join(dir, "mock-ink.sh")
+	var script strings.Builder
+	script.WriteString("#!/bin/sh\n")
+	if logPath != "" {
+		script.WriteString("printf '%s %s %s\\n' \"$1\" \"$2\" \"$3\" >> '" + logPath + "'\n")
+	}
+	if sleepSec != "" {
+		script.WriteString("sleep " + sleepSec + "\n")
+	}
+	script.WriteString("cat '" + pngPath + "'\n")
+	if err := os.WriteFile(scriptPath, []byte(script.String()), 0700); err != nil {
+		t.Fatal(err)
+	}
+	return scriptPath
+}
+
+func TestImportDecouplesSQLiteCursorFromSlowInkRendering(t *testing.T) {
+	origTimeout := sqliteReadTimeout
+	sqliteReadTimeout = 120 * time.Millisecond
+	t.Cleanup(func() { sqliteReadTimeout = origTimeout })
+
+	tmp := t.TempDir()
+	dbPath := filepath.Join(tmp, "decoupled.marginnotes")
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, q := range []string{
+		"CREATE TABLE ZTOPIC (Z_PK INTEGER, ZTOPICID TEXT, ZTITLE TEXT, ZMINDLINKS TEXT)",
+		"CREATE TABLE ZBOOKNOTE (Z_PK INTEGER, ZNOTEID TEXT, ZTOPICID TEXT, ZGROUPNOTEID TEXT, ZNOTETITLE TEXT, ZNOTES_TEXT TEXT, ZHIGHLIGHT_TEXT TEXT, ZSTARTPAGE INTEGER, ZMINDLINKS TEXT, ZHIGHLIGHT_PIC BLOB, ZNOTES BLOB)",
+		"CREATE TABLE ZMEDIA (ZMD5 TEXT, ZDATA BLOB)",
+		"INSERT INTO ZTOPIC VALUES (1, 'topic-slow', '解耦测试', 'n1|n2')",
+	} {
+		if _, err := db.ExecContext(context.Background(), q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	archive := func(objects ...any) []byte {
+		t.Helper()
+		data, err := plist.Marshal(map[string]any{
+			"$archiver": "NSKeyedArchiver", "$top": map[string]any{"root": plist.UID(1)},
+			"$objects": append([]any{"$null"}, objects...),
+		}, plist.BinaryFormat)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return data
+	}
+
+	pk1 := buildSyntheticPKDrawing(t, false)
+	pk2 := buildSyntheticPKDrawing(t, true)
+	// Place nested child key BEFORE its wrapper row to verify Pass 2 fetch too.
+	nestedWrap := archive(
+		map[string]any{"NS.keys": []any{plist.UID(2)}, "NS.objects": []any{plist.UID(3)}},
+		"drawing2", "child-draw-key",
+	)
+	for _, row := range []struct {
+		key  string
+		data []byte
+	}{
+		{"unreferenced-pdf-json", []byte(`{"pages":[1,2,3]}`)},
+		{"child-draw-key", archive(map[string]any{"NS.data": pk2})},
+		{"draw-key-1", archive(map[string]any{"NS.data": pk1})},
+		{"wrap-draw-key", nestedWrap},
+	} {
+		if _, err := db.Exec("INSERT INTO ZMEDIA VALUES (?, ?)", row.key, row.data); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	clip1 := archive(
+		map[string]any{"NS.keys": []any{plist.UID(2)}, "NS.objects": []any{plist.UID(3)}},
+		"drawing", "draw-key-1",
+	)
+	clip2 := archive(
+		map[string]any{"NS.keys": []any{plist.UID(2)}, "NS.objects": []any{plist.UID(3)}},
+		"drawing", "wrap-draw-key",
+	)
+	if _, err := db.Exec("INSERT INTO ZBOOKNOTE VALUES (1, 'n1', 'topic-slow', NULL, '笔记一', '', '', 1, '', ?, NULL)", clip1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec("INSERT INTO ZBOOKNOTE VALUES (2, 'n2', 'topic-slow', NULL, '笔记二', '', '', 2, '', ?, NULL)", clip2); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Mock ink renderer sleeps 300ms per call (> 120ms sqliteReadTimeout).
+	// If media.attach ran inside the SQLite cursor loop, this would deterministically fail with context deadline exceeded.
+	mockInk := writeMockInkRenderer(t, tmp, "", "0.3", makePNG(t, 32, 16, 5))
+	store := NewStore(filepath.Join(tmp, "store"))
+	store.SetInkRenderer(mockInk)
+
+	res, err := store.Import(dbPath)
+	if err != nil {
+		t.Fatalf("expected import to succeed after SQLite closed before slow ink rendering, got: %v", err)
+	}
+	if len(res.Library.Books) != 1 || len(res.Library.Books[0].Notes) != 2 {
+		t.Fatalf("unexpected imported books/notes: %+v", res.Library.Books)
+	}
+	for _, n := range res.Library.Books[0].Notes {
+		if n.Clip == "" {
+			t.Fatalf("expected rendered clip for note %s", n.ID)
+		}
+	}
+}
+
+func TestImportMemoizesDuplicatePKDrawingsAndSkipsEmptyDrawings(t *testing.T) {
+	tmp := t.TempDir()
+	dbPath := filepath.Join(tmp, "memo-empty.marginnotes")
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, q := range []string{
+		"CREATE TABLE ZTOPIC (Z_PK INTEGER, ZTOPICID TEXT, ZTITLE TEXT, ZMINDLINKS TEXT)",
+		"CREATE TABLE ZBOOKNOTE (Z_PK INTEGER, ZNOTEID TEXT, ZTOPICID TEXT, ZGROUPNOTEID TEXT, ZNOTETITLE TEXT, ZNOTES_TEXT TEXT, ZHIGHLIGHT_TEXT TEXT, ZSTARTPAGE INTEGER, ZMINDLINKS TEXT, ZHIGHLIGHT_PIC BLOB, ZNOTES BLOB)",
+		"CREATE TABLE ZMEDIA (ZMD5 TEXT, ZDATA BLOB)",
+		"INSERT INTO ZTOPIC VALUES (1, 'topic-memo', '缓存测试', 'd1|d2|d3|d4|e1|e2')",
+	} {
+		if _, err := db.ExecContext(context.Background(), q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	archive := func(objects ...any) []byte {
+		t.Helper()
+		data, err := plist.Marshal(map[string]any{
+			"$archiver": "NSKeyedArchiver", "$top": map[string]any{"root": plist.UID(1)},
+			"$objects": append([]any{"$null"}, objects...),
+		}, plist.BinaryFormat)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return data
+	}
+
+	pkNonEmpty := buildSyntheticPKDrawing(t, false)
+	pkEmptyRaw := buildEmptyPKDrawing(t, false, false)
+	pkEmptyTombstone := buildEmptyPKDrawing(t, true, true)
+	baseClip := makePNG(t, 40, 20, 11)
+
+	for _, row := range []struct {
+		key  string
+		data []byte
+	}{
+		{"draw-dup", archive(map[string]any{"NS.data": pkNonEmpty})},
+		{"draw-alias", archive(map[string]any{"NS.data": pkNonEmpty})},
+		{"draw-empty-raw", archive(map[string]any{"NS.data": pkEmptyRaw})},
+		{"draw-empty-tomb", archive(map[string]any{"NS.data": pkEmptyTombstone})},
+		{"base-clip", archive(map[string]any{"NS.data": baseClip})},
+	} {
+		if _, err := db.Exec("INSERT INTO ZMEDIA VALUES (?, ?)", row.key, row.data); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	makeDrawClip := func(drawKey string) []byte {
+		return archive(
+			map[string]any{"NS.keys": []any{plist.UID(2)}, "NS.objects": []any{plist.UID(3)}},
+			"drawing", drawKey,
+		)
+	}
+	makePaintDrawClip := func(paintKey, drawKey string) []byte {
+		return archive(
+			map[string]any{
+				"NS.keys":    []any{plist.UID(2), plist.UID(3)},
+				"NS.objects": []any{plist.UID(4), plist.UID(5)},
+			},
+			"paint", "drawing", paintKey, drawKey,
+		)
+	}
+
+	inserts := []struct {
+		pk   int
+		id   string
+		clip []byte
+	}{
+		{1, "d1", makeDrawClip("draw-dup")},
+		{2, "d2", makeDrawClip("draw-dup")},
+		{3, "d3", makeDrawClip("draw-dup")},
+		{4, "d4", makeDrawClip("draw-alias")},
+		{5, "e1", makePaintDrawClip("base-clip", "draw-empty-raw")},
+		{6, "e2", makePaintDrawClip("base-clip", "draw-empty-tomb")},
+	}
+	for _, item := range inserts {
+		if _, err := db.Exec("INSERT INTO ZBOOKNOTE VALUES (?, ?, 'topic-memo', NULL, ?, '', '', 1, '', ?, NULL)", item.pk, item.id, item.id, item.clip); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	logPath := filepath.Join(tmp, "ink-calls.log")
+	mockInk := writeMockInkRenderer(t, tmp, logPath, "", makePNG(t, 24, 24, 33))
+	store := NewStore(filepath.Join(tmp, "store"))
+	store.SetInkRenderer(mockInk)
+
+	res, err := store.Import(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logRaw, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("expected mock ink renderer log file: %v", err)
+	}
+	calls := strings.Split(strings.TrimSpace(string(logRaw)), "\n")
+	if len(calls) != 1 {
+		t.Fatalf("expected external ink renderer invoked EXACTLY ONCE (4 duplicates memoized, 2 empty skipped), got %d calls:\n%s", len(calls), string(logRaw))
+	}
+
+	notes := res.Library.Books[0].Notes
+	if len(notes) != 6 {
+		t.Fatalf("expected 6 notes, got %d", len(notes))
+	}
+	firstDupClip := notes[0].Clip
+	if firstDupClip == "" {
+		t.Fatal("expected non-empty rendered clip on d1")
+	}
+	for i := 1; i < 4; i++ {
+		if notes[i].Clip != firstDupClip {
+			t.Fatalf("note %s clip=%q != d1 clip=%q", notes[i].ID, notes[i].Clip, firstDupClip)
+		}
+	}
+	// Empty-drawing notes must fall back cleanly to the original base clip bytes.
+	for i := 4; i < 6; i++ {
+		if notes[i].Clip == "" {
+			t.Fatalf("empty-drawing note %s lost its base clip", notes[i].ID)
+		}
+		saved, err := os.ReadFile(store.MediaPath(notes[i].Clip))
+		if err != nil || !bytes.Equal(saved, baseClip) {
+			t.Fatalf("empty-drawing note %s clip bytes differ from base clip (err=%v)", notes[i].ID, err)
+		}
+	}
+}
+
+func TestDirectRGBACompositingOverBaseClip(t *testing.T) {
+	pk := buildSyntheticPKDrawing(t, false)
+
+	// 1. Direct renderPKDrawingImage API contract.
+	rgba, err := renderPKDrawingImage(pk, 100, 100, 100)
+	if err != nil || rgba == nil {
+		t.Fatalf("renderPKDrawingImage failed: rgba=%v err=%v", rgba, err)
+	}
+	if rgba.Bounds().Dx() != 100 || rgba.Bounds().Dy() != 100 {
+		t.Fatalf("unexpected RGBA bounds: %v", rgba.Bounds())
+	}
+	if emptyRGBA, err := renderPKDrawingImage(buildEmptyPKDrawing(t, false, false), 100, 100, 100); err != nil || emptyRGBA != nil {
+		t.Fatalf("expected (nil, nil) for 0-stroke PKDrawing, got rgba=%v err=%v", emptyRGBA, err)
+	}
+	if _, err := renderPKDrawingImage([]byte("not-a-pkdrawing"), 100, 100, 100); err == nil {
+		t.Fatal("expected error for invalid PKDrawing bytes")
+	}
+
+	// 2. Build a solid blue (#0080ff) 100x100 base clip PNG and composite ink directly over it
+	//    via BOTH unshared in-place path and shared memoized path.
+	base := image.NewNRGBA(image.Rect(0, 0, 100, 100))
+	for y := 0; y < 100; y++ {
+		for x := 0; x < 100; x++ {
+			base.SetNRGBA(x, y, color.NRGBA{R: 0, G: 0x80, B: 0xff, A: 0xff})
+		}
+	}
+	var baseBuf bytes.Buffer
+	if err := png.Encode(&baseBuf, base); err != nil {
+		t.Fatal(err)
+	}
+
+	key := inkCacheKey{hash: sha256.Sum256(pk), width: 100, height: 100, pixels: 100}
+	for _, tc := range []struct {
+		name   string
+		counts map[inkCacheKey]int
+	}{
+		{name: "unshared-direct-inplace", counts: map[inkCacheKey]int{key: 1}},
+		{name: "shared-memoized-rgba", counts: map[inkCacheKey]int{key: 2}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := newMediaImport("", nil)
+			m.sources["clip"] = baseBuf.Bytes()
+			m.sources["draw"] = pk
+			m.inkCounts = tc.counts
+
+			out := m.picture(map[string]any{"paint": "clip", "drawing": "draw"})
+			if len(out) == 0 {
+				t.Fatal("expected composited PNG bytes")
+			}
+			img, err := png.Decode(bytes.NewReader(out))
+			if err != nil {
+				t.Fatalf("composited output is not valid PNG: %v", err)
+			}
+			if img.Bounds().Dx() != 100 || img.Bounds().Dy() != 100 {
+				t.Fatalf("unexpected composited bounds: %v", img.Bounds())
+			}
+			// Background pixel (5, 5) stays solid blue (#0080ff).
+			br, bg, bb, ba := img.At(5, 5).RGBA()
+			if br > 0x0500 || bg < 0x7000 || bg > 0x9000 || bb < 0xf000 || ba < 0xf000 {
+				t.Fatalf("background pixel (5,5) corrupted: r=%#x g=%#x b=%#x a=%#x", br, bg, bb, ba)
+			}
+			// Opaque black pen stroke at (40, 20) covers the blue base.
+			pr, pg, pb, pa := img.At(40, 20).RGBA()
+			if pr > 0x1000 || pg > 0x1000 || pb > 0x1000 || pa < 0xf000 {
+				t.Fatalf("expected opaque black pen stroke at (40,20), got r=%#x g=%#x b=%#x a=%#x", pr, pg, pb, pa)
+			}
+			// Translucent red marker at (40, 50) blends red over blue base (both red and blue channels present).
+			mr, _, mb, ma := img.At(40, 50).RGBA()
+			if mr < 0x4000 || mb < 0x5000 || ma < 0xf000 {
+				t.Fatalf("expected red marker blended over blue base at (40,50), got r=%#x b=%#x a=%#x", mr, mb, ma)
+			}
+			// Tombstoned stroke at (40, 85) leaves blue base untouched.
+			tr, tg, tb, ta := img.At(40, 85).RGBA()
+			if tr > 0x0500 || tg < 0x7000 || tb < 0xf000 || ta < 0xf000 {
+				t.Fatalf("tombstoned stroke altered (40,85): r=%#x g=%#x b=%#x a=%#x", tr, tg, tb, ta)
+			}
+		})
+	}
+}
+
+func TestSharedCompositedDrawingProducesSingleDeterministicMediaHash(t *testing.T) {
+	tmp := t.TempDir()
+	dbPath := filepath.Join(tmp, "shared-composite.marginnotes")
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, q := range []string{
+		"CREATE TABLE ZTOPIC (Z_PK INTEGER, ZTOPICID TEXT, ZTITLE TEXT, ZMINDLINKS TEXT)",
+		"CREATE TABLE ZBOOKNOTE (Z_PK INTEGER, ZNOTEID TEXT, ZTOPICID TEXT, ZGROUPNOTEID TEXT, ZNOTETITLE TEXT, ZNOTES_TEXT TEXT, ZHIGHLIGHT_TEXT TEXT, ZSTARTPAGE INTEGER, ZMINDLINKS TEXT, ZHIGHLIGHT_PIC BLOB, ZNOTES BLOB)",
+		"CREATE TABLE ZMEDIA (ZMD5 TEXT, ZDATA BLOB)",
+		"INSERT INTO ZTOPIC VALUES (1, 'topic-shared-comp', '共享合成测试', 'c1|c2|c3|c4|c5|c6')",
+	} {
+		if _, err := db.ExecContext(context.Background(), q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	archive := func(objects ...any) []byte {
+		t.Helper()
+		data, err := plist.Marshal(map[string]any{
+			"$archiver": "NSKeyedArchiver", "$top": map[string]any{"root": plist.UID(1)},
+			"$objects": append([]any{"$null"}, objects...),
+		}, plist.BinaryFormat)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return data
+	}
+
+	// Build a solid blue 100x100 base clip and a PKDrawing with translucent
+	// marker and antialiased pen edges that previously split hashes between
+	// Consumer 1 (premul RGBA) and Consumers 2..N (decoded PNG NRGBA).
+	base := image.NewNRGBA(image.Rect(0, 0, 100, 100))
+	for y := 0; y < 100; y++ {
+		for x := 0; x < 100; x++ {
+			base.SetNRGBA(x, y, color.NRGBA{R: 0x20, G: 0x70, B: 0xe0, A: 0xff})
+		}
+	}
+	var baseBuf bytes.Buffer
+	if err := png.Encode(&baseBuf, base); err != nil {
+		t.Fatal(err)
+	}
+	pk := buildSyntheticPKDrawing(t, false)
+	if _, err := db.Exec("INSERT INTO ZMEDIA VALUES (?, ?)", "base-clip", archive(map[string]any{"NS.data": baseBuf.Bytes()})); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec("INSERT INTO ZMEDIA VALUES (?, ?)", "shared-draw", archive(map[string]any{"NS.data": pk})); err != nil {
+		t.Fatal(err)
+	}
+	clip := archive(
+		map[string]any{
+			"NS.keys":    []any{plist.UID(2), plist.UID(3)},
+			"NS.objects": []any{plist.UID(4), plist.UID(5)},
+		},
+		"paint", "drawing", "base-clip", "shared-draw",
+	)
+	for i := 1; i <= 6; i++ {
+		id := "c" + string(rune('0'+i))
+		if _, err := db.Exec("INSERT INTO ZBOOKNOTE VALUES (?, ?, 'topic-shared-comp', NULL, ?, '', '', 1, '', ?, NULL)", i, id, id, clip); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	storeDir := filepath.Join(tmp, "store")
+	store := NewStore(storeDir)
+	res, err := store.Import(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	notes := res.Library.Books[0].Notes
+	if len(notes) != 6 {
+		t.Fatalf("expected 6 notes, got %d", len(notes))
+	}
+	wantClip := notes[0].Clip
+	if wantClip == "" {
+		t.Fatal("expected non-empty composited clip hash")
+	}
+	for i := 1; i < len(notes); i++ {
+		if notes[i].Clip != wantClip {
+			t.Fatalf("shared composited note %s got distinct hash %q != %q (non-deterministic split!)", notes[i].ID, notes[i].Clip, wantClip)
+		}
+	}
+	entries, err := os.ReadDir(filepath.Join(storeDir, "media"))
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("expected exactly 1 deduplicated composited media file on disk, got %d (err=%v)", len(entries), err)
 	}
 }
 

@@ -96,12 +96,14 @@ type workspace struct {
 
 	busy bool
 
-	importMu         sync.Mutex
-	postUI           func(func())
-	downloadsPending bool
-	downloadsPolling bool
-	importPaths      []queuedImport
-	takeDownloadFn   func(context.Context) (*pendingAndroidDownload, error)
+	importMu           sync.Mutex
+	postUI             func(func())
+	downloadsPending   bool
+	downloadsPolling   bool
+	importPaths        []queuedImport
+	takeDownloadFn     func(context.Context) (*pendingAndroidDownload, error)
+	importFileFn       func(string) (notebook.ImportResult, error)
+	openImportDialogFn func(mygo.OpenDialogOptions) ([]string, error)
 
 	updateMu                    sync.Mutex
 	update                      updateUIState
@@ -116,9 +118,10 @@ type workspace struct {
 	checkPendingAndroidUpdateFn func() (*updateInfo, bool)
 	isOnlineFn                  func() bool
 
-	message      string
-	messageError bool
-	messageUntil time.Time
+	message        string
+	messageError   bool
+	messagePending bool
+	messageUntil   time.Time
 }
 
 type queuedImport struct {
@@ -731,9 +734,24 @@ func (a *workspace) openChildNote(id string) {
 	a.page = detail
 }
 
+const importingNotebookMessage = "正在导入笔记本…"
+
 func (a *workspace) showMessage(text string, failed bool) {
-	a.message, a.messageError = text, failed
+	a.message, a.messageError, a.messagePending = text, failed, false
 	a.messageUntil = time.Now().Add(5 * time.Second)
+}
+
+func (a *workspace) showProgress(text string) {
+	a.message, a.messageError, a.messagePending = text, false, true
+	a.messageUntil = time.Time{}
+}
+
+func (a *workspace) clearPendingMessage() {
+	if !a.messagePending {
+		return
+	}
+	a.message, a.messageError, a.messagePending = "", false, false
+	a.messageUntil = time.Time{}
 }
 
 func (a *workspace) showError(err error) {
@@ -873,27 +891,172 @@ func (a *workspace) applyImport(r notebook.ImportResult) {
 	}
 }
 
+// androidCacheDirs returns the app's Android cache directory roots.
+// MyGo's Android host sets both XDG_CACHE_HOME and TMPDIR to Context.cacheDir.
+func androidCacheDirs() []string {
+	var dirs []string
+	add := func(dir string) {
+		dir = strings.TrimSpace(dir)
+		if dir == "" || !filepath.IsAbs(dir) {
+			return
+		}
+		cleaned := filepath.Clean(dir)
+		if filepath.Dir(cleaned) == cleaned || cleaned == "/tmp" {
+			return
+		}
+		if !slices.Contains(dirs, cleaned) {
+			dirs = append(dirs, cleaned)
+		}
+	}
+	if dir, err := os.UserCacheDir(); err == nil {
+		add(dir)
+	}
+	add(os.TempDir())
+	return dirs
+}
+
+func isPathStrictlyWithinDir(root, target string) bool {
+	if root == "" || target == "" || !filepath.IsAbs(root) || !filepath.IsAbs(target) {
+		return false
+	}
+	cleanRoot := filepath.Clean(root)
+	if filepath.Dir(cleanRoot) == cleanRoot {
+		return false
+	}
+	cleanTarget := filepath.Clean(target)
+	rel, err := filepath.Rel(cleanRoot, cleanTarget)
+	if err != nil || rel == "" || rel == "." || rel == ".." || filepath.IsAbs(rel) {
+		return false
+	}
+	if strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return false
+	}
+	return true
+}
+
+// isAndroidPickedCacheFile reports whether filePath is strictly inside one of
+// Android's MyGo picker temporary cache directories (<cacheDir>/picked/...).
+// On non-Android platforms it always returns false so user files are never matched.
+func isAndroidPickedCacheFile(goos, filePath string, cacheDirs []string) bool {
+	if goos != "android" || strings.TrimSpace(filePath) == "" || !filepath.IsAbs(filePath) {
+		return false
+	}
+	cleanPath := filepath.Clean(filePath)
+	for _, cacheDir := range cacheDirs {
+		if strings.TrimSpace(cacheDir) == "" || !filepath.IsAbs(cacheDir) {
+			continue
+		}
+		cleanCache := filepath.Clean(cacheDir)
+		if filepath.Dir(cleanCache) == cleanCache {
+			continue
+		}
+		pickedDir := filepath.Join(cleanCache, "picked")
+		if isPathStrictlyWithinDir(pickedDir, cleanPath) {
+			return true
+		}
+	}
+	return false
+}
+
+// cleanupAndroidPickedFile deletes filePath (and any now-empty per-pick subdirectory)
+// only on Android and only when the resolved regular file lives strictly inside
+// <cacheDir>/picked/. It never removes symlinks, directories, or <cacheDir>/picked itself.
+func cleanupAndroidPickedFile(goos, filePath string, cacheDirs []string) bool {
+	if goos != "android" || strings.TrimSpace(filePath) == "" || !filepath.IsAbs(filePath) {
+		return false
+	}
+	cleanPath := filepath.Clean(filePath)
+	info, err := os.Lstat(cleanPath)
+	if err != nil || !info.Mode().IsRegular() {
+		return false
+	}
+	parentDir, err := filepath.EvalSymlinks(filepath.Dir(cleanPath))
+	if err != nil {
+		return false
+	}
+	realTarget := filepath.Join(parentDir, filepath.Base(cleanPath))
+
+	var matchedPickedRoot string
+	for _, cacheDir := range cacheDirs {
+		if strings.TrimSpace(cacheDir) == "" || !filepath.IsAbs(cacheDir) {
+			continue
+		}
+		cleanCache := filepath.Clean(cacheDir)
+		if filepath.Dir(cleanCache) == cleanCache {
+			continue
+		}
+		pickedDir := filepath.Join(cleanCache, "picked")
+		realPickedDir, err := filepath.EvalSymlinks(pickedDir)
+		if err != nil {
+			continue
+		}
+		if isPathStrictlyWithinDir(realPickedDir, realTarget) {
+			matchedPickedRoot = realPickedDir
+			break
+		}
+	}
+	if matchedPickedRoot == "" {
+		return false
+	}
+	if err := os.Remove(realTarget); err != nil {
+		return false
+	}
+	for dir := parentDir; isPathStrictlyWithinDir(matchedPickedRoot, dir); {
+		if err := os.Remove(dir); err != nil {
+			break
+		}
+		next := filepath.Dir(dir)
+		if next == dir {
+			break
+		}
+		dir = next
+	}
+	return true
+}
+
+func cleanupAndroidPickedFiles(paths ...string) {
+	if runtime.GOOS != "android" || len(paths) == 0 {
+		return
+	}
+	cacheDirs := androidCacheDirs()
+	for _, p := range paths {
+		cleanupAndroidPickedFile(runtime.GOOS, p, cacheDirs)
+	}
+}
+
 func (a *workspace) chooseImport() {
 	win := a.window()
+	openFn := a.openImportDialogFn
+	if openFn == nil {
+		openFn = mygo.Dialog.Open
+	}
+	importFn := a.importFileFn
+	if importFn == nil {
+		importFn = a.store.Import
+	}
 	a.work(func() func() {
 		filters := []mygo.FileFilter{{Name: "MarginNote / PDF", Extensions: []string{"marginpkg", "marginnotes", "pdf"}}}
 		if runtime.GOOS == "android" {
 			// Android's document providers usually give MarginNote files a generic MIME type.
 			filters = nil
 		}
-		paths, err := mygo.Dialog.Open(mygo.OpenDialogOptions{
+		paths, err := openFn(mygo.OpenDialogOptions{
 			Parent: win, Title: "导入笔记或 PDF",
 			Filters: filters,
 		})
 		var result notebook.ImportResult
 		if err == nil && len(paths) > 0 {
-			result, err = a.store.Import(paths[0])
+			defer cleanupAndroidPickedFiles(paths...)
+			a.updateUI(func() { a.showProgress(importingNotebookMessage) })
+			result, err = importFn(paths[0])
 		}
 		return func() {
 			if err != nil {
 				a.showError(err)
 			} else if len(paths) > 0 {
 				a.applyImport(result)
+			} else {
+				a.clearPendingMessage()
 			}
 		}
 	})
@@ -910,12 +1073,21 @@ func (a *workspace) flushImports() {
 		return
 	}
 	if item, ok := a.popImport(); ok {
+		importFn := a.importFileFn
+		if importFn == nil {
+			importFn = a.store.Import
+		}
+		a.showProgress(importingNotebookMessage)
 		a.work(func() func() {
-			r, err := a.store.Import(item.path)
-			if item.cleanup {
-				_ = os.Remove(item.path)
-				_ = os.Remove(filepath.Dir(item.path))
-			}
+			defer func() {
+				if item.cleanup {
+					_ = os.Remove(item.path)
+					_ = os.Remove(filepath.Dir(item.path))
+				} else {
+					cleanupAndroidPickedFiles(item.path)
+				}
+			}()
+			r, err := importFn(item.path)
 			return func() {
 				if err != nil {
 					a.showError(err)
