@@ -160,6 +160,109 @@ func TestPDFExcerptBacklinkAndPageInk(t *testing.T) {
 	}
 }
 
+func TestPDFResolutionFollowsViewportAndSettles(t *testing.T) {
+	const width, height, aspect = 420, 600, 1.414
+	app := &workspace{pdfDensity: 2}
+	ref := pageRef{"doc", 0}
+	fit := pdfRasterSide(width, height, aspect, 0, 1, app.pdfDensity)
+	if narrow := pdfRasterSide(210, height, aspect, 0, 1, app.pdfDensity); narrow >= fit {
+		t.Fatalf("narrower viewport requested %d px, full viewport %d px", narrow, fit)
+	}
+	app.pdf.cache = map[pageRef]renderedPDFPage{ref: {
+		side: fit, aspect: aspect, light: ui.NewBitmap(image.NewRGBA(image.Rect(0, 0, 10, 10))),
+	}}
+	var requested int
+	tester := ui.NewTester(func(c *ui.Context) {
+		_, requested = app.pdfResolution(c, ref, width, height)
+		ui.Box(c).Fill()
+	}, width, height)
+	tester.Frame()
+	app.pdf.zoom = 2
+	tester.Frame()
+	tester.Advance(179 * time.Millisecond)
+	if requested != fit {
+		t.Fatalf("requested %d px during the settle period, want %d px", requested, fit)
+	}
+	tester.Advance(time.Millisecond)
+	if sharper := pdfRasterSide(width, height, aspect, 0, 2, app.pdfDensity); requested != sharper || sharper <= fit {
+		t.Fatalf("requested %d px after zoom, want %d px (fit was %d px)", requested, sharper, fit)
+	}
+	app.splitDragging = true
+	tester.Frame()
+	tester.Advance(250 * time.Millisecond)
+	if requested != fit {
+		t.Fatalf("requested %d px during split drag, want %d px", requested, fit)
+	}
+}
+
+func TestPDFFastTurnsKeepPreviousPageWhileLoading(t *testing.T) {
+	app := &workspace{store: notebook.NewStore(t.TempDir())}
+	book := notebook.Book{ID: "book", Title: "函数", Documents: []notebook.Document{
+		{ID: "doc", Title: "函数"},
+		{ID: "other", Title: "另一个文档"},
+	}}
+	app.setLibrary(notebook.Library{Books: []notebook.Book{book}}, book.ID)
+	oldColor, targetColor := color.RGBA{234, 198, 132, 255}, color.RGBA{106, 143, 198, 255}
+	renderedPage := func(fill color.RGBA) renderedPDFPage {
+		raster := image.NewRGBA(image.Rect(0, 0, 450, 600))
+		draw.Draw(raster, raster.Bounds(), image.NewUniform(fill), image.Point{}, draw.Src)
+		return renderedPDFPage{light: ui.NewBitmap(raster), count: 4}
+	}
+	app.pdf.cache = map[pageRef]renderedPDFPage{{"doc", 0}: renderedPage(oldColor)}
+	app.pdf.counts = map[string]int{"doc": 4}
+	tester := ui.NewTester(app.view, 1280, 800)
+	tester.Frame()
+	click := func(label string) {
+		t.Helper()
+		if err := tester.Click(label); err != nil {
+			t.Fatal(err)
+		}
+	}
+	checkPage := func(want color.RGBA) ui.Rect {
+		t.Helper()
+		sheet, ok := tester.Find("PDF 原页与留白")
+		if !ok {
+			t.Fatal("PDF page disappeared while turning pages")
+		}
+		if got := tester.Image().RGBAAt(int(sheet.X+50), int(sheet.Y+150)); got != want {
+			t.Fatalf("PDF pixel = %v, want %v", got, want)
+		}
+		if _, ok := tester.Find("钢笔"); !ok {
+			t.Fatal("PDF annotation toolbar disappeared while turning pages")
+		}
+		return sheet
+	}
+	checkPage(oldColor)
+	click("钢笔")
+	click("下一页")
+	click("下一页")
+	app.pdf.cache[pageRef{"doc", 1}] = renderedPage(targetColor)
+	tester.Frame()
+	sheet := checkPage(oldColor)
+	if app.pdf.page != 2 || !tester.HasText("正在加载第 3 页…") {
+		t.Fatal("loading feedback did not follow the newest page request")
+	}
+	tester.UsePointer(ui.PointerPen, .7)
+	tester.Press(sheet.X+50, sheet.Y+120)
+	tester.Move(sheet.X+140, sheet.Y+140)
+	tester.Release(sheet.X+140, sheet.Y+140)
+	if len(app.drawing.data.Pages) != 0 {
+		t.Fatal("the temporary preview accepted annotations")
+	}
+
+	app.pdf.cache[pageRef{"doc", 2}] = renderedPage(targetColor)
+	tester.Frame()
+	checkPage(targetColor)
+	if tester.HasText("正在加载第 3 页…") {
+		t.Fatal("loading feedback remained after the target page appeared")
+	}
+	app.setPDFDocument("other")
+	tester.Frame()
+	if _, ok := tester.Find("PDF 原页与留白"); ok {
+		t.Fatal("the new document displayed a page from the previous document")
+	}
+}
+
 func TestMarkerOverlapAndPartialEraser(t *testing.T) {
 	first := inkStroke{Color: "#F4C545", Width: 14, Marker: true, Points: []inkPoint{{X: 25, Y: 50}, {X: 160, Y: 50}}}
 	second := inkStroke{Color: first.Color, Width: 14, Marker: true, Points: []inkPoint{{X: 90, Y: 20}, {X: 90, Y: 82}}}

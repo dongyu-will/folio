@@ -34,7 +34,7 @@ const (
 	folioReleasesURL        = "https://github.com/dongyu-will/folio/releases"
 	folioReleasesAPI        = "https://api.github.com/repos/dongyu-will/folio/releases/latest"
 	folioAndroidManifestURL = "https://github.com/dongyu-will/folio/releases/latest/download/update-android.json"
-	folioFallbackVersion    = "0.2.2"
+	folioFallbackVersion    = "0.2.3"
 
 	androidConscryptCADir = "/apex/com.android.conscrypt/cacerts"
 	androidSSLCertDir     = "/apex/com.android.conscrypt/cacerts:/system/etc/security/cacerts:/data/misc/keychain/certs-added"

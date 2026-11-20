@@ -271,7 +271,7 @@ class OpenNotesPlugin : MyGoPlugin {
             fd.close()
             throw err
         }
-        renderer.use { pdf ->
+        return renderer.use { pdf ->
             pdf.openPage(index).use { page ->
                 val scale = maxSide.toFloat() / maxOf(page.width, page.height)
                 val width = (page.width * scale).roundToInt().coerceAtLeast(1)
@@ -289,8 +289,9 @@ class OpenNotesPlugin : MyGoPlugin {
                 } finally {
                     bitmap.recycle()
                 }
+                JSONObject().put("count", pdf.pageCount)
+                    .put("width", page.width).put("height", page.height)
             }
-            return JSONObject().put("count", pdf.pageCount)
         }
     }
 

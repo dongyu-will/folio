@@ -12,6 +12,9 @@ import (
 
 func (a *workspace) view(c *ui.Context) {
 	a.disablePenZones()
+	if a.preview == "" {
+		a.media.original = mediaOriginal{}
+	}
 	if a.bookChoice != a.bookID && !a.editing() {
 		a.setLibrary(notebook.Library{Books: a.books}, a.bookChoice)
 	}
@@ -106,7 +109,14 @@ func (a *workspace) view(c *ui.Context) {
 		}
 	}
 
-	ui.Box(c).Fill().Background(p.shell).Children(func() {
+	ui.Box(c).Fill().Background(p.shell).Draw(func(paint *ui.Painter, _ ui.Rect) {
+		if scale := paint.Scale(); scale != a.pdfDensity {
+			a.pdfDensity = scale
+			if a.mode != canvasMode {
+				c.Invalidate()
+			}
+		}
+	}).Children(func() {
 		ui.Column(c).Fill().Children(func() {
 			if a.preview != "" {
 				a.imageView(c, p, width, height)
@@ -824,7 +834,7 @@ func (a *workspace) noteContent(c *ui.Context, p palette, n notebook.Note, width
 	renderedBlocks := 0
 	for bi, b := range n.Blocks {
 		if b.Image != "" {
-			if a.mediaBitmap(b.Image) == nil {
+			if w, h := a.imageDims(b.Image); w <= 0 || h <= 0 {
 				continue
 			}
 			if renderedBlocks > 0 && useBlocks && len(n.Blocks) > 1 {
@@ -854,11 +864,10 @@ func copyText(c *ui.Context, p palette, text string) {
 }
 
 func (a *workspace) addImage(c *ui.Context, p palette, ref, label string, width float32) bool {
-	bitmap := a.mediaBitmap(ref)
-	if bitmap == nil {
+	w, h := a.imageDims(ref)
+	if w <= 0 || h <= 0 {
 		return false
 	}
-	w, h := bitmap.Size()
 	imgW := min(width-20, float32(w))
 	imgH := max(8, imgW*float32(h)/float32(w))
 	const maxInlineH = float32(460)
@@ -874,24 +883,31 @@ func (a *workspace) addImage(c *ui.Context, p palette, ref, label string, width 
 		card.Border(1, p.accent.Alpha(.5)).Shadow(0, 4, 14, -2, p.shadow)
 	}
 	card.Children(func() {
-		ui.Image(c, bitmap).Size(imgW, imgH).Fit(ui.Contain)
+		ui.Box(c).Size(imgW, imgH).Draw(func(p *ui.Painter, rect ui.Rect) {
+			a.paintMediaThumbnail(p, rect, ref)
+		})
 	})
 	return true
 }
 
 func (a *workspace) imageView(c *ui.Context, p palette, width, height float32) {
-	bitmap := a.mediaBitmap(a.preview)
-	if bitmap == nil {
-		a.preview = ""
-		c.Invalidate()
-		return
-	}
-	w, h := bitmap.Size()
-	size := min(width-56, float32(w))
+	bitmap, ready := a.originalMedia(a.preview)
 	ui.Row(c).Height(52).FillWidth().PaddingX(16).AlignItems(ui.Center).Background(p.surface).Children(func() {
 		pillButton(c, p, "返回笔记", icArrowLeft, true, false, func() { a.preview = "" })
 	})
 	horizontalRule(c, p)
+	if bitmap == nil {
+		ui.Box(c).Grow(1).FillWidth().Center().Background(p.canvas).Children(func() {
+			message := "正在加载原图…"
+			if ready {
+				message = "无法加载原图"
+			}
+			ui.Text(c, message).FontSize(13).TextColor(p.quiet)
+		})
+		return
+	}
+	w, h := bitmap.Size()
+	size := max(1, min(width-56, float32(w)))
 	ui.Scroll(c).Grow(1).FillWidth().Background(p.canvas).AlignItems(ui.Center).Padding(24).Children(func() {
 		ui.Box(c).MinHeight(min(120, height-96)).Padding(14).Radius(12).Background(ui.Hex("#ffffff")).
 			Border(1, p.rule).Shadow(0, 12, 32, -8, p.shadow).Children(func() {

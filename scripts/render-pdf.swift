@@ -21,7 +21,7 @@ func render() throws {
         throw CocoaError(.fileWriteUnknown)
     }
     try png.write(to: URL(fileURLWithPath: args[4]), options: .atomic)
-    print("{\"count\":\(doc.pageCount)}")
+    print("{\"count\":\(doc.pageCount),\"width\":\(bounds.width),\"height\":\(bounds.height)}")
 }
 
 do {

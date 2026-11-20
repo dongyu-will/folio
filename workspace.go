@@ -4,9 +4,6 @@ import (
 	"context"
 	"errors"
 	"image"
-	_ "image/gif"
-	_ "image/jpeg"
-	_ "image/png"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -56,8 +53,7 @@ type workspace struct {
 	editMode                       editorMode
 	draftTitle, draftBody string
 	preview               string
-	images                map[string]*ui.Bitmap
-	mediaCache            map[string]*ui.Bitmap
+	media                 mediaViewState
 	mediaDims             map[string]image.Point
 	cardMenuOpen          bool
 
@@ -77,6 +73,7 @@ type workspace struct {
 	drawing                                            drawingState
 	drawingWrites                                      drawingWriter
 	pdf                                                pdfState
+	pdfDensity                                         float32
 	mode                                               workspaceMode
 	splitRatio, splitStart, splitPointerX, marginStart float32
 	splitDragging, marginDragging                      bool
@@ -518,7 +515,7 @@ func (a *workspace) setLibrary(library notebook.Library, preferred string) {
 	if i < 0 {
 		a.bookID, a.bookChoice, a.scope, a.selected, a.query = "", "", "", "", ""
 		a.activeTrail = nil
-		a.images, a.mediaCache, a.mediaDims = nil, nil, nil
+		a.clearMediaCache()
 		a.cardMenuOpen = false
 		a.pdfHighlightNoteID = ""
 		a.pdfTOCOpen = false
@@ -539,7 +536,7 @@ func (a *workspace) setLibrary(library notebook.Library, preferred string) {
 		a.bookID = book.ID
 		a.canvasReady = false
 		a.expanded = nil
-		a.mediaCache, a.mediaDims = nil, nil
+		a.clearMediaCache()
 		a.cardMenuOpen = false
 		a.pdfHighlightNoteID = ""
 		a.pdfTOCOpen = false
@@ -593,7 +590,7 @@ func (a *workspace) setNoteWithTrail(id string, trail []string) {
 }
 
 func (a *workspace) setNoteAt(id string, trail []string, recenter bool) {
-	n, ok := a.tree.notes[id]
+	_, ok := a.tree.notes[id]
 	if !ok {
 		return
 	}
@@ -607,94 +604,6 @@ func (a *workspace) setNoteAt(id string, trail []string, recenter bool) {
 		a.activeTrail = a.tree.trail(id)
 	}
 	a.readerScroll.Y = 0
-	a.images = make(map[string]*ui.Bitmap)
-	for _, ref := range noteCardImages(n) {
-		if bmp := a.mediaBitmap(ref); bmp != nil {
-			a.images[ref] = bmp
-		}
-	}
-}
-
-func (a *workspace) imageDims(ref string) (int, int) {
-	if ref == "" {
-		return 0, 0
-	}
-	if bmp := a.images[ref]; bmp != nil {
-		return bmp.Size()
-	}
-	if bmp := a.mediaCache[ref]; bmp != nil {
-		return bmp.Size()
-	}
-	if dim, ok := a.mediaDims[ref]; ok {
-		return dim.X, dim.Y
-	}
-	if a.mediaDims == nil {
-		a.mediaDims = make(map[string]image.Point)
-	}
-	if a.store == nil {
-		return 0, 0
-	}
-	path := a.store.MediaPath(ref)
-	if path == "" {
-		a.mediaDims[ref] = image.Point{}
-		return 0, 0
-	}
-	f, err := os.Open(path)
-	if err != nil {
-		a.mediaDims[ref] = image.Point{}
-		return 0, 0
-	}
-	defer f.Close()
-	cfg, _, err := image.DecodeConfig(f)
-	if err != nil || cfg.Width <= 0 || cfg.Height <= 0 {
-		a.mediaDims[ref] = image.Point{}
-		return 0, 0
-	}
-	a.mediaDims[ref] = image.Point{X: cfg.Width, Y: cfg.Height}
-	return cfg.Width, cfg.Height
-}
-
-func (a *workspace) mediaBitmap(ref string) *ui.Bitmap {
-	if ref == "" {
-		return nil
-	}
-	if bmp := a.images[ref]; bmp != nil {
-		return bmp
-	}
-	if bmp, ok := a.mediaCache[ref]; ok {
-		return bmp
-	}
-	if a.store == nil {
-		return nil
-	}
-	if a.mediaCache == nil {
-		a.mediaCache = make(map[string]*ui.Bitmap)
-	}
-	path := a.store.MediaPath(ref)
-	if path == "" {
-		a.mediaCache[ref] = nil
-		return nil
-	}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		a.mediaCache[ref] = nil
-		return nil
-	}
-	bmp, err := ui.DecodeBitmap(data)
-	if err != nil {
-		a.mediaCache[ref] = nil
-		return nil
-	}
-	if len(a.mediaCache) >= 96 {
-		clear(a.mediaCache)
-	}
-	a.mediaCache[ref] = bmp
-	if a.mediaDims == nil {
-		a.mediaDims = make(map[string]image.Point)
-	}
-	w, h := bmp.Size()
-	a.mediaDims[ref] = image.Point{X: w, Y: h}
-	return bmp
 }
 
 func (a *workspace) openNote(id string) {

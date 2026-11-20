@@ -7,7 +7,6 @@ import (
 	"math"
 	"os"
 	"regexp"
-	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -29,6 +28,7 @@ const (
 type pdfState struct {
 	document    string
 	page        int
+	displayed   pdfDisplay
 	cache       map[pageRef]renderedPDFPage
 	recent      []pageRef
 	thumbs      map[pageRef]renderedPDFPage
@@ -38,6 +38,9 @@ type pdfState struct {
 	nightWork   bool
 	prefetchRef pageRef
 	prefetchAt  time.Time
+	qualityRef  pageRef
+	qualitySide int
+	qualityAt   time.Time
 	counts      map[string]int
 	serial      int
 
@@ -54,6 +57,12 @@ type pdfState struct {
 	pagePts                map[string][2]float32
 	focusedHighlightNoteID string
 	highlightSelectedAt    string
+}
+
+type pdfDisplay struct {
+	ref    pageRef
+	page   renderedPDFPage
+	scroll ui.ScrollState
 }
 
 func (a *workspace) resetPDF(documents []notebook.Document) {
@@ -75,12 +84,13 @@ func (a *workspace) resetPDF(documents []notebook.Document) {
 
 func (a *workspace) clearRenderCache() {
 	a.pdf.cache, a.pdf.recent = nil, nil
+	a.pdf.displayed = pdfDisplay{}
 	a.pdf.thumbs, a.pdf.thumbRecent = nil, nil
 	a.pdf.serial++
 	a.pdf.foreground, a.pdf.background, a.pdf.nightWork = nil, nil, false
 	a.pdf.prefetchAt = time.Time{}
 	a.drawing.pdf, a.drawing.canvas = inkLayers{}, inkLayers{}
-	a.mediaCache = nil
+	a.clearMediaCache()
 	a.showMessage("已清理渲染缓存", false)
 }
 
@@ -90,6 +100,7 @@ const (
 	pdfVisible pdfRequest = iota
 	pdfPrefetch
 	pdfThumbnail
+	pdfUpgrade
 )
 
 type pdfBackground struct {
@@ -97,11 +108,16 @@ type pdfBackground struct {
 	request pdfRequest
 }
 
-func (a *workspace) requestPDF(ref pageRef, request pdfRequest, dark bool) (renderedPDFPage, bool) {
+func (a *workspace) requestPDF(ref pageRef, request pdfRequest, dark bool, side int) (renderedPDFPage, bool) {
 	p := &a.pdf
 	if item, ok := p.cache[ref]; ok {
 		if request != pdfPrefetch {
 			p.recent = touchPDFPage(p.recent, ref)
+		}
+		if request == pdfVisible && item.side > 0 && side > max(item.side, item.failedSide) {
+			// Sharpening an existing page must leave the foreground renderer free
+			// to handle a turn to a different page.
+			_ = a.loadPDFPage(ref, pdfUpgrade, dark, side)
 		}
 		return a.requirePDFNight(ref, item, p.cache, dark)
 	}
@@ -111,16 +127,24 @@ func (a *workspace) requestPDF(ref pageRef, request pdfRequest, dark bool) (rend
 			return a.requirePDFNight(ref, item, p.thumbs, dark)
 		}
 	}
+	if err := a.loadPDFPage(ref, request, dark, side); err != nil {
+		return renderedPDFPage{err: err}, true
+	}
+	return renderedPDFPage{}, false
+}
+
+func (a *workspace) loadPDFPage(ref pageRef, request pdfRequest, dark bool, side int) error {
+	p := &a.pdf
 	win := a.window()
 	if win == nil || a.store == nil || p.foreground != nil {
-		return renderedPDFPage{}, false
+		return nil
 	}
 	if p.background != nil && (request != pdfVisible || p.background.ref == ref && p.background.request == pdfPrefetch) {
-		return renderedPDFPage{}, false
+		return nil
 	}
 	path := a.store.DocumentPath(ref.document)
 	if path == "" {
-		return renderedPDFPage{err: fmt.Errorf("找不到所选 PDF")}, true
+		return fmt.Errorf("找不到所选 PDF")
 	}
 	background := request != pdfVisible
 	if background {
@@ -128,17 +152,11 @@ func (a *workspace) requestPDF(ref pageRef, request pdfRequest, dark bool) (rend
 	} else {
 		p.foreground = &ref
 	}
-	side, serial := 2400, p.serial
-	if runtime.GOOS == "android" {
-		side = 2000
-	}
-	if request == pdfThumbnail {
-		side = 480
-	}
+	serial := p.serial
 	go func() {
 		item, err := renderPDF(path, ref.page, side, background)
 		item.err = err
-		if err == nil && dark && request == pdfVisible {
+		if err == nil && dark && (request == pdfVisible || request == pdfUpgrade) {
 			item.night = ui.NewBitmap(nightPDF(item.raster))
 		}
 		win.Update(func() {
@@ -164,6 +182,16 @@ func (a *workspace) requestPDF(ref pageRef, request pdfRequest, dark bool) (rend
 			if *cache == nil {
 				*cache = make(map[pageRef]renderedPDFPage)
 			}
+			if old := (*cache)[ref]; old.light != nil {
+				if err != nil {
+					old.failedSide = max(old.failedSide, side)
+					(*cache)[ref] = old
+					return
+				}
+				if old.side >= item.side {
+					return
+				}
+			}
 			(*cache)[ref] = item
 			*recent = touchPDFPage(*recent, ref)
 			if request != pdfThumbnail && len(*recent) > limit {
@@ -179,7 +207,7 @@ func (a *workspace) requestPDF(ref pageRef, request pdfRequest, dark bool) (rend
 			}
 		})
 	}()
-	return renderedPDFPage{}, false
+	return nil
 }
 
 func touchPDFPage(recent []pageRef, ref pageRef) []pageRef {
@@ -215,7 +243,7 @@ func (a *workspace) requirePDFNight(ref pageRef, item renderedPDFPage, cache map
 	return item, false
 }
 
-func (a *workspace) prefetchPDF(c *ui.Context, ref pageRef, count int) {
+func (a *workspace) prefetchPDF(c *ui.Context, ref pageRef, count, side int) {
 	if count < 2 || a.drawing.gesture.stroke.Points != nil || a.splitDragging || a.marginDragging {
 		return
 	}
@@ -232,10 +260,13 @@ func (a *workspace) prefetchPDF(c *ui.Context, ref pageRef, count int) {
 	if next >= count {
 		next = ref.page - 1
 	}
-	a.requestPDF(pageRef{ref.document, next}, pdfPrefetch, false)
+	a.requestPDF(pageRef{ref.document, next}, pdfPrefetch, false, side)
 }
 
 func (a *workspace) setPDFPage(page int) {
+	if a.pdf.displayed.ref == (pageRef{a.pdf.document, a.pdf.page}) {
+		a.pdf.displayed.scroll = ui.ScrollState{X: a.pdf.scroll.X, Y: a.pdf.scroll.Y}
+	}
 	a.pdf.page = max(0, page)
 	a.androidInk.pdf = penZone{}
 	a.pdf.scroll = ui.ScrollState{}
@@ -247,6 +278,9 @@ func (a *workspace) setPDFPage(page int) {
 }
 
 func (a *workspace) setPDFDocument(id string) {
+	if a.pdf.document != id {
+		a.pdf.displayed = pdfDisplay{}
+	}
 	a.pdf.document = id
 	a.pdfTOCOpen = false
 	initialPage := 0
@@ -580,6 +614,7 @@ func (a *workspace) splitGripVertical(c *ui.Context, p palette, height, top, gri
 
 func (a *workspace) zoomPDF(factor float32) {
 	a.pdf.lastZoomAt = time.Time{}
+	a.pdf.qualityAt = time.Time{}
 	if factor <= 0 {
 		a.pdf.zoom = 1
 		a.pdf.scroll = ui.ScrollState{}
@@ -616,6 +651,9 @@ func (a *workspace) zoomPDFAt(factor, localX, localY, viewW, pad, baseFit, ratio
 	u := localX / oldPaperW
 	v := localY / oldPaperW
 	newZoom := clamp(oldZoom*factor, 1, 4)
+	if newZoom != oldZoom {
+		d.qualityAt = time.Time{}
+	}
 	newPaperW := baseFit * newZoom
 	newPadX := max(pad, (viewW-newPaperW*(1+ratio))/2)
 
@@ -625,33 +663,98 @@ func (a *workspace) zoomPDFAt(factor, localX, localY, viewW, pad, baseFit, ratio
 	d.lastZoomVPX, d.lastZoomVPY, d.lastZoomAt = vpX, vpY, evTime
 }
 
+const pdfPaperPadding = float32(16)
+
+func (d *pdfState) marginRatio() float32 {
+	if !d.marginOpen {
+		return 0
+	}
+	if d.margin == 0 {
+		d.margin = .32
+	}
+	return d.margin
+}
+
+func pdfFitWidth(width, height, aspect, margin float32) float32 {
+	fitWidth := max(72, width-2*pdfPaperPadding) / (1 + margin)
+	fitHeight := max(72, height-2*pdfPaperPadding-24) / aspect
+	return min(fitWidth, fitHeight)
+}
+
+func pdfRasterSide(width, height, aspect, margin, zoom, density float32) int {
+	pixels := pdfFitWidth(width, height, aspect, margin) * max(1, aspect) * max(1, zoom) * max(1, density)
+	const step = 128
+	return clampInt(int(math.Ceil(float64(pixels)/step))*step, 512, 2400)
+}
+
+func (a *workspace) pdfResolution(c *ui.Context, ref pageRef, width, height float32) (fitSide, renderSide int) {
+	d := &a.pdf
+	page := d.cache[ref]
+	aspect := page.aspectRatio()
+	if page.light == nil && d.displayed.ref.document == ref.document {
+		aspect = d.displayed.page.aspectRatio()
+	}
+	margin := d.marginRatio()
+	fitSide = pdfRasterSide(width, height, aspect, margin, 1, a.pdfDensity)
+	if page.light == nil || page.side == 0 {
+		return fitSide, fitSide
+	}
+	side := pdfRasterSide(width, height, aspect, margin, d.zoom, a.pdfDensity)
+	if side <= max(page.side, page.failedSide) {
+		d.qualityAt = time.Time{}
+		return fitSide, page.side
+	}
+	now := c.Now()
+	interacting := a.splitDragging || a.marginDragging || len(a.drawing.gesture.stroke.Points) > 0
+	if d.qualityRef != ref || d.qualitySide != side || d.qualityAt.IsZero() || interacting {
+		d.qualityRef, d.qualitySide = ref, side
+		d.qualityAt = now.Add(180 * time.Millisecond)
+	}
+	if interacting {
+		return fitSide, page.side
+	}
+	if remaining := d.qualityAt.Sub(now); remaining > 0 {
+		c.After(remaining)
+		return fitSide, page.side
+	}
+	return fitSide, side
+}
+
 func (a *workspace) pdfPane(c *ui.Context, p palette, width, height float32) {
-	ref := pageRef{a.pdf.document, a.pdf.page}
-	page, ready := a.requestPDF(ref, pdfVisible, p.dark && a.settings.PDFNight)
-	count := max(page.count, a.pdf.counts[ref.document])
-	if ready && page.err == nil {
-		a.prefetchPDF(c, ref, count)
-	}
-	if !ready || page.err != nil {
-		a.androidInk.pdf = penZone{}
-	}
 	navH := float32(38)
 	if a.touchUI() {
 		navH = 46
 	}
+	sheetHeight := max(1, height-navH)
+	ref := pageRef{a.pdf.document, a.pdf.page}
+	fitSide, renderSide := a.pdfResolution(c, ref, width, sheetHeight)
+	page, ready := a.requestPDF(ref, pdfVisible, p.dark && a.settings.PDFNight, renderSide)
+	count := max(page.count, a.pdf.counts[ref.document])
+	if ready && page.err == nil {
+		a.pdf.displayed.ref, a.pdf.displayed.page = ref, page
+		a.prefetchPDF(c, ref, count, fitSide)
+	} else {
+		a.androidInk.pdf = penZone{}
+		a.publishPenZones()
+	}
 	ui.Column(c).Fill().Background(p.shell).Children(func() {
 		a.pdfNavigation(c, p, count, navH)
-		if !ready || page.err != nil {
-			ui.Box(c).Grow(1).FillWidth().Center().Children(func() {
-				if page.err != nil {
-					ui.Text(c, page.err.Error()).Padding(12).TextColor(p.danger).FontSize(13)
-				} else {
-					ui.Text(c, "正在渲染 PDF…").TextColor(p.quiet).FontSize(13)
-				}
-			})
+		if ready && page.err == nil {
+			a.pdfSheet(c, p, width, sheetHeight, ref, page, false)
 			return
 		}
-		a.pdfSheet(c, p, width, max(1, height-navH), ref, page)
+		shown := &a.pdf.displayed
+		if !ready && shown.ref.document == ref.document && shown.page.light != nil {
+			a.pdfSheet(c, p, width, sheetHeight, shown.ref, shown.page, true)
+			return
+		}
+		ui.Box(c).Grow(1).FillWidth().Center().Children(func() {
+			if page.err != nil {
+				ui.Text(c, page.err.Error()).Padding(12).TextColor(p.danger).FontSize(13)
+			} else {
+				ui.Text(c, "正在渲染 PDF…").TextColor(p.quiet).FontSize(13)
+			}
+		})
 	})
 }
 
@@ -788,7 +891,7 @@ func (a *workspace) pdfNavigation(c *ui.Context, p palette, count int, navH floa
 	})
 }
 
-func (a *workspace) pdfSheet(c *ui.Context, p palette, width, height float32, ref pageRef, page renderedPDFPage) {
+func (a *workspace) pdfSheet(c *ui.Context, p palette, width, height float32, ref pageRef, page renderedPDFPage, pending bool) {
 	d := &a.pdf
 	image := page.light
 	paper, marginPaper := ui.Hex("#ffffff"), ui.Hex("#f6f7fb")
@@ -796,57 +899,20 @@ func (a *workspace) pdfSheet(c *ui.Context, p palette, width, height float32, re
 		image = page.night
 		paper, marginPaper = ui.Hex("#181818"), p.elevated
 	}
-	iw, ih := image.Size()
-	aspect := float32(ih) / float32(max(1, iw))
-	d.aspect = aspect
-	ratio := float32(0)
-	if d.marginOpen {
-		if d.margin == 0 {
-			d.margin = .32
-		}
-		ratio = d.margin
-	}
-	const pad = float32(16)
-	a.checkShape(c)
-	fitWidth := max(72, width-2*pad) / (1 + ratio)
-	fitHeight := max(72, height-2*pad-24) / aspect
-	baseFit := min(fitWidth, fitHeight)
+	aspect := page.aspectRatio()
+	ratio := d.marginRatio()
+	const pad = pdfPaperPadding
+	baseFit := pdfFitWidth(width, height, aspect, ratio)
 	paperW := baseFit * max(1, d.zoom)
 	paperH, addedW := paperW*aspect, paperW*ratio
 	key := ref.document + ":" + strconv.Itoa(ref.page)
-	if a.pdfHighlightNoteID == "" {
-		d.focusedHighlightNoteID = ""
-		d.highlightSelectedAt = ""
+	scroll := &d.scroll
+	if pending {
+		scroll = &d.displayed.scroll
 	} else {
-		if d.focusedHighlightNoteID == a.pdfHighlightNoteID && a.selected != d.highlightSelectedAt && a.selected != a.pdfHighlightNoteID {
-			// User switched to a different note on the canvas/outline; clear stale PDF highlight.
-			a.pdfHighlightNoteID = ""
-			d.focusedHighlightNoteID = ""
-			d.highlightSelectedAt = ""
-		} else if d.focusedHighlightNoteID == a.pdfHighlightNoteID && a.selected == a.pdfHighlightNoteID {
-			d.highlightSelectedAt = a.selected
-		} else if d.focusedHighlightNoteID != a.pdfHighlightNoteID {
-			d.focusedHighlightNoteID = a.pdfHighlightNoteID
-			d.highlightSelectedAt = a.selected
-			if hlNote, ok := a.tree.notes[a.pdfHighlightNoteID]; ok {
-				unit := ui.Rect{W: paperW, H: paperH}
-				for _, hr := range hlNote.HighlightRects {
-					if hr.Page == ref.page+1 {
-						if r, valid := a.mapHighlightRect(hr, unit, ref.document); valid {
-							d.scroll.X = max(0, r.X-32)
-							d.scroll.Y = max(0, r.Y-48)
-							break
-						}
-					}
-				}
-			}
-		}
-	}
-	if d.focusHighlight && d.highlight != nil {
-		h := d.highlight
-		d.scroll.X = max(0, h.X*paperW-32)
-		d.scroll.Y = max(0, h.Y*paperH-40)
-		d.focusHighlight = false
+		d.aspect = aspect
+		a.checkShape(c)
+		a.focusPDFSheet(ref, paperW, paperH)
 	}
 	ui.Box(c).Grow(1).MinHeight(0).FillWidth().Clip().Children(func() {
 		horizontalPadding := max(pad, (width-paperW-addedW)/2)
@@ -855,8 +921,11 @@ func (a *workspace) pdfSheet(c *ui.Context, p palette, width, height float32, re
 			bottomPad = 92
 		}
 		ui.ScrollBoth(c.Key("pdf-scroll")).Fill().Padding(pad, horizontalPadding, bottomPad).
-			TrackScroll(&d.scroll).Label("PDF 页面").
+			TrackScroll(scroll).Label("PDF 页面").IgnoreInput(pending).
 			HandleInput(func(ev ui.InputEvent) bool {
+				if pending {
+					return false
+				}
 				switch {
 				case ev.Kind == ui.InputZoom && ev.Scale > 0:
 					lx := clamp(ev.X+d.scroll.X-horizontalPadding, 0, paperW+addedW)
@@ -873,8 +942,11 @@ func (a *workspace) pdfSheet(c *ui.Context, p palette, width, height float32, re
 			}).Children(func() {
 			sheet := ui.Box(c.Key(key)).Size(paperW+addedW, paperH).Shrink(0).
 				Radius(9).Clip().Background(paper).Border(1, p.rule).Label("PDF 原页与留白").
-				Shadow(0, 6, 16, -5, p.shadow).
+				Shadow(0, 6, 16, -5, p.shadow).IgnoreInput(pending).
 				HandleInput(func(ev ui.InputEvent) bool {
+					if pending {
+						return false
+					}
 					switch {
 					case ev.Kind == ui.InputZoom && ev.Scale > 0:
 						a.zoomPDFAt(ev.Scale, ev.X, ev.Y, width, pad, baseFit, ratio, ev.Time)
@@ -892,7 +964,7 @@ func (a *workspace) pdfSheet(c *ui.Context, p palette, width, height float32, re
 			if a.drawing.tool != panTool && a.drawing.tool != lassoTool {
 				sheet.Cursor(ui.CursorCrosshair)
 			}
-			if a.drawing.tool == excerptTool && !a.splitDragging && !a.marginDragging {
+			if !pending && a.drawing.tool == excerptTool && !a.splitDragging && !a.marginDragging {
 				// A touch drag selects a region; keep the sheet fixed within the scroll view.
 				sheet.Draggable(nil, ui.DraggableOptions{Bounds: &ui.Rect{}, Rigid: true})
 			}
@@ -910,11 +982,13 @@ func (a *workspace) pdfSheet(c *ui.Context, p palette, width, height float32, re
 				// Keep the ink render target to the visible portion at high page zoom.
 				vp := paint.Visible()
 				vis := intersect(rect, vp)
-				a.pdfPenZone(key, vis, rect.X, rect.Y, paperW, vp.Y+vp.H)
+				if !pending {
+					a.pdfPenZone(key, vis, rect.X, rect.Y, paperW, vp.Y+vp.H)
+				}
 				a.drawing.drawInk(paint, vis, p, key, rect.X, rect.Y, paperW, &a.drawing.pdf)
 				a.pdfHighlights(paint, p, original, ref, key)
 			})
-			if addedW > 0 {
+			if !pending && addedW > 0 {
 				marginGripW := float32(7)
 				if a.touchUI() {
 					marginGripW = 20
@@ -966,7 +1040,7 @@ func (a *workspace) pdfSheet(c *ui.Context, p palette, width, height float32, re
 		})
 		if a.mode == pdfMode {
 			a.inkDock(c, p, pdfMode, width)
-		} else if width > 235 {
+		} else if !pending && width > 235 {
 			hint := "手指导航 · 触控笔书写"
 			if !a.stylusDrawsOnPDF() {
 				hint = "手指导航 · 触控笔选择"
@@ -976,7 +1050,12 @@ func (a *workspace) pdfSheet(c *ui.Context, p palette, width, height float32, re
 				ui.Text(c, hint).FontSize(11).TextColor(p.quiet).SingleLine()
 			})
 		}
-		if a.pdfHighlightNoteID != "" {
+		if pending {
+			ui.Row(c.Key("pdf-loading")).Absolute().Top(8).Left(0).Right(0).Center().ZIndex(3).IgnoreInput(true).Children(func() {
+				ui.Text(c, fmt.Sprintf("正在加载第 %d 页…", d.page+1)).Padding(6, 12).Radius(12).
+					Background(p.elevated).Border(1, p.rule).TextColor(p.secondary).FontSize(12)
+			})
+		} else if a.pdfHighlightNoteID != "" {
 			if hlNote, ok := a.tree.notes[a.pdfHighlightNoteID]; ok && noteHasPageHighlight(hlNote, ref.page+1) {
 				clearH := float32(26)
 				if a.touchUI() {
@@ -1003,6 +1082,44 @@ func (a *workspace) pdfSheet(c *ui.Context, p palette, width, height float32, re
 			}
 		}
 	})
+}
+
+func (a *workspace) focusPDFSheet(ref pageRef, paperW, paperH float32) {
+	d := &a.pdf
+	if a.pdfHighlightNoteID == "" {
+		d.focusedHighlightNoteID = ""
+		d.highlightSelectedAt = ""
+	} else {
+		if d.focusedHighlightNoteID == a.pdfHighlightNoteID && a.selected != d.highlightSelectedAt && a.selected != a.pdfHighlightNoteID {
+			// User switched to a different note on the canvas/outline; clear stale PDF highlight.
+			a.pdfHighlightNoteID = ""
+			d.focusedHighlightNoteID = ""
+			d.highlightSelectedAt = ""
+		} else if d.focusedHighlightNoteID == a.pdfHighlightNoteID && a.selected == a.pdfHighlightNoteID {
+			d.highlightSelectedAt = a.selected
+		} else if d.focusedHighlightNoteID != a.pdfHighlightNoteID {
+			d.focusedHighlightNoteID = a.pdfHighlightNoteID
+			d.highlightSelectedAt = a.selected
+			if hlNote, ok := a.tree.notes[a.pdfHighlightNoteID]; ok {
+				unit := ui.Rect{W: paperW, H: paperH}
+				for _, hr := range hlNote.HighlightRects {
+					if hr.Page == ref.page+1 {
+						if r, valid := a.mapHighlightRect(hr, unit, ref.document); valid {
+							d.scroll.X = max(0, r.X-32)
+							d.scroll.Y = max(0, r.Y-48)
+							break
+						}
+					}
+				}
+			}
+		}
+	}
+	if d.focusHighlight && d.highlight != nil {
+		h := d.highlight
+		d.scroll.X = max(0, h.X*paperW-32)
+		d.scroll.Y = max(0, h.Y*paperH-40)
+		d.focusHighlight = false
+	}
 }
 
 func intersect(a, b ui.Rect) ui.Rect {
@@ -1252,7 +1369,7 @@ func (a *workspace) createExcerpt(box ui.Rect) {
 }
 
 func (a *workspace) excerptPreview(c *ui.Context, p palette, region notebook.PDFRegion) {
-	page, ok := a.requestPDF(pageRef{region.Document, region.Page}, pdfThumbnail, p.dark && a.settings.PDFNight)
+	page, ok := a.requestPDF(pageRef{region.Document, region.Page}, pdfThumbnail, p.dark && a.settings.PDFNight, 480)
 	if !ok || page.err != nil {
 		message := "正在载入摘录…"
 		if page.err != nil {

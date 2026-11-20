@@ -1587,9 +1587,7 @@ func (a *workspace) cardActionBar(c *ui.Context, p palette, node mapNode, box ui
 		actionBtn("act-child", "子卡片", icPlus, false, a.startAddChild)
 		if len(imgs) > 0 {
 			actionBtn("act-img", "原图", icPage, false, func() {
-				if a.mediaBitmap(imgs[0]) != nil {
-					a.preview = imgs[0]
-				}
+				a.preview = imgs[0]
 			})
 		}
 		if node.hasKids && node.depth > 0 {
@@ -2213,18 +2211,15 @@ func (a *workspace) richGraphNode(c *ui.Context, p palette, node mapNode, box ui
 						dispH = node.imageHeight[imgIdx] * scale
 					}
 					imgIdx++
-					bmp := a.mediaBitmap(ref)
 					framePad := 4.5 * scale
 					frameW := max(12, innerW)
 					imgW := max(8, frameW-2*framePad)
 					ui.Box(c.Key("img-"+ref)).Width(frameW).Shrink(0).
 						Padding(framePad).Radius(6 * scale).Center().
 						Background(ui.Hex("#ffffff")).Border(max(.5, 1*scale), ct.border.Alpha(.45)).Children(func() {
-						if bmp != nil {
-							ui.Image(c, bmp).Size(imgW, max(6, dispH)).Fit(ui.Contain)
-						} else {
-							ui.Box(c).Size(imgW, max(6, dispH))
-						}
+						ui.Box(c).Size(imgW, max(6, dispH)).Draw(func(p *ui.Painter, rect ui.Rect) {
+							a.paintMediaThumbnail(p, rect, ref)
+						})
 					})
 				}
 

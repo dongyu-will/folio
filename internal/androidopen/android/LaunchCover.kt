@@ -4,20 +4,24 @@ import android.app.Activity
 import android.app.Application
 import android.content.Context
 import android.content.res.Configuration
+import android.graphics.Bitmap
 import android.graphics.drawable.ColorDrawable
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.view.Choreographer
+import android.view.PixelCopy
+import android.view.SurfaceView
 import android.view.View
 import android.view.ViewGroup
+import android.widget.ImageView
+import androidx.core.view.children
 import java.lang.ref.WeakReference
 import java.util.Locale
 
 /**
- * Keeps an opaque shell-colored cover above HostImpl.root during cold start and
- * warm resume so SurfaceView's black hole-punch never flashes while EGL/GLES3
- * compiles shaders and latches the first buffer.
+ * Covers HostImpl.root until the first frame is ready. On warm resume the
+ * cover shows the last workspace frame while SurfaceView acquires a buffer.
  *
  * Attached exclusively to android.R.id.content as a top sibling of HostImpl.root
  * (never inside HostImpl.root, where Navigation.arrange() hides non-top children).
@@ -30,11 +34,13 @@ internal object LaunchCover {
 
     private const val COLOR_LIGHT = 0xFFF5F5F7.toInt()
     private const val COLOR_DARK = 0xFF0E0F12.toInt()
+    private const val RESUME_FRAME_MAX_EDGE = 2048
 
     private const val READY_EXTRA_FRAMES = 3
     private const val FADE_DURATION_MS = 120L
     private const val COLD_TIMEOUT_MS = 4500L
     private const val RESUME_TIMEOUT_MS = 650L
+    private const val RESUME_FRAME_TIMEOUT_MS = 1500L
 
     private enum class State {
         IDLE,
@@ -42,6 +48,7 @@ internal object LaunchCover {
         STOPPED,
         RESUME_PENDING_EMIT,
         RESUME_WAIT,
+        RESUME_BUFFER,
         COUNTDOWN,
         FADING,
     }
@@ -53,7 +60,9 @@ internal object LaunchCover {
     private var currentActivity: WeakReference<Activity>? = null
     private var resumedActivity: WeakReference<Activity>? = null
     private var onActivityResumedListener: ((Activity) -> Unit)? = null
-    private var coverView: View? = null
+    private var coverView: ImageView? = null
+    private var resumeFrame: Bitmap? = null
+    private var captureSequence = 0
     private var surfaceLost = false
     private var state = State.IDLE
     private var generation = 0
@@ -73,6 +82,7 @@ internal object LaunchCover {
             // HostImpl.attach() calls setContentView(root) later in onCreate, so
             // set the window background now and attach the sibling cover in onStart.
             currentActivity = WeakReference(activity)
+            clearResumeFrame()
             detachCoverIfDifferent(activity)
             cancelPending()
             generation++
@@ -104,7 +114,10 @@ internal object LaunchCover {
                     }
                 }
             }
-            if (!surfaceLost) return
+            if (!surfaceLost) {
+                clearResumeFrame()
+                return
+            }
             surfaceLost = false
             applyWindowBackground(activity)
             attachCover(activity)
@@ -116,7 +129,8 @@ internal object LaunchCover {
                 startColdPoll(gen)
             } else {
                 state = State.RESUME_PENDING_EMIT
-                armFailSafe(gen, RESUME_TIMEOUT_MS)
+                val timeout = if (resumeFrame != null) RESUME_FRAME_TIMEOUT_MS else RESUME_TIMEOUT_MS
+                armFailSafe(gen, timeout)
                 val emit = Runnable {
                     pendingEmitRunnable = null
                     if (gen != generation || state != State.RESUME_PENDING_EMIT) return@Runnable
@@ -133,6 +147,9 @@ internal object LaunchCover {
             if (resumedActivity?.get() === activity) {
                 resumedActivity = null
                 isResumed = false
+            }
+            if (currentActivity?.get() === activity && !activity.isFinishing && HostImpl.drew) {
+                captureResumeFrame(activity)
             }
         }
 
@@ -170,6 +187,7 @@ internal object LaunchCover {
                 cancelPending()
                 generation++
                 currentActivity = null
+                clearResumeFrame()
                 state = State.IDLE
             }
         }
@@ -236,8 +254,10 @@ internal object LaunchCover {
 
     fun onFrameReady() {
         runOnMain {
-            if (state == State.COLD_WAIT || state == State.RESUME_WAIT) {
-                startFrameCountdown(generation)
+            when (state) {
+                State.COLD_WAIT -> startFrameCountdown(generation)
+                State.RESUME_WAIT -> waitForResumeBuffer(generation)
+                else -> Unit
             }
         }
     }
@@ -270,6 +290,44 @@ internal object LaunchCover {
         activity.window?.setBackgroundDrawable(ColorDrawable(resolveColor(activity)))
     }
 
+    private fun workspaceSurface(): SurfaceView? {
+        val workspace = (HostImpl.front() as? SurfaceWindow)?.view as? ViewGroup ?: return null
+        return workspace.children.filterIsInstance<SurfaceView>().firstOrNull()
+    }
+
+    private fun captureResumeFrame(activity: Activity) {
+        val request = ++captureSequence
+        val surface = workspaceSurface() ?: return
+        val width = surface.width
+        val height = surface.height
+        if (width <= 0 || height <= 0 || !surface.holder.surface.isValid) return
+
+        // Keep a bounded, in-memory copy of Folio's last rendered buffer.
+        val scale = minOf(1f, RESUME_FRAME_MAX_EDGE.toFloat() / maxOf(width, height))
+        val frame = Bitmap.createBitmap(
+            (width * scale).toInt().coerceAtLeast(1),
+            (height * scale).toInt().coerceAtLeast(1),
+            Bitmap.Config.ARGB_8888,
+        )
+        try {
+            PixelCopy.request(surface, frame, { result ->
+                if (result == PixelCopy.SUCCESS && currentActivity?.get() === activity &&
+                    request == captureSequence
+                ) {
+                    resumeFrame = frame
+                    if (state != State.FADING) coverView?.setImageBitmap(frame)
+                }
+            }, main)
+        } catch (_: IllegalArgumentException) {
+            // The surface can disappear as Android hides the window.
+        }
+    }
+
+    private fun clearResumeFrame() {
+        captureSequence++
+        resumeFrame = null
+    }
+
     private fun attachCover(activity: Activity) {
         val content = activity.findViewById<ViewGroup>(android.R.id.content) ?: return
         val color = resolveColor(activity)
@@ -277,6 +335,7 @@ internal object LaunchCover {
         if (existing != null && existing.parent === content) {
             existing.animate().cancel()
             existing.setBackgroundColor(color)
+            existing.setImageBitmap(resumeFrame)
             existing.alpha = 1f
             existing.visibility = View.VISIBLE
             existing.isClickable = true
@@ -286,8 +345,10 @@ internal object LaunchCover {
         if (existing != null) {
             removeCoverView(existing)
         }
-        val view = View(activity).apply {
+        val view = ImageView(activity).apply {
             setBackgroundColor(color)
+            scaleType = ImageView.ScaleType.FIT_CENTER
+            setImageBitmap(resumeFrame)
             alpha = 1f
             isClickable = true
             isFocusable = false
@@ -325,7 +386,7 @@ internal object LaunchCover {
         val runnable = Runnable {
             failSafeRunnable = null
             if (gen == generation && state != State.IDLE && state != State.FADING && state != State.STOPPED) {
-                startFadeOut(gen)
+                dismissCover(gen)
             }
         }
         failSafeRunnable = runnable
@@ -350,6 +411,39 @@ internal object LaunchCover {
         choreographer.postFrameCallback(cb)
     }
 
+    private fun waitForResumeBuffer(gen: Int) {
+        // Go's paint notification can precede the new surface's first buffer.
+        // Keep the cover up until PixelCopy can read from that surface.
+        state = State.RESUME_BUFFER
+        val probe = Bitmap.createBitmap(1, 1, Bitmap.Config.ARGB_8888)
+        val choreographer = Choreographer.getInstance()
+        val cb = object : Choreographer.FrameCallback {
+            override fun doFrame(frameTimeNanos: Long) {
+                if (gen != generation || state != State.RESUME_BUFFER) return
+                val surface = workspaceSurface()
+                if (surface != null && surface.holder.surface.isValid) {
+                    try {
+                        PixelCopy.request(surface, probe, { result ->
+                            if (gen == generation && state == State.RESUME_BUFFER) {
+                                if (result == PixelCopy.SUCCESS) {
+                                    startFrameCountdown(gen)
+                                } else {
+                                    choreographer.postFrameCallback(this)
+                                }
+                            }
+                        }, main)
+                        return
+                    } catch (_: IllegalArgumentException) {
+                        // Android detached this surface before the probe could run.
+                    }
+                }
+                choreographer.postFrameCallback(this)
+            }
+        }
+        activeFrameCallback = cb
+        choreographer.postFrameCallback(cb)
+    }
+
     private fun startFrameCountdown(gen: Int) {
         if (gen != generation) return
         if (state == State.COUNTDOWN || state == State.FADING || state == State.IDLE) return
@@ -363,7 +457,7 @@ internal object LaunchCover {
                 remaining--
                 if (remaining <= 0) {
                     activeFrameCallback = null
-                    startFadeOut(gen)
+                    dismissCover(gen)
                 } else {
                     choreographer.postFrameCallback(this)
                 }
@@ -373,15 +467,15 @@ internal object LaunchCover {
         choreographer.postFrameCallback(cb)
     }
 
-    private fun startFadeOut(gen: Int) {
+    private fun dismissCover(gen: Int) {
         if (gen != generation) return
         cancelPending()
-        val view = coverView ?: run {
-            state = State.IDLE
-            return
-        }
-        if (!view.isAttachedToWindow) {
-            removeCoverView(view)
+        val view = coverView
+        // The saved frame and the live surface show the same workspace, so a
+        // single swap avoids fading through SurfaceView's transparent region.
+        if (view == null || !view.isAttachedToWindow || view.drawable != null) {
+            if (view != null) removeCoverView(view)
+            if (isResumed) clearResumeFrame()
             state = State.IDLE
             return
         }
@@ -394,6 +488,7 @@ internal object LaunchCover {
             .withEndAction {
                 if (gen == generation && state == State.FADING && coverView === view) {
                     removeCoverView(view)
+                    if (isResumed) clearResumeFrame()
                     state = State.IDLE
                 }
             }

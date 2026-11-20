@@ -211,11 +211,10 @@ func (a *workspace) outlineCard(c *ui.Context, p palette, item outlineItem, stre
 				imgMaxW := max(140, cardW-44)
 				ui.Column(c).FillWidth().Padding(12, 16, 14).Gap(10).Children(func() {
 					renderOutlineImg := func(ref string) bool {
-						bmp := a.mediaBitmap(ref)
-						if bmp == nil {
+					iw, ih := a.imageDims(ref)
+					if iw <= 0 || ih <= 0 {
 							return false
 						}
-						iw, ih := bmp.Size()
 						dispW := min(imgMaxW, float32(iw))
 						dispH := max(16, dispW*float32(ih)/float32(max(1, iw)))
 						if dispH > 340 {
@@ -229,7 +228,9 @@ func (a *workspace) outlineCard(c *ui.Context, p palette, item outlineItem, stre
 							imgBtn.Border(1, p.accent.Alpha(.65))
 						}
 						imgBtn.Children(func() {
-							ui.Image(c, bmp).Size(dispW, dispH).Fit(ui.Contain)
+						ui.Box(c).Size(dispW, dispH).Draw(func(p *ui.Painter, rect ui.Rect) {
+							a.paintMediaThumbnail(p, rect, ref)
+						})
 						})
 						return true
 					}
@@ -245,7 +246,7 @@ func (a *workspace) outlineCard(c *ui.Context, p palette, item outlineItem, stre
 					renderedBlocks := 0
 					for bi, blk := range n.Blocks {
 						if blk.Image != "" {
-							if a.mediaBitmap(blk.Image) == nil {
+						if w, h := a.imageDims(blk.Image); w <= 0 || h <= 0 {
 								continue
 							}
 							if renderedBlocks > 0 && useBlocks && len(n.Blocks) > 1 {

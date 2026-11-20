@@ -31,13 +31,28 @@ type renderedPDFPage struct {
 	light, night *ui.Bitmap
 	raster       *image.RGBA
 	count        int
+	side         int
+	failedSide   int
+	aspect       float32
 	err          error
+}
+
+func (p renderedPDFPage) aspectRatio() float32 {
+	if p.aspect > 0 {
+		return p.aspect
+	}
+	if p.light != nil {
+		w, h := p.light.Size()
+		return float32(h) / float32(max(1, w))
+	}
+	return 1.414
 }
 
 func renderPDF(path string, page, maxSide int, background bool) (renderedPDFPage, error) {
 	var result struct {
-		Count int
-		Error string
+		Count         int
+		Error         string
+		Width, Height float32
 	}
 	f, err := os.CreateTemp("", "mgnote-pdf-*.png")
 	if err != nil {
@@ -86,7 +101,11 @@ func renderPDF(path string, page, maxSide int, background bool) (renderedPDFPage
 	light := image.NewRGBA(src.Bounds())
 	draw.Draw(light, light.Bounds(), image.NewUniform(color.White), image.Point{}, draw.Src)
 	draw.Draw(light, light.Bounds(), src, src.Bounds().Min, draw.Over)
-	return renderedPDFPage{light: ui.NewBitmap(light), raster: light, count: result.Count}, nil
+	var aspect float32
+	if result.Width > 0 && result.Height > 0 {
+		aspect = result.Height / result.Width
+	}
+	return renderedPDFPage{light: ui.NewBitmap(light), raster: light, count: result.Count, side: maxSide, aspect: aspect}, nil
 }
 
 func pdfRendererPath() string {
