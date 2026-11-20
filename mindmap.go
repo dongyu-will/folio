@@ -1554,9 +1554,9 @@ func (a *workspace) cardActionBar(c *ui.Context, p palette, node mapNode, box ui
 		Background(p.elevated).Border(1, p.border).
 		InsetShadow(0, 1, 0, 0, p.specular).
 		Shadow(0, 8, 22, -4, p.modalShadow).Children(func() {
-		actionBtn := func(key, label string, icon *ui.SVG, danger bool, onClick func()) {
+		actionBtn := func(key, label string, icon *ui.SVG, danger, disabled bool, onClick func()) {
 			btn := ui.ButtonBase(c.Key(key)).Height(btnH).PaddingX(btnPadX).Gap(4).Radius(6).Center().
-				Label(label).Disabled(a.busy).OnClick(onClick)
+				Label(label).Disabled(disabled).OnClick(onClick)
 			fg := p.ink
 			icFg := p.secondary
 			if danger {
@@ -1579,14 +1579,14 @@ func (a *workspace) cardActionBar(c *ui.Context, p palette, node mapNode, box ui
 			})
 		}
 
-		actionBtn("act-detail", "详情", icBook, false, func() {
+		actionBtn("act-detail", "详情", icBook, false, false, func() {
 			a.cardMenuOpen = false
 			a.page = detail
 		})
-		actionBtn("act-edit", "编辑", icEdit, false, a.startEditNote)
-		actionBtn("act-child", "子卡片", icPlus, false, a.startAddChild)
+		actionBtn("act-edit", "编辑", icEdit, false, a.busy, a.startEditNote)
+		actionBtn("act-child", "子卡片", icPlus, false, a.busy, a.startAddChild)
 		if len(imgs) > 0 {
-			actionBtn("act-img", "原图", icPage, false, func() {
+			actionBtn("act-img", "原图", icPage, false, false, func() {
 				a.preview = imgs[0]
 			})
 		}
@@ -1597,13 +1597,13 @@ func (a *workspace) cardActionBar(c *ui.Context, p palette, node mapNode, box ui
 				foldLabel = "展开"
 				foldIcon = icChevronRight
 			}
-			actionBtn("act-fold", foldLabel, foldIcon, false, func() {
+			actionBtn("act-fold", foldLabel, foldIcon, false, false, func() {
 				a.toggleBranch(node.id)
 			})
 		}
 		if n.ID != "" {
 			ui.Box(c).Width(1).Height(14).Background(p.rule).Margin(0, 2)
-			actionBtn("act-del", "", icTrash, true, a.confirmDeleteNote)
+			actionBtn("act-del", "", icTrash, true, a.busy, a.confirmDeleteNote)
 		}
 	})
 }

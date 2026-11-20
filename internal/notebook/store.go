@@ -201,18 +201,48 @@ func (s *Store) writeAllShards(library Library, dirty map[string]bool) error {
 }
 
 func (s *Store) Import(path string) (ImportResult, error) {
+	return s.ImportWithPreview(path, nil)
+}
+
+// ImportWithPreview publishes a read-only library snapshot for a new notebook
+// before loading its attachments. Only the completed import is saved.
+func (s *Store) ImportWithPreview(path string, preview func(ImportResult)) (ImportResult, error) {
 	if detectImportFormat(path) == ".pdf" {
 		return s.importPDF(path)
 	}
-	return s.importFile(path, false)
+	return s.importFile(path, false, preview)
 }
 
-func (s *Store) importFile(path string, existingOnly bool) (ImportResult, error) {
+func (s *Store) importFile(path string, existingOnly bool, preview func(ImportResult)) (ImportResult, error) {
 	format := detectImportFormat(path)
 	sink := s.newMediaSink()
 	defer sink.cleanup()
 
-	books, files, configs, err := readMarginNoteWithSink(path, s.inkRenderer, sink)
+	var showText func([]Book)
+	if preview != nil {
+		showText = func(books []Book) {
+			if len(books) == 0 {
+				return
+			}
+			library, err := s.Read()
+			if err != nil {
+				return
+			}
+			isNew := func(book Book) bool {
+				return indexBook(&library, book.ID) < 0 && indexBookByTopic(&library, book.ID) < 0
+			}
+			if !isNew(books[0]) {
+				return
+			}
+			for _, book := range books {
+				if isNew(book) {
+					library.Books = append(library.Books, book)
+				}
+			}
+			preview(ImportResult{Library: library, BookID: books[0].ID})
+		}
+	}
+	books, files, configs, err := readMarginNoteWithSink(path, s.inkRenderer, sink, showText)
 	if err != nil {
 		return ImportResult{}, err
 	}
@@ -571,7 +601,7 @@ func (s *Store) RecoverMedia(downloads string) error {
 			continue
 		}
 		seen[source] = true
-		if _, readErr := s.importFile(filepath.Join(downloads, source), true); !errors.Is(readErr, os.ErrNotExist) {
+		if _, readErr := s.importFile(filepath.Join(downloads, source), true, nil); !errors.Is(readErr, os.ErrNotExist) {
 			err = errors.Join(err, readErr)
 		}
 	}

@@ -758,7 +758,7 @@ func TestImportDecouplesSQLiteCursorFromSlowInkRendering(t *testing.T) {
 		"CREATE TABLE ZTOPIC (Z_PK INTEGER, ZTOPICID TEXT, ZTITLE TEXT, ZMINDLINKS TEXT)",
 		"CREATE TABLE ZBOOKNOTE (Z_PK INTEGER, ZNOTEID TEXT, ZTOPICID TEXT, ZGROUPNOTEID TEXT, ZNOTETITLE TEXT, ZNOTES_TEXT TEXT, ZHIGHLIGHT_TEXT TEXT, ZSTARTPAGE INTEGER, ZMINDLINKS TEXT, ZHIGHLIGHT_PIC BLOB, ZNOTES BLOB)",
 		"CREATE TABLE ZMEDIA (ZMD5 TEXT, ZDATA BLOB)",
-		"INSERT INTO ZTOPIC VALUES (1, 'topic-slow', '解耦测试', 'n1|n2')",
+		"INSERT INTO ZTOPIC VALUES (1, 'topic-slow', '解耦测试', 'n1')",
 	} {
 		if _, err := db.ExecContext(context.Background(), q); err != nil {
 			t.Fatal(err)
@@ -805,10 +805,15 @@ func TestImportDecouplesSQLiteCursorFromSlowInkRendering(t *testing.T) {
 		map[string]any{"NS.keys": []any{plist.UID(2)}, "NS.objects": []any{plist.UID(3)}},
 		"drawing", "wrap-draw-key",
 	)
-	if _, err := db.Exec("INSERT INTO ZBOOKNOTE VALUES (1, 'n1', 'topic-slow', NULL, '笔记一', '', '', 1, '', ?, NULL)", clip1); err != nil {
+	textBlocks := archive(
+		map[string]any{"NS.objects": []any{plist.UID(2)}},
+		map[string]any{"NS.keys": []any{plist.UID(3), plist.UID(4)}, "NS.objects": []any{plist.UID(5), plist.UID(6)}},
+		"type", "text", "TextNote", "先显示的正文",
+	)
+	if _, err := db.Exec("INSERT INTO ZBOOKNOTE VALUES (1, 'n1', 'topic-slow', NULL, '笔记一', '', '', 1, 'n2', ?, ?)", clip1, textBlocks); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.Exec("INSERT INTO ZBOOKNOTE VALUES (2, 'n2', 'topic-slow', NULL, '笔记二', '', '', 2, '', ?, NULL)", clip2); err != nil {
+	if _, err := db.Exec("INSERT INTO ZBOOKNOTE VALUES (2, 'n2', 'topic-slow', 'n1', '', '', '', 2, '', ?, NULL)", clip2); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.Close(); err != nil {
@@ -817,16 +822,38 @@ func TestImportDecouplesSQLiteCursorFromSlowInkRendering(t *testing.T) {
 
 	// Mock ink renderer sleeps 300ms per call (> 120ms sqliteReadTimeout).
 	// If media.attach ran inside the SQLite cursor loop, this would deterministically fail with context deadline exceeded.
-	mockInk := writeMockInkRenderer(t, tmp, "", "0.3", makePNG(t, 32, 16, 5))
+	renderLog := filepath.Join(tmp, "renders.log")
+	mockInk := writeMockInkRenderer(t, tmp, renderLog, "0.3", makePNG(t, 32, 16, 5))
 	store := NewStore(filepath.Join(tmp, "store"))
 	store.SetInkRenderer(mockInk)
 
-	res, err := store.Import(dbPath)
+	var previewID string
+	res, err := store.ImportWithPreview(dbPath, func(preview ImportResult) {
+		previewID = preview.BookID
+		if len(preview.Library.Books) != 1 || len(preview.Library.Books[0].Notes) != 2 {
+			t.Fatalf("preview lost notes, including the ink-only child: %+v", preview.Library.Books)
+		}
+		book := preview.Library.Books[0]
+		note := book.Notes[0]
+		if !slices.Equal(book.Roots, []string{"n1"}) || !slices.Equal(note.Children, []string{"n2"}) ||
+			note.Body != "先显示的正文" || note.Clip != "" || book.Notes[1].Clip != "" || !book.Notes[1].PendingMedia {
+			t.Fatalf("unexpected preview card structure or content: %+v", book)
+		}
+		if _, err := os.Stat(renderLog); !os.IsNotExist(err) {
+			t.Fatalf("ink rendering began before preview: %v", err)
+		}
+		if library, err := store.Read(); err != nil || len(library.Books) != 0 {
+			t.Fatalf("unfinished preview persisted in library: %+v, %v", library, err)
+		}
+	})
 	if err != nil {
 		t.Fatalf("expected import to succeed after SQLite closed before slow ink rendering, got: %v", err)
 	}
 	if len(res.Library.Books) != 1 || len(res.Library.Books[0].Notes) != 2 {
 		t.Fatalf("unexpected imported books/notes: %+v", res.Library.Books)
+	}
+	if previewID == "" || res.BookID != previewID {
+		t.Fatalf("preview and completed book IDs differ: %q, %q", previewID, res.BookID)
 	}
 	for _, n := range res.Library.Books[0].Notes {
 		if n.Clip == "" {

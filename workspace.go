@@ -99,7 +99,7 @@ type workspace struct {
 	downloadsPolling   bool
 	importPaths        []queuedImport
 	takeDownloadFn     func(context.Context) (*pendingAndroidDownload, error)
-	importFileFn       func(string) (notebook.ImportResult, error)
+	importFileFn       func(string, func(notebook.ImportResult)) (notebook.ImportResult, error)
 	openImportDialogFn func(mygo.OpenDialogOptions) ([]string, error)
 
 	updateMu                    sync.Mutex
@@ -401,7 +401,7 @@ func noteCardImages(n notebook.Note) []string {
 }
 
 func hasNoteContent(n notebook.Note) bool {
-	return noteText(n) != "" || n.Clip != "" || len(n.Blocks) > 0
+	return noteText(n) != "" || n.Clip != "" || len(n.Blocks) > 0 || n.PendingMedia
 }
 
 func blockPlainText(blk notebook.ContentBlock) string {
@@ -643,7 +643,10 @@ func (a *workspace) openChildNote(id string) {
 	a.page = detail
 }
 
-const importingNotebookMessage = "正在导入笔记本…"
+const (
+	importingNotebookMessage    = "正在导入笔记本…"
+	importingAttachmentsMessage = "正在加载笔记附件…"
+)
 
 func (a *workspace) showMessage(text string, failed bool) {
 	a.message, a.messageError, a.messagePending = text, failed, false
@@ -790,6 +793,10 @@ func (a *workspace) applyImport(r notebook.ImportResult) {
 	} else {
 		a.setLibrary(r.Library, r.BookID)
 	}
+	a.showImportResult(r)
+}
+
+func (a *workspace) showImportResult(r notebook.ImportResult) {
 	switch {
 	case r.Added > 0:
 		a.showMessage("已导入笔记本", false)
@@ -797,6 +804,59 @@ func (a *workspace) applyImport(r notebook.ImportResult) {
 		a.showMessage("已更新本地笔记本", false)
 	default:
 		a.showMessage("该笔记本已在库中，已为你打开", false)
+	}
+}
+
+func (a *workspace) importPath(path string) func() {
+	var before notebook.Library
+	var beforeBook string
+	previewed := false
+	importFn := a.importFileFn
+	if importFn == nil {
+		importFn = a.store.ImportWithPreview
+	}
+	result, err := importFn(path, func(preview notebook.ImportResult) {
+		a.updateUI(func() {
+			before, beforeBook = notebook.Library{Books: a.books}, a.bookID
+			previewed = true
+			a.setLibrary(preview.Library, preview.BookID)
+			a.showProgress(importingAttachmentsMessage)
+		})
+	})
+	return func() {
+		if err != nil {
+			if previewed {
+				a.replaceImportPreview(before, beforeBook)
+			}
+			a.showError(err)
+			return
+		}
+		if previewed {
+			a.replaceImportPreview(result.Library, result.BookID)
+			a.showImportResult(result)
+		} else {
+			a.applyImport(result)
+		}
+	}
+}
+
+func (a *workspace) replaceImportPreview(library notebook.Library, fallback string) {
+	preferred := a.bookChoice
+	if !slices.ContainsFunc(library.Books, func(book notebook.Book) bool { return book.ID == preferred }) {
+		preferred = fallback
+	}
+	a.setLibrary(library, preferred)
+	if _, ok := a.tree.notes[a.scope]; !ok {
+		a.scope = ""
+	}
+	if _, ok := a.tree.notes[a.selected]; !ok {
+		a.cardMenuOpen = false
+		a.setNote(a.firstNote())
+	} else if !a.tree.validTrail(a.activeTrail, a.selected) {
+		a.activeTrail = a.tree.trail(a.selected)
+	}
+	if a.pdf.document == "" && len(a.tree.book.Documents) > 0 {
+		a.resetPDF(a.tree.book.Documents)
 	}
 }
 
@@ -939,10 +999,6 @@ func (a *workspace) chooseImport() {
 	if openFn == nil {
 		openFn = mygo.Dialog.Open
 	}
-	importFn := a.importFileFn
-	if importFn == nil {
-		importFn = a.store.Import
-	}
 	a.work(func() func() {
 		filters := []mygo.FileFilter{{Name: "MarginNote / PDF", Extensions: []string{"marginpkg", "marginnotes", "pdf"}}}
 		if runtime.GOOS == "android" {
@@ -953,21 +1009,15 @@ func (a *workspace) chooseImport() {
 			Parent: win, Title: "导入笔记或 PDF",
 			Filters: filters,
 		})
-		var result notebook.ImportResult
-		if err == nil && len(paths) > 0 {
-			defer cleanupAndroidPickedFiles(paths...)
-			a.updateUI(func() { a.showProgress(importingNotebookMessage) })
-			result, err = importFn(paths[0])
+		if err != nil {
+			return func() { a.showError(err) }
 		}
-		return func() {
-			if err != nil {
-				a.showError(err)
-			} else if len(paths) > 0 {
-				a.applyImport(result)
-			} else {
-				a.clearPendingMessage()
-			}
+		if len(paths) == 0 {
+			return a.clearPendingMessage
 		}
+		defer cleanupAndroidPickedFiles(paths...)
+		a.updateUI(func() { a.showProgress(importingNotebookMessage) })
+		return a.importPath(paths[0])
 	})
 }
 
@@ -982,10 +1032,6 @@ func (a *workspace) flushImports() {
 		return
 	}
 	if item, ok := a.popImport(); ok {
-		importFn := a.importFileFn
-		if importFn == nil {
-			importFn = a.store.Import
-		}
 		a.showProgress(importingNotebookMessage)
 		a.work(func() func() {
 			defer func() {
@@ -996,14 +1042,7 @@ func (a *workspace) flushImports() {
 					cleanupAndroidPickedFiles(item.path)
 				}
 			}()
-			r, err := importFn(item.path)
-			return func() {
-				if err != nil {
-					a.showError(err)
-				} else {
-					a.applyImport(r)
-				}
-			}
+			return a.importPath(item.path)
 		})
 		return
 	}

@@ -2110,7 +2110,7 @@ func TestImportLiveStatusBannerDuringAndAfterImport(t *testing.T) {
 	// does not expire prematurely during long imports, and updates cleanly on finish.
 	started := make(chan struct{})
 	release := make(chan struct{})
-	app.importFileFn = func(path string) (notebook.ImportResult, error) {
+	app.importFileFn = func(path string, _ func(notebook.ImportResult)) (notebook.ImportResult, error) {
 		close(started)
 		<-release
 		return notebook.ImportResult{Library: lib, BookID: book.ID, Added: 1}, nil
@@ -2178,7 +2178,7 @@ func TestImportLiveStatusBannerDuringAndAfterImport(t *testing.T) {
 	app.openImportDialogFn = func(opts mygo.OpenDialogOptions) ([]string, error) {
 		return []string{"/synthetic/corrupt.marginpkg"}, nil
 	}
-	app.importFileFn = func(path string) (notebook.ImportResult, error) {
+	app.importFileFn = func(path string, _ func(notebook.ImportResult)) (notebook.ImportResult, error) {
 		close(pickStarted)
 		<-pickRelease
 		return notebook.ImportResult{}, errors.New("无法解析笔记包")
@@ -2206,6 +2206,89 @@ func TestImportLiveStatusBannerDuringAndAfterImport(t *testing.T) {
 	}
 	if tester.HasText(importingNotebookMessage) || !tester.HasText("无法解析笔记包") {
 		t.Fatalf("expected error message to replace progress banner; texts=%v", tester.Texts())
+	}
+}
+
+func TestImportShowsReadableCardsBeforeAttachments(t *testing.T) {
+	oldBook := notebook.Book{ID: "old", Title: "已有笔记", Roots: []string{"old-note"},
+		Notes: []notebook.Note{{ID: "old-note", Title: "原有卡片", Body: "原有正文"}}}
+	textBook := notebook.Book{ID: "incoming", Title: "新笔记", Roots: []string{"first", "second", "media"},
+		Notes: []notebook.Note{
+			{ID: "first", Title: "第一张卡片", Body: "第一段正文"},
+			{ID: "second", Title: "第二张卡片", Body: "第二段正文"},
+			{ID: "media", PendingMedia: true},
+		}}
+	completeBook := textBook
+	completeBook.Notes = slices.Clone(textBook.Notes)
+	completeBook.Notes[1].Clip = "attachment.png"
+	completeBook.Notes[2] = notebook.Note{ID: "media", Clip: "attachment.png"}
+	completeBook.Documents = []notebook.Document{{ID: "source-pdf"}}
+
+	for _, fail := range []bool{false, true} {
+		name := "finish"
+		if fail {
+			name = "attachment failure"
+		}
+		t.Run(name, func(t *testing.T) {
+			app := &workspace{store: notebook.NewStore(t.TempDir())}
+			app.settings.SidebarCollapsed = true
+			app.setLibrary(notebook.Library{Books: []notebook.Book{oldBook}}, oldBook.ID)
+			uiCh := make(chan func(), 3)
+			app.postUI = func(fn func()) { uiCh <- fn }
+			nextUI := func() {
+				t.Helper()
+				select {
+				case fn := <-uiCh:
+					fn()
+				case <-time.After(2 * time.Second):
+					t.Fatal("timed out waiting for import update")
+				}
+			}
+			release := make(chan struct{}, 1)
+			defer close(release)
+			app.importFileFn = func(_ string, publish func(notebook.ImportResult)) (notebook.ImportResult, error) {
+				publish(notebook.ImportResult{BookID: textBook.ID, Library: notebook.Library{Books: []notebook.Book{oldBook, textBook}}})
+				<-release
+				if fail {
+					return notebook.ImportResult{}, errors.New("无法保存笔记附件")
+				}
+				return notebook.ImportResult{BookID: completeBook.ID, Added: 1,
+					Library: notebook.Library{Books: []notebook.Book{oldBook, completeBook}}}, nil
+			}
+
+			app.enqueueImport("/synthetic/new.marginpkg")
+			nextUI()
+			nextUI()
+			tester := ui.NewTester(app.view, 1280, 800)
+			tester.Frame()
+			if !app.busy || !tester.HasText(importingAttachmentsMessage) || !tester.HasText("第二段正文") {
+				t.Fatalf("expected readable card while importing attachments; texts=%v", tester.Texts())
+			}
+			if !slices.Contains(app.visibleKids(app.tree.root), "media") {
+				t.Fatal("a card containing only media disappeared from the preview")
+			}
+			if err := tester.Click("第二张卡片"); err != nil {
+				t.Fatal(err)
+			}
+			if err := tester.Click("详情"); err != nil {
+				t.Fatal(err)
+			}
+			if app.page != detail || app.selected != "second" {
+				t.Fatalf("could not open card detail before attachment import: page=%v selected=%q", app.page, app.selected)
+			}
+
+			release <- struct{}{}
+			nextUI()
+			tester.Frame()
+			if fail {
+				if app.bookID != oldBook.ID || len(app.books) != 1 || !tester.HasText("无法保存笔记附件") {
+					t.Fatalf("failed import did not restore the original library: book=%q message=%q", app.bookID, app.message)
+				}
+			} else if app.page != detail || app.selected != "second" || app.tree.notes["second"].Clip != "attachment.png" ||
+				app.pdf.document != "source-pdf" || app.busy || app.messagePending {
+				t.Fatalf("finished import did not update attachments in place: book=%q selected=%q page=%v", app.bookID, app.selected, app.page)
+			}
+		})
 	}
 }
 

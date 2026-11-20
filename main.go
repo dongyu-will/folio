@@ -57,20 +57,13 @@ func main() {
 			}
 		}
 	}
-	var initialBook string
+	app := &workspace{store: store}
 	for _, path := range os.Args[1:] {
-		if strings.HasPrefix(path, "-") {
-			continue
+		if !strings.HasPrefix(path, "-") {
+			app.enqueueImport(path)
 		}
-		result, err := store.Import(path)
-		if err != nil {
-			log.Print(err)
-			continue
-		}
-		initialBook = result.BookID
 	}
 
-	app := &workspace{store: store}
 	mygo.App.OnQuit(func() {
 		if err := app.drawingWrites.flush(store); err != nil {
 			log.Print(err)
@@ -85,7 +78,7 @@ func main() {
 	if err != nil {
 		app.showError(err)
 	}
-	app.setLibrary(library, initialBook)
+	app.setLibrary(library, "")
 	if runtime.GOOS == "android" {
 		app.androidFramePending.Store(true)
 		mygo.Native(androidopen.PluginID).On("stylus", app.onAndroidStylus)

@@ -461,8 +461,12 @@ func (m *mediaImport) attach(n *Note, clipData, noteData []byte) bool {
 }
 
 func (m *mediaImport) attachParsed(n *Note, clip map[string]any, blocks []any) bool {
+	return attachNoteContent(n, clip, blocks, m.savePicture)
+}
+
+func attachNoteContent(n *Note, clip map[string]any, blocks []any, picture func(map[string]any) string) bool {
 	if clip != nil {
-		n.Clip = m.savePicture(clip)
+		n.Clip = picture(clip)
 		extractHighlightRects(n, clip)
 	}
 	var content []ContentBlock
@@ -514,7 +518,7 @@ func (m *mediaImport) attachParsed(n *Note, clip map[string]any, blocks []any) b
 			}
 			var mergedImg string
 			if qpic, ok := block["q_hpic"].(map[string]any); ok {
-				mergedImg = m.savePicture(qpic)
+				mergedImg = picture(qpic)
 				extractHighlightRects(n, qpic)
 				if mergedImg != "" {
 					content = append(content, ContentBlock{Image: mergedImg})
@@ -529,13 +533,13 @@ func (m *mediaImport) attachParsed(n *Note, clip map[string]any, blocks []any) b
 			}
 		case "PaintNote", "PicNote", "ImageNote", "MergedImageNote":
 			sawOther = true
-			if file := m.savePicture(block); file != "" {
+			if file := picture(block); file != "" {
 				content = append(content, ContentBlock{Image: file})
 				hasImage = true
 			}
 		case "SketchNote":
 			sawSketch = true
-			if file := m.savePicture(block); file != "" {
+			if file := picture(block); file != "" {
 				content = append(content, ContentBlock{Image: file})
 				hasImage = true
 			}

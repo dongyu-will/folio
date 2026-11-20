@@ -71,6 +71,7 @@ type Note struct {
 	Links          []string        `json:"links,omitempty"`
 	TitleEdited    bool            `json:"titleEdited,omitempty"`
 	BodyEdited     bool            `json:"bodyEdited,omitempty"`
+	PendingMedia   bool            `json:"-"` // Used only by the temporary import preview.
 }
 
 type sourceNote struct {
@@ -96,10 +97,10 @@ type rawSourceNote struct {
 }
 
 func readMarginNote(path, ink string) ([]Book, map[string][]byte, *bookConfigIndex, error) {
-	return readMarginNoteWithSink(path, ink, nil)
+	return readMarginNoteWithSink(path, ink, nil, nil)
 }
 
-func readMarginNoteWithSink(path, ink string, sink mediaSink) ([]Book, map[string][]byte, *bookConfigIndex, error) {
+func readMarginNoteWithSink(path, ink string, sink mediaSink, preview func([]Book)) ([]Book, map[string][]byte, *bookConfigIndex, error) {
 	info, err := os.Stat(path)
 	if err != nil {
 		return nil, nil, nil, err
@@ -130,8 +131,15 @@ func readMarginNoteWithSink(path, ink string, sink mediaSink) ([]Book, map[strin
 		return nil, nil, nil, errors.New("解压后的笔记数据库超过 512 MB")
 	}
 
+	digest, source := hex.EncodeToString(hash.Sum(nil)), filepath.Base(path)
+	var showText func([]sourceTopic, []rawSourceNote)
+	if preview != nil {
+		showText = func(topics []sourceTopic, rawNotes []rawSourceNote) {
+			preview(previewBooks(topics, rawNotes, digest, source))
+		}
+	}
 	media := newMediaImport(ink, sink)
-	topics, rawNotes, configs, err := loadMarginSQLite(tempPath, media)
+	topics, rawNotes, configs, err := loadMarginSQLite(tempPath, media, showText)
 	// Remove the extracted SQLite temp file immediately after closing the DB
 	// so peak flash usage drops before ink rendering and PDF extraction.
 	_ = os.Remove(tempPath)
@@ -148,14 +156,14 @@ func readMarginNoteWithSink(path, ink string, sink mediaSink) ([]Book, map[strin
 		return nil, nil, nil, fmt.Errorf("无法保存笔记附件：%w", attachErr)
 	}
 
-	books := assembleBooks(topics, rawNotes, hex.EncodeToString(hash.Sum(nil)), filepath.Base(path), media.ink)
+	books := assembleBooks(topics, rawNotes, digest, source, mediaVersion(media.ink))
 	if len(books) == 0 {
 		return nil, nil, nil, errors.New("文件里没有可导入的笔记")
 	}
 	return books, pruneUnusedMedia(books, media.files), configs, nil
 }
 
-func loadMarginSQLite(tempPath string, media *mediaImport) ([]sourceTopic, []rawSourceNote, *bookConfigIndex, error) {
+func loadMarginSQLite(tempPath string, media *mediaImport, showText func([]sourceTopic, []rawSourceNote)) ([]sourceTopic, []rawSourceNote, *bookConfigIndex, error) {
 	uri := (&url.URL{Scheme: "file", Path: filepath.ToSlash(tempPath)}).String()
 	db, err := sql.Open("sqlite", uri+"?mode=ro&immutable=1&_pragma=trusted_schema(OFF)")
 	if err != nil {
@@ -191,10 +199,42 @@ func loadMarginSQLite(tempPath string, media *mediaImport) ([]sourceTopic, []raw
 		plan.addParsedNote(rawNotes[i].clip, rawNotes[i].blocks)
 	}
 
+	if showText != nil {
+		showText(topics, rawNotes)
+	}
 	if err := readMediaFiltered(ctx, db, media, plan); err != nil {
 		return nil, nil, nil, fmt.Errorf("无法读取笔记附件：%w", err)
 	}
 	return topics, rawNotes, configs, nil
+}
+
+func previewBooks(topics []sourceTopic, rawNotes []rawSourceNote, digest, source string) []Book {
+	notes := make([]rawSourceNote, len(rawNotes))
+	for i, raw := range rawNotes {
+		n := raw.note
+		n.sketchOrDummyOnly = attachNoteContent(&n.Note, raw.clip, raw.blocks, func(pic map[string]any) string {
+			n.PendingMedia = n.PendingMedia || hasPictureData(pic)
+			return ""
+		}) && !hasPictureData(raw.clip)
+		notes[i].note = n
+	}
+	return assembleBooks(topics, notes, digest, source, 0)
+}
+
+func hasPictureData(pic map[string]any) bool {
+	for _, field := range []string{"drawing", "paint", "img", "pic"} {
+		switch value := pic[field].(type) {
+		case string:
+			if value != "" {
+				return true
+			}
+		case []byte:
+			if len(value) > 0 {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func importRenderWorkers() int {
@@ -565,7 +605,7 @@ func readTopics(ctx context.Context, db *sql.DB) ([]sourceTopic, error) {
 	return topics, rows.Err()
 }
 
-func assembleBooks(topics []sourceTopic, rawNotes []rawSourceNote, digest, source, ink string) []Book {
+func assembleBooks(topics []sourceTopic, rawNotes []rawSourceNote, digest, source string, version int) []Book {
 	notes := make(map[string][]sourceNote)
 	var topicOrder []string
 	for i := range rawNotes {
@@ -588,7 +628,7 @@ func assembleBooks(topics []sourceTopic, rawNotes []rawSourceNote, digest, sourc
 		if title == "" {
 			title = strings.TrimSuffix(source, filepath.Ext(source))
 		}
-		book := Book{ID: digest + "/" + t.id, Title: title, Source: source, MediaVersion: mediaVersion(ink)}
+		book := Book{ID: digest + "/" + t.id, Title: title, Source: source, MediaVersion: version}
 		book.Notes, book.Roots = connectNotes(list, topicRoots)
 		books = append(books, book)
 	}
@@ -602,7 +642,7 @@ func assembleBooks(topics []sourceTopic, rawNotes []rawSourceNote, digest, sourc
 		}
 		orphans = filterSourceNotes(orphans)
 		if len(orphans) > 0 {
-			book := Book{ID: digest, Title: strings.TrimSuffix(source, filepath.Ext(source)), Source: source, MediaVersion: mediaVersion(ink)}
+			book := Book{ID: digest, Title: strings.TrimSuffix(source, filepath.Ext(source)), Source: source, MediaVersion: version}
 			book.Notes, book.Roots = connectNotes(orphans, nil)
 			books = append(books, book)
 		}
@@ -681,7 +721,7 @@ func filterSourceNotes(list []sourceNote) []sourceNote {
 		hasChildren := len(n.Children) > 0 || isGroupParent[n.ID]
 		hasText := strings.TrimSpace(n.Title) != "" || strings.TrimSpace(n.Body) != "" || strings.TrimSpace(n.Excerpt) != ""
 		// Drop completely empty ghost notes (e.g. MarginNote tombstones / DummyNotes).
-		if !hasText && n.Clip == "" && len(n.Blocks) == 0 && len(n.Links) == 0 && len(n.HighlightRects) == 0 && !hasChildren {
+		if !hasText && n.Clip == "" && !n.PendingMedia && len(n.Blocks) == 0 && len(n.Links) == 0 && len(n.HighlightRects) == 0 && !hasChildren {
 			continue
 		}
 		// Drop canvas-level untitled ZTYPE==4 SketchNote/DummyNote overlays (ZZINDEX < 0).
