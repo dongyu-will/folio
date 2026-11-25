@@ -115,12 +115,12 @@ func (a *workspace) outlineView(c *ui.Context, p palette, width, height float32)
 		}
 
 		for _, item := range items {
-			a.outlineCard(c.Key("outline-"+item.id), p, item, streamW)
+			a.outlineCard(c.Key("outline-"+item.id), p, item, streamW, len(items) <= 60)
 		}
 	})
 }
 
-func (a *workspace) outlineCard(c *ui.Context, p palette, item outlineItem, streamW float32) {
+func (a *workspace) outlineCard(c *ui.Context, p palette, item outlineItem, streamW float32, animateRow bool) {
 	n := a.tree.notes[item.id]
 	title := noteTitle(n)
 	rawTitle := strings.TrimSpace(n.Title)
@@ -134,7 +134,11 @@ func (a *workspace) outlineCard(c *ui.Context, p palette, item outlineItem, stre
 	expanded := a.expanded != nil && a.expanded[item.id]
 	hasBody := bodyText != "" || len(imgs) > 0 || len(n.Tags) > 0
 
-	ui.Row(c).Width(streamW).Shrink(0).Padding(0, 0, 0, indent).Gap(8).AlignItems(ui.Stretch).Children(func() {
+	outer := ui.Row(c).Width(streamW).Shrink(0).Padding(0, 0, 0, indent).Gap(8).AlignItems(ui.Stretch)
+	if animateRow {
+		outer.Transition(trPanelSlideV)
+	}
+	outer.Children(func() {
 		if item.depth > 0 {
 			railColor := ct.accent.Alpha(.45)
 			if !ct.tinted {
@@ -143,7 +147,7 @@ func (a *workspace) outlineCard(c *ui.Context, p palette, item outlineItem, stre
 			if selected {
 				railColor = p.accent
 			}
-			ui.Box(c).Width(2.5).Radius(1.5).Background(railColor).Margin(6, 0).Shrink(0)
+			ui.Box(c).Width(2.5).Radius(1.5).Background(railColor).Margin(6, 0).Shrink(0).Transition(trColorMicro)
 		}
 
 		border := ct.border
@@ -155,7 +159,7 @@ func (a *workspace) outlineCard(c *ui.Context, p palette, item outlineItem, stre
 			cardBg = ct.headerBg
 		}
 		cardW := max(180, streamW-indent-10)
-		card := ui.Column(c).Grow(1).MinWidth(0).Radius(12).Clip().Background(cardBg).Border(1.2, border)
+		card := ui.Column(c).Grow(1).MinWidth(0).Radius(12).Clip().Background(cardBg).Border(1.2, border).Transition(trColorMicro)
 		if selected {
 			card.Shadow(0, 0, 0, .85, p.accent).Shadow(0, 3, 10, -2, p.accent.Alpha(.18))
 		} else {
@@ -170,24 +174,22 @@ func (a *workspace) outlineCard(c *ui.Context, p palette, item outlineItem, stre
 			ui.Row(c).FillWidth().AlignItems(ui.Center).Background(headerBg).
 				Padding(9, 12, 9, 10).Gap(6).Children(func() {
 				if hasKids {
-					icon := icChevronRight
-					if expanded {
-						icon = icChevronDown
-					}
 					foldSz := float32(24)
 					if a.touchUI() {
 						foldSz = 34
 					}
 					foldBtn := ui.ButtonBase(c.Key("fold-"+item.id)).Size(foldSz, foldSz).Radius(6).Center().
-						Label("展开或折叠" + title).Disabled(a.editing()).
+						Label("展开或折叠" + title).Disabled(a.editing()).Transition(trColorMicro).
 						OnClick(func() { a.toggleBranch(item.id) })
 					if foldBtn.Pressed() {
 						foldBtn.Background(p.pressed)
 					} else if foldBtn.Hovered() {
 						foldBtn.Background(p.hover)
 					}
+					applyPressPose(foldBtn, foldBtn.Pressed(), a.editing())
 					foldBtn.Children(func() {
-						ui.Icon(c, icon).Size(13, 13).TextColor(ct.headerInk.Alpha(.75))
+						ic := ui.Icon(c.Key("chevron"), icChevronRight).Size(13, 13).TextColor(ct.headerInk.Alpha(.75))
+						applyChevronPose(ic, expanded)
 					})
 				} else if ct.tinted {
 					ui.Box(c).Size(7, 7).Radius(99).Background(ct.accent).Margin(0, 2, 0, 4).Shrink(0)
@@ -218,7 +220,7 @@ func (a *workspace) outlineCard(c *ui.Context, p palette, item outlineItem, stre
 						}
 						pageBtn := ui.ButtonBase(c.Key("opage-"+item.id)).Height(pageBtnH).Padding(0, 10).Radius(99).
 							Center().Shrink(0).Label(pageLabel + " ↗").Disabled(a.editing()).
-							FocusRingColor(p.accent).OnClick(func() { a.jumpToNotePDF(n) })
+							FocusRingColor(p.accent).Transition(trColorMicro).OnClick(func() { a.jumpToNotePDF(n) })
 						bg, bdr, fg := p.tint, p.tintBorder, p.accent
 						if !a.editing() {
 							if pageBtn.Pressed() {
@@ -227,6 +229,7 @@ func (a *workspace) outlineCard(c *ui.Context, p palette, item outlineItem, stre
 								bg = p.hover
 							}
 						}
+						applyPressPose(pageBtn, pageBtn.Pressed(), a.editing())
 						pageBtn.Background(bg).Border(1, bdr).Children(func() {
 							ui.Text(c, pageLabel+" ↗").FontSize(11).FontWeight(600).
 								FontFeatures("tnum").TextColor(fg).SingleLine()
@@ -269,20 +272,22 @@ func (a *workspace) outlineCard(c *ui.Context, p palette, item outlineItem, stre
 				if a.reciteMode && !a.revealedNotes[item.id] {
 					occlude := ui.ButtonBase(c.Key("orec-"+item.id)).FillWidth().Padding(14).
 						Center().Background(p.tint.Alpha(.7)).Label("点击揭晓内容").
+						Transition(trCrossfade).
 						OnClick(func() {
 							a.setNoteRevealed(item.id, true)
 							hapticLight()
 						})
+					applyPressPose(occlude, occlude.Pressed(), false)
 					occlude.Children(func() {
 						ui.Text(c, "点击揭晓内容").FontSize(12.5).FontWeight(600).TextColor(p.accent)
 					})
 					return
 				}
 				imgMaxW := max(140, cardW-44)
-				ui.Column(c).FillWidth().Padding(12, 16, 14).Gap(10).Children(func() {
+				ui.Column(c.Key("obody-"+item.id)).FillWidth().Padding(12, 16, 14).Gap(10).Transition(trCrossfade).Children(func() {
 					renderOutlineImg := func(ref string) bool {
-					iw, ih := a.imageDims(ref)
-					if iw <= 0 || ih <= 0 {
+						iw, ih := a.imageDims(ref)
+						if iw <= 0 || ih <= 0 {
 							return false
 						}
 						dispW := min(imgMaxW, float32(iw))
@@ -293,12 +298,13 @@ func (a *workspace) outlineCard(c *ui.Context, p palette, item outlineItem, stre
 						}
 						imgBtn := ui.ButtonBase(c.Key("oimg-"+ref)).AlignSelf(ui.Start).Radius(8).
 							Padding(8).Background(ui.Hex("#ffffff")).Border(1, ct.border.Alpha(.5)).
-							Label("放大"+title+"的附图").OnClick(func() { a.preview = ref })
+							Transition(trColorMicro).Label("放大"+title+"的附图").OnClick(func() { a.preview = ref })
 						if imgBtn.Pressed() {
 							imgBtn.Border(1, p.accent)
 						} else if imgBtn.Hovered() {
 							imgBtn.Border(1, p.accent.Alpha(.65))
 						}
+						applyPressPose(imgBtn, imgBtn.Pressed(), false)
 						imgBtn.Children(func() {
 						ui.Box(c).Size(dispW, dispH).Draw(func(p *ui.Painter, rect ui.Rect) {
 							a.paintMediaThumbnail(p, rect, ref)
@@ -367,7 +373,8 @@ func tagPillsRowAction(c *ui.Context, p palette, tags []string, onTag func(strin
 			if onTag != nil {
 				btn := ui.ButtonBase(c.Key(fmt.Sprintf("tag-%d", i))).Height(21).Padding(0, 8).Radius(99).
 					Center().Shrink(0).Background(p.tint).Border(1, p.tintBorder.Alpha(.7)).
-					Label(label).Tooltip("按标签筛选").OnClick(func() { onTag(clean) })
+					Transition(trColorMicro).Label(label).Tooltip("按标签筛选").OnClick(func() { onTag(clean) })
+				applyPressPose(btn, btn.Pressed(), false)
 				btn.Children(func() {
 					ui.Text(c, label).FontSize(11).FontWeight(550).TextColor(p.accent).SingleLine()
 				})

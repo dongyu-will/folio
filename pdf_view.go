@@ -70,6 +70,7 @@ type pdfState struct {
 	searchErr    string
 	searchSeq    uint64
 	searchScroll ui.ScrollState
+	now          time.Time
 }
 
 type pdfDisplay struct {
@@ -84,6 +85,7 @@ func (a *workspace) resetPDF(documents []notebook.Document) {
 		marginOpen: a.settings.PDFMarginOpen,
 		margin:     a.settings.PDFMargin,
 	}
+	a.maskFades.clear()
 	a.pdfHighlightNoteID = ""
 	a.pdfTOCOpen = false
 	a.mode = canvasMode
@@ -509,7 +511,8 @@ func (a *workspace) workspaceToolbar(c *ui.Context, p palette, width, barH float
 		if a.mode == canvasMode && a.scope != "" {
 			title = noteTitle(a.tree.notes[a.scope])
 		}
-		ui.Text(c, title).FontSize(14).FontWeight(650).TextColor(p.ink).SingleLine().Ellipsis("…").MinWidth(0).Shrink(1)
+		ui.Text(c, title).FontSize(14).FontWeight(650).TextColor(p.ink).SingleLine().Ellipsis("…").MinWidth(0).Shrink(1).
+			ContentTransition(ctText)
 		if !compact {
 			badgePill(c, p, fmt.Sprintf("%d 条笔记", len(a.tree.order)))
 		}
@@ -606,7 +609,7 @@ func (a *workspace) layoutSwitcher(c *ui.Context, p palette, btnSize float32) {
 	label := a.layoutLabel(mode)
 	b := ui.ButtonBase(c.Key("layout-switcher")).Height(btnSize).Padding(0, 10).Gap(5).
 		Center().Radius(8).Shrink(0).Background(p.elevated).Border(1, p.border).
-		Shadow(0, 1, 2, 0, p.shadowSoft).
+		Shadow(0, 1, 2, 0, p.shadowSoft).Transition(trColorMicro).
 		Label("视图样式：" + label).Tooltip("切换视图样式").Disabled(a.editing()).FocusRingColor(p.accent)
 	fg := p.ink
 	switch {
@@ -617,9 +620,10 @@ func (a *workspace) layoutSwitcher(c *ui.Context, p palette, btnSize float32) {
 	case b.Hovered():
 		b.Background(p.hover)
 	}
+	applyPressPose(b, b.Pressed(), a.editing())
 	b.Children(func() {
 		ui.Icon(c, icLayers).Size(13, 13).TextColor(p.accent).Shrink(0)
-		ui.Text(c, label).FontSize(12).FontWeight(550).TextColor(fg).SingleLine()
+		ui.Text(c, label).FontSize(12).FontWeight(550).TextColor(fg).SingleLine().ContentTransition(ctText)
 		ui.Icon(c, icChevronDown).Size(11, 11).TextColor(p.quiet).Shrink(0)
 	})
 	options := []segment[string]{
@@ -654,15 +658,27 @@ func (a *workspace) modeSegments(c *ui.Context, p palette, options []segment[wor
 		for _, opt := range options {
 			active := opt.value == selected
 			b := ui.ButtonBase(c.Key(opt.title)).Height(28).PaddingX(12).Radius(6).Center().
-				Shrink(0).Label(opt.title).Selected(active).OnClick(func() { change(opt.value) })
+				Shrink(0).Label(opt.title).Selected(active).Transition(trColorMicro).
+				OnClick(func() { change(opt.value) })
 			fg := p.quiet
 			if active {
-				b.Background(p.elevated).Border(1, p.border).Shadow(0, 1, 2, 0, p.shadowSoft)
+				fg = p.ink
+			} else if b.Pressed() {
+				b.Background(p.pressed)
 				fg = p.ink
 			} else if b.Hovered() {
 				b.Background(p.hover)
 			}
-			b.Children(func() { ui.Text(c, opt.title).FontSize(12.5).FontWeight(550).TextColor(fg).SingleLine() })
+			applyPressPose(b, b.Pressed(), false)
+			b.Children(func() {
+				if active {
+					ui.Box(c.Key("seg-pill-mode")).Absolute().Top(0).Bottom(0).Left(0).Right(0).
+						Radius(6).Background(p.elevated).Border(1, p.border).
+						Shadow(0, 1, 2, 0, p.shadowSoft).IgnoreInput(true).
+						Transition(trSegmentPill("workspace-mode"))
+				}
+				ui.Text(c, opt.title).FontSize(12.5).FontWeight(550).TextColor(fg).SingleLine()
+			})
 		}
 	})
 }
@@ -683,7 +699,7 @@ func (a *workspace) zoomControlWithLabels(c *ui.Context, p palette, scale float3
 		Shadow(0, 1, 2, 0, p.shadowSoft).Children(func() {
 		zoomBtn := func(key string, icon *ui.SVG, label string, onClick func()) {
 			b := ui.ButtonBase(c.Key(keyPrefix+key)).Size(btnSz, btnSz).Radius(6).Center().
-				Label(label).Tooltip(label).FocusRingColor(p.accent).OnClick(onClick)
+				Label(label).Tooltip(label).FocusRingColor(p.accent).Transition(trColorMicro).OnClick(onClick)
 			fg := p.secondary
 			if b.Pressed() {
 				b.Background(p.pressed)
@@ -692,6 +708,7 @@ func (a *workspace) zoomControlWithLabels(c *ui.Context, p palette, scale float3
 				b.Background(p.hover)
 				fg = p.ink
 			}
+			applyPressPose(b, b.Pressed(), false)
 			b.Children(func() {
 				ui.Icon(c, icon).Size(icSz, icSz).TextColor(fg)
 			})
@@ -700,7 +717,10 @@ func (a *workspace) zoomControlWithLabels(c *ui.Context, p palette, scale float3
 		zoomBtn("zoom-out", icMinus, "缩小"+suffix, func() { action(1 / 1.18) })
 		resetLabel := "重置为 100%" + suffix
 		pct := ui.ButtonBase(c.Key(keyPrefix+"zoom-reset")).Height(btnSz).MinWidth(pctW).PaddingX(5).Radius(6).Center().
-			Label(resetLabel).Tooltip(resetLabel).FocusRingColor(p.accent).OnClick(func() { action(-1) })
+			Label(resetLabel).Tooltip(resetLabel).FocusRingColor(p.accent).Transition(trColorMicro).OnClick(func() { action(-1) })
+		prevScale := ui.Local(pct, "prevScale", func() float32 { return scale })
+		down := scale < *prevScale
+		*prevScale = scale
 		pctColor := p.secondary
 		if pct.Pressed() {
 			pct.Background(p.pressed)
@@ -709,9 +729,10 @@ func (a *workspace) zoomControlWithLabels(c *ui.Context, p palette, scale float3
 			pct.Background(p.hover)
 			pctColor = p.ink
 		}
+		applyPressPose(pct, pct.Pressed(), false)
 		pct.Children(func() {
 			ui.Text(c, fmt.Sprintf("%d%%", int(scale*100+.5))).FontSize(fontSz).FontWeight(600).
-				FontFeatures("tnum").TextColor(pctColor).SingleLine()
+				FontFeatures("tnum").TextColor(pctColor).SingleLine().ContentTransition(ctNumeric(down))
 		})
 		zoomBtn("zoom-in", icPlus, "放大"+suffix, func() { action(1.18) })
 		ui.Box(c).Width(1).Height(14).Background(p.rule).Margin(0, 2)
@@ -728,7 +749,7 @@ func (a *workspace) splitGrip(c *ui.Context, p palette, width, left, gripSize fl
 	if a.touchUI() {
 		handleW, handleH = 4, 44
 	}
-	ui.Box(c.Key("split-grip")).Width(gripSize).FillHeight().Shrink(0).Center().
+	grip := ui.Box(c.Key("split-grip")).Width(gripSize).FillHeight().Shrink(0).Center().
 		Background(p.shell).Label("拖动调整分屏宽度").Role(ui.RoleSeparator).
 		Draggable(nil, ui.DraggableOptions{Axis: ui.Horizontal, Bounds: &ui.Rect{}, Rigid: true}).
 		HandleInput(func(ev ui.InputEvent) bool {
@@ -756,12 +777,20 @@ func (a *workspace) splitGrip(c *ui.Context, p palette, width, left, gripSize fl
 				}
 			}
 			return false
-		}).Children(func() {
+		})
+	grip.Children(func() {
 		col := p.border
+		pillScale := float32(1)
 		if a.splitDragging {
 			col = p.accent
+			pillScale = 1.35
+		} else if grip.Hovered() {
+			col = p.secondary
+			pillScale = 1.15
 		}
-		ui.Box(c).Width(handleW).Height(handleH).Radius(handleW / 2).Background(col)
+		ui.Box(c.Key("split-grip-pill")).Width(handleW).Height(handleH).Radius(handleW / 2).
+			Background(col).Transition(trColorMicro).
+			AnimatePose(ui.Pose{Scale: pillScale}, animControl)
 	})
 }
 
@@ -770,7 +799,7 @@ func (a *workspace) splitGripVertical(c *ui.Context, p palette, height, top, gri
 	minPane := min(float32(180), max(90, avail*.3))
 	minR, maxR := minPane/avail, max(minPane, avail-minPane)/avail
 	handleW, handleH := float32(44), float32(4)
-	ui.Box(c.Key("split-grip-v")).FillWidth().Height(gripSize).Shrink(0).Center().
+	grip := ui.Box(c.Key("split-grip-v")).FillWidth().Height(gripSize).Shrink(0).Center().
 		Background(p.shell).Label("拖动调整分屏高度").Role(ui.RoleSeparator).
 		Draggable(nil, ui.DraggableOptions{Axis: ui.Vertical, Bounds: &ui.Rect{}, Rigid: true}).
 		HandleInput(func(ev ui.InputEvent) bool {
@@ -798,12 +827,20 @@ func (a *workspace) splitGripVertical(c *ui.Context, p palette, height, top, gri
 				}
 			}
 			return false
-		}).Children(func() {
+		})
+	grip.Children(func() {
 		col := p.border
+		pillScale := float32(1)
 		if a.splitDragging {
 			col = p.accent
+			pillScale = 1.35
+		} else if grip.Hovered() {
+			col = p.secondary
+			pillScale = 1.15
 		}
-		ui.Box(c).Width(handleW).Height(handleH).Radius(handleH / 2).Background(col)
+		ui.Box(c.Key("split-grip-v-pill")).Width(handleW).Height(handleH).Radius(handleH / 2).
+			Background(col).Transition(trColorMicro).
+			AnimatePose(ui.Pose{Scale: pillScale}, animControl)
 	})
 }
 
@@ -1075,7 +1112,10 @@ func (a *workspace) pdfPane(c *ui.Context, p palette, width, height float32) {
 							})
 						})
 					} else {
-						ui.Text(c, "正在渲染 PDF…").TextColor(p.quiet).FontSize(13)
+						ui.Row(c).Gap(8).AlignItems(ui.Center).Children(func() {
+							ui.Spinner(c).Size(18, 18).TextColor(p.quiet)
+							ui.Text(c, "正在渲染 PDF…").TextColor(p.quiet).FontSize(13)
+						})
 					}
 				})
 			})
@@ -1096,7 +1136,7 @@ func (a *workspace) pdfNavigation(c *ui.Context, p palette, count int, navH, wid
 		if hasTOC {
 			tocBtn := ui.ButtonBase(c.Key("pdf-toc-btn")).Height(btnH).PaddingX(10).Radius(7).Center().
 				Gap(4).Shrink(0).Label("目录").Selected(a.pdfTOCOpen).FocusRingColor(p.accent).
-				OnClick(func() { a.pdfTOCOpen = !a.pdfTOCOpen })
+				Transition(trColorMicro).OnClick(func() { a.pdfTOCOpen = !a.pdfTOCOpen })
 			fg := p.secondary
 			if a.pdfTOCOpen {
 				tocBtn.Background(p.tint).Border(1, p.tintBorder)
@@ -1110,6 +1150,7 @@ func (a *workspace) pdfNavigation(c *ui.Context, p palette, count int, navH, wid
 			} else {
 				tocBtn.Background(p.elevated).Border(1, p.rule)
 			}
+			applyPressPose(tocBtn, tocBtn.Pressed(), false)
 			tocBtn.Children(func() {
 				ui.Icon(c, icLayers).Size(12.5, 12.5).TextColor(fg)
 				ui.Text(c, "目录").FontSize(12).FontWeight(550).TextColor(fg).SingleLine()
@@ -1119,7 +1160,8 @@ func (a *workspace) pdfNavigation(c *ui.Context, p palette, count int, navH, wid
 				panel.Width(tocW).MaxHeight(400).Radius(10).Clip().
 					Background(p.elevated).Border(1, p.border).
 					InsetShadow(0, 1, 0, 0, p.specular).
-					Shadow(0, 12, 32, -6, p.shadow)
+					Shadow(0, 12, 32, -6, p.shadow).
+					Transition(trPopover)
 				ui.Column(c).FillWidth().MaxHeight(400).Children(func() {
 					ui.Row(c).FillWidth().Height(36).PaddingX(12).AlignItems(ui.Center).
 						Background(p.shell).BorderColor(p.rule).BorderWidth(0, 0, 1, 0).Shrink(0).Children(func() {
@@ -1136,7 +1178,7 @@ func (a *workspace) pdfNavigation(c *ui.Context, p palette, count int, navH, wid
 							row := ui.ButtonBase(c.Key(fmt.Sprintf("toc-%d", idx))).
 								FillWidth().MinHeight(tocRowH).Padding(4, 8, 4, 8+indent).Gap(8).
 								Justify(ui.SpaceBetween).AlignItems(ui.Center).Radius(6).
-								Label(entry.Title).FocusRingColor(p.accent).
+								Label(entry.Title).FocusRingColor(p.accent).Transition(trColorMicro).
 								OnClick(func() {
 									if entry.Page > 0 {
 										a.setPDFPage(entry.Page - 1)
@@ -1160,6 +1202,7 @@ func (a *workspace) pdfNavigation(c *ui.Context, p palette, count int, navH, wid
 								row.Background(p.hover)
 								fg = p.ink
 							}
+							applyPressPose(row, row.Pressed(), false)
 							row.Children(func() {
 								ui.Text(c, entry.Title).FontSize(12.5).FontWeight(weight).
 									TextColor(fg).SingleLine().Ellipsis("…").Grow(1).MinWidth(0)
@@ -1212,9 +1255,12 @@ func (a *workspace) pdfNavigation(c *ui.Context, p palette, count int, navH, wid
 				a.setPDFPage(clamped - 1)
 			} else {
 				a.pdf.jumpPageText = pageNum
+				a.pdfPageShakeRun++
 			}
 		}
-		ui.Text(c, fmt.Sprintf("/ %d", count)).SingleLine().FontSize(inputFont).TextColor(p.quiet).Shrink(0)
+		applyErrorShake(field, a.pdfPageShakeRun)
+		ui.Text(c, fmt.Sprintf("/ %d", count)).SingleLine().FontSize(inputFont).TextColor(p.quiet).Shrink(0).
+			ContentTransition(ctNumeric(false))
 		designToolbarButton(c, p, icChevronRight, "下一页", navBtnSz, false, count == 0 || a.pdf.page+1 >= count, func() { a.setPDFPage(a.pdf.page + 1) })
 		ui.Box(c).Grow(1).MinWidth(0)
 		if width >= 300 {
@@ -1247,7 +1293,8 @@ func (a *workspace) pdfNavigation(c *ui.Context, p palette, count int, navH, wid
 }
 
 func (a *workspace) pdfSearchPanel(c *ui.Context, p palette, width float32) {
-	ui.Column(c).FillWidth().Shrink(0).Background(p.surface).BorderColor(p.rule).BorderWidth(0, 0, 1, 0).Children(func() {
+	ui.Column(c.Key("pdf-search-panel")).FillWidth().Shrink(0).Background(p.surface).
+		BorderColor(p.rule).BorderWidth(0, 0, 1, 0).Transition(trPanelSlideV).Children(func() {
 		ui.Row(c).Height(42).PaddingX(10).Gap(6).AlignItems(ui.Center).FillWidth().Children(func() {
 			field := ui.TextInput(c.Key("pdf-search-input"), &a.pdf.searchQuery).
 				Grow(1).MinWidth(80).Height(28).PaddingX(8).Radius(7).FontSize(12.5).
@@ -1259,11 +1306,16 @@ func (a *workspace) pdfSearchPanel(c *ui.Context, p palette, width float32) {
 			searchLabel := "搜索"
 			if a.pdf.searchBusy {
 				searchLabel = "搜索中…"
+				ui.Spinner(c).Size(13, 13).TextColor(p.accent)
 			}
 			pillButton(c, p, searchLabel, nil, false, a.pdf.searchBusy || strings.TrimSpace(a.pdf.searchQuery) == "", a.startPDFSearch).Height(26)
 			if len(a.pdf.searchHits) > 0 {
-				ui.Text(c, fmt.Sprintf("%d/%d", a.pdf.searchIndex+1, len(a.pdf.searchHits))).
+				hitCounter := ui.Text(c, fmt.Sprintf("%d/%d", a.pdf.searchIndex+1, len(a.pdf.searchHits))).
 					FontSize(11.5).TextColor(p.quiet).SingleLine().Shrink(0)
+				prevHit := ui.Local(hitCounter, "prevHit", func() int { return a.pdf.searchIndex })
+				down := a.pdf.searchIndex < *prevHit
+				*prevHit = a.pdf.searchIndex
+				hitCounter.ContentTransition(ctNumeric(down))
 				designToolbarButton(c, p, icChevronLeft, "上一处", 24, false, false, func() { a.jumpPDFSearchHit(a.pdf.searchIndex - 1) })
 				designToolbarButton(c, p, icChevronRight, "下一处", 24, false, false, func() { a.jumpPDFSearchHit(a.pdf.searchIndex + 1) })
 			}
@@ -1283,13 +1335,19 @@ func (a *workspace) pdfSearchPanel(c *ui.Context, p palette, width float32) {
 						break
 					}
 					active := idx == a.pdf.searchIndex
+					row := ui.ButtonBase(c.Key(fmt.Sprintf("pdf-hit-%d", idx))).
+						FillWidth().Height(28).PaddingX(8).Radius(6).Gap(8).AlignItems(ui.Center).
+						Transition(trColorMicro).OnClick(func() { a.jumpPDFSearchHit(idx) })
 					bg, border := p.canvas, p.rule
 					if active {
 						bg, border = p.selectedBg, p.accent.Alpha(.45)
+					} else if row.Pressed() {
+						bg = p.pressed
+					} else if row.Hovered() {
+						bg = p.hover
 					}
-					row := ui.ButtonBase(c.Key(fmt.Sprintf("pdf-hit-%d", idx))).
-						FillWidth().Height(28).PaddingX(8).Radius(6).Gap(8).AlignItems(ui.Center).
-						Background(bg).Border(1, border).OnClick(func() { a.jumpPDFSearchHit(idx) })
+					row.Background(bg).Border(1, border)
+					applyPressPose(row, row.Pressed(), false)
 					row.Children(func() {
 						ui.Text(c, fmt.Sprintf("P.%d", hit.Page+1)).FontSize(11).FontWeight(600).
 							TextColor(p.accent).SingleLine().Shrink(0)
@@ -1311,6 +1369,7 @@ func (a *workspace) pdfThumbRail(c *ui.Context, p palette, railW, railH float32,
 	ui.Scroll(c.Key("pdf-thumb-rail")).Width(railW).Height(railH).Shrink(0).
 		Background(p.surface).BorderColor(p.rule).BorderWidth(0, 1, 0, 0).
 		Padding(6, 6).Gap(itemGap).TrackScroll(&a.pdf.thumbScroll).Label("PDF 缩略图").
+		Transition(trPanelSlideH).
 		Children(func() {
 			start := max(0, int(a.pdf.thumbScroll.Y/stride)-2)
 			visibleCount := max(6, int(railH/stride)+4)
@@ -1324,14 +1383,20 @@ func (a *workspace) pdfThumbRail(c *ui.Context, p palette, railW, railH float32,
 				ref := pageRef{a.pdf.document, pageIdx}
 				thumb, ready := a.requestPDF(ref, pdfThumbnail, dark, 160)
 				active := pageIdx == a.pdf.page
+				cell := ui.ButtonBase(c.Key(fmt.Sprintf("thumb-%d", pageIdx))).
+					FillWidth().Height(itemH).Shrink(0).Padding(4).Radius(8).
+					Label(fmt.Sprintf("第 %d 页", pageIdx+1)).Transition(trColorMicro).
+					OnClick(func() { a.setPDFPage(pageIdx) })
 				border, bg := p.rule, p.canvas
 				if active {
 					border, bg = p.accent, p.selectedBg
+				} else if cell.Pressed() {
+					bg = p.pressed
+				} else if cell.Hovered() {
+					bg = p.hover
 				}
-				cell := ui.ButtonBase(c.Key(fmt.Sprintf("thumb-%d", pageIdx))).
-					FillWidth().Height(itemH).Shrink(0).Padding(4).Radius(8).
-					Background(bg).Border(1.5, border).Label(fmt.Sprintf("第 %d 页", pageIdx+1)).
-					OnClick(func() { a.setPDFPage(pageIdx) })
+				cell.Background(bg).Border(1.5, border)
+				applyPressPose(cell, cell.Pressed(), false)
 				cell.Children(func() {
 					ui.Column(c).Fill().Center().Gap(3).Children(func() {
 						ui.Box(c).Grow(1).MinHeight(0).FillWidth().Radius(5).Clip().
@@ -1362,6 +1427,7 @@ func (a *workspace) pdfThumbRail(c *ui.Context, p palette, railW, railH float32,
 
 func (a *workspace) pdfSheet(c *ui.Context, p palette, width, height float32, ref pageRef, page renderedPDFPage, pending bool) {
 	d := &a.pdf
+	d.now = c.Now()
 	image := page.light
 	paper, marginPaper := ui.Hex("#ffffff"), ui.Hex("#f6f7fb")
 	if p.dark && a.settings.PDFNight && page.night != nil {
@@ -1369,7 +1435,14 @@ func (a *workspace) pdfSheet(c *ui.Context, p palette, width, height float32, re
 		paper, marginPaper = ui.Hex("#181818"), p.elevated
 	}
 	aspect := page.aspectRatio()
-	ratio := d.marginRatio()
+	sheetHost := ui.Box(c.Key("pdf-sheet-host")).Grow(1).MinHeight(0).FillWidth().Clip()
+	targetRatio := d.marginRatio()
+	var ratio float32
+	if a.marginDragging || c.Instant() {
+		ratio = sheetHost.Jump("pdf-margin", targetRatio)
+	} else {
+		ratio = sheetHost.AnimateTo("pdf-margin", targetRatio, animLayout)
+	}
 	const pad = pdfPaperPadding
 	baseFit := pdfFitWidth(width, height, aspect, ratio)
 	paperW := baseFit * max(1, d.zoom)
@@ -1381,9 +1454,9 @@ func (a *workspace) pdfSheet(c *ui.Context, p palette, width, height float32, re
 	} else {
 		d.aspect = aspect
 		a.checkShape(c)
-		a.focusPDFSheet(ref, paperW, paperH)
+		a.focusPDFSheet(c, ref, paperW, paperH)
 	}
-	ui.Box(c).Grow(1).MinHeight(0).FillWidth().Clip().Children(func() {
+	sheetHost.Children(func() {
 		horizontalPadding := max(pad, (width-paperW-addedW)/2)
 		bottomPad := float32(70)
 		if a.touchUI() && a.mode == pdfMode {
@@ -1425,6 +1498,7 @@ func (a *workspace) pdfSheet(c *ui.Context, p palette, width, height float32, re
 						return true
 					case ev.Kind == ui.InputPointerDown:
 						d.lastZoomAt = time.Time{}
+						d.now = c.Now()
 						if ev.Button == 0 && a.drawing.tool == panTool && a.reciteMode && a.toggleMaskAt(ref.document, ref.page, ui.Rect{W: paperW, H: paperH}, ev.X, ev.Y) {
 							return true
 						}
@@ -1460,13 +1534,14 @@ func (a *workspace) pdfSheet(c *ui.Context, p palette, width, height float32, re
 				a.drawing.drawInk(paint, vis, p, key, rect.X, rect.Y, paperW, &a.drawing.pdf)
 				a.pdfHighlights(paint, p, original, ref, key)
 			})
-			if !pending && addedW > 0 {
+			if !pending && (addedW > 0 || d.marginOpen) {
 				marginGripW := float32(7)
 				if a.touchUI() {
 					marginGripW = 20
 				}
+				gripLeft := min(paperW-marginGripW/2, max(0, paperW+addedW-2-marginGripW))
 				sheet.Children(func() {
-					grip := ui.Box(c.Key("pdf-margin-grip")).Absolute().Top(0).Bottom(0).Left(paperW-marginGripW/2).Width(marginGripW).
+					grip := ui.Box(c.Key("pdf-margin-grip")).Absolute().Top(0).Bottom(0).Left(gripLeft).Width(marginGripW).
 						Center().
 						Label("拖动调整留白宽度").Role(ui.RoleSeparator).
 						Draggable(nil, ui.DraggableOptions{Axis: ui.Horizontal, Bounds: &ui.Rect{}, Rigid: true}).
@@ -1503,13 +1578,20 @@ func (a *workspace) pdfSheet(c *ui.Context, p palette, width, height float32, re
 							}
 							return true
 						})
-					if a.touchUI() {
+					if a.touchUI() || a.marginDragging || grip.Hovered() {
 						grip.Children(func() {
 							col := p.border
+							pillScale := float32(1)
 							if a.marginDragging {
 								col = p.accent
+								pillScale = 1.35
+							} else if grip.Hovered() {
+								col = p.secondary
+								pillScale = 1.15
 							}
-							ui.Box(c).Width(3.5).Height(36).Radius(2).Background(col)
+							ui.Box(c.Key("pdf-margin-grip-pill")).Width(3.5).Height(36).Radius(2).
+								Background(col).Transition(trColorMicro).
+								AnimatePose(ui.Pose{Scale: pillScale}, animControl)
 						})
 					}
 				})
@@ -1528,9 +1610,13 @@ func (a *workspace) pdfSheet(c *ui.Context, p palette, width, height float32, re
 			})
 		}
 		if pending {
-			ui.Row(c.Key("pdf-loading")).Absolute().Top(8).Left(0).Right(0).Center().ZIndex(3).IgnoreInput(true).Children(func() {
-				ui.Text(c, fmt.Sprintf("正在加载第 %d 页…", d.page+1)).Padding(6, 12).Radius(12).
-					Background(p.elevated).Border(1, p.rule).TextColor(p.secondary).FontSize(12)
+			ui.Row(c.Key("pdf-loading")).Absolute().Top(8).Left(0).Right(0).Center().ZIndex(3).IgnoreInput(true).
+				Transition(trFloatingBarStatic).Children(func() {
+				ui.Row(c).Padding(6, 12).Radius(12).Gap(6).AlignItems(ui.Center).
+					Background(p.elevated).Border(1, p.rule).Shadow(0, 2, 8, -2, p.shadowSoft).Children(func() {
+					ui.Spinner(c).Size(13, 13).TextColor(p.secondary)
+					ui.Text(c, fmt.Sprintf("正在加载第 %d 页…", d.page+1)).TextColor(p.secondary).FontSize(12)
+				})
 			})
 		} else if a.pdfHighlightNoteID != "" {
 			if hlNote, ok := a.tree.notes[a.pdfHighlightNoteID]; ok && noteHasPageHighlight(hlNote, ref.page+1) {
@@ -1542,15 +1628,19 @@ func (a *workspace) pdfSheet(c *ui.Context, p palette, width, height float32, re
 					Height(clearH).Padding(0, 10).Radius(99).AlignItems(ui.Center).Gap(5).
 					Background(p.elevated).Border(1, p.tintBorder).
 					Shadow(0, 2, 8, -2, p.shadowSoft).
+					Transition(trFloatingBarStatic).
 					Label("清除高亮定位").FocusRingColor(p.accent).
 					OnClick(func() {
 						a.pdfHighlightNoteID = ""
 						d.focusedHighlightNoteID = ""
 						d.highlight = nil
 					})
-				if clearBtn.Hovered() {
+				if clearBtn.Pressed() {
+					clearBtn.Background(p.pressed)
+				} else if clearBtn.Hovered() {
 					clearBtn.Background(p.tint)
 				}
+				applyPressPose(clearBtn, clearBtn.Pressed(), false)
 				clearBtn.Children(func() {
 					ui.Box(c).Size(6.5, 6.5).Radius(99).Background(p.accent).Shrink(0)
 					ui.Text(c, noteTitle(hlNote)).FontSize(11).FontWeight(550).
@@ -1562,8 +1652,16 @@ func (a *workspace) pdfSheet(c *ui.Context, p palette, width, height float32, re
 	})
 }
 
-func (a *workspace) focusPDFSheet(ref pageRef, paperW, paperH float32) {
+func (a *workspace) focusPDFSheet(c *ui.Context, ref pageRef, paperW, paperH float32) {
 	d := &a.pdf
+	scrollTo := func(tx, ty float32) {
+		if !c.Instant() && (d.scroll.MaxX > 0 || d.scroll.MaxY > 0) {
+			d.scroll.ScrollTo(tx, ty, animCamera)
+		} else {
+			d.scroll.X = tx
+			d.scroll.Y = ty
+		}
+	}
 	if a.pdfHighlightNoteID == "" {
 		d.focusedHighlightNoteID = ""
 		d.highlightSelectedAt = ""
@@ -1583,8 +1681,7 @@ func (a *workspace) focusPDFSheet(ref pageRef, paperW, paperH float32) {
 				for _, hr := range hlNote.HighlightRects {
 					if hr.Page == ref.page+1 {
 						if r, valid := a.mapHighlightRect(hr, unit, ref.document); valid {
-							d.scroll.X = max(0, r.X-32)
-							d.scroll.Y = max(0, r.Y-48)
+							scrollTo(max(0, r.X-32), max(0, r.Y-48))
 							break
 						}
 					}
@@ -1594,8 +1691,7 @@ func (a *workspace) focusPDFSheet(ref pageRef, paperW, paperH float32) {
 	}
 	if d.focusHighlight && d.highlight != nil {
 		h := d.highlight
-		d.scroll.X = max(0, h.X*paperW-32)
-		d.scroll.Y = max(0, h.Y*paperH-40)
+		scrollTo(max(0, h.X*paperW-32), max(0, h.Y*paperH-40))
 		d.focusHighlight = false
 	}
 }
@@ -1780,6 +1876,9 @@ func (a *workspace) toggleMaskAt(docID string, pageZeroBased int, original ui.Re
 			if x >= r.X && x <= r.X+r.W && y >= r.Y && y <= r.Y+r.H {
 				key := fmt.Sprintf("%s:%d:%d", n.ID, mr.Page, mi)
 				a.setMaskRevealed(key, !a.revealedMasks[key])
+				if !a.pdf.now.IsZero() {
+					a.maskFades.start(key, a.pdf.now)
+				}
 				hapticLight()
 				return true
 			}
@@ -1821,14 +1920,37 @@ func (a *workspace) pdfHighlights(paint *ui.Painter, p palette, original ui.Rect
 					continue
 				}
 				maskKey := fmt.Sprintf("%s:%d:%d", n.ID, mr.Page, mi)
-				if a.revealedMasks[maskKey] {
+				revealed := a.revealedMasks[maskKey]
+				prog, active := a.maskFades.progress(maskKey, paint.Now(), animFade.Duration)
+				if active {
+					paint.AnimationFrame()
+				}
+				fillAlpha := float32(1)
+				if revealed {
+					fillAlpha = 1 + (0.12-1)*prog
+				} else if active {
+					fillAlpha = 0.12 + (1-0.12)*prog
+				}
+				if revealed && !active {
 					paint.Fill(r, amber.Alpha(.12), 4)
 					paint.StrokePath(rectPath(r).Dash(0, 4, 3), 1.25, amber.Alpha(.7))
-				} else {
+				} else if !revealed && !active {
 					paint.Fill(r, amber, 4)
 					paint.StrokePath(rectPath(r), 1.25, amber.Alpha(.9))
 					if r.W >= 54 && r.H >= 18 {
 						paint.Text(r.X+6, r.Y+4, "点击揭晓", 10, ui.Hex("#ffffff"))
+					}
+				} else {
+					paint.Fill(r, amber.Alpha(fillAlpha), 4)
+					t := (fillAlpha - 0.12) / (1 - 0.12)
+					borderAlpha := float32(0.7) + (0.9-0.7)*t
+					if revealed {
+						paint.StrokePath(rectPath(r).Dash(0, 4, 3), 1.25, amber.Alpha(borderAlpha))
+					} else {
+						paint.StrokePath(rectPath(r), 1.25, amber.Alpha(borderAlpha))
+					}
+					if r.W >= 54 && r.H >= 18 && t > 0.05 {
+						paint.Text(r.X+6, r.Y+4, "点击揭晓", 10, ui.Hex("#ffffff").Alpha(t))
 					}
 				}
 			}

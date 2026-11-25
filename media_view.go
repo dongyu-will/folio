@@ -6,7 +6,9 @@ import (
 	_ "image/gif"
 	_ "image/jpeg"
 	_ "image/png"
+	"math"
 	"os"
+	"time"
 
 	"github.com/egoist/mygo/ui"
 )
@@ -21,9 +23,10 @@ type mediaThumbnailKey struct {
 }
 
 type mediaThumbnailEntry struct {
-	key    mediaThumbnailKey
-	bitmap *ui.Bitmap
-	size   int64
+	key       mediaThumbnailKey
+	bitmap    *ui.Bitmap
+	size      int64
+	decodedAt time.Time
 }
 
 type mediaThumbnailCache struct {
@@ -32,16 +35,28 @@ type mediaThumbnailCache struct {
 	bytes   int64
 }
 
-func (c *mediaThumbnailCache) get(key mediaThumbnailKey) (*ui.Bitmap, bool) {
+func (c *mediaThumbnailCache) getEntry(key mediaThumbnailKey) (mediaThumbnailEntry, bool) {
 	entry := c.entries[key]
 	if entry == nil {
-		return nil, false
+		return mediaThumbnailEntry{}, false
 	}
 	c.recent.MoveToFront(entry)
-	return entry.Value.(mediaThumbnailEntry).bitmap, true
+	return entry.Value.(mediaThumbnailEntry), true
+}
+
+func (c *mediaThumbnailCache) get(key mediaThumbnailKey) (*ui.Bitmap, bool) {
+	e, ok := c.getEntry(key)
+	if !ok {
+		return nil, false
+	}
+	return e.bitmap, true
 }
 
 func (c *mediaThumbnailCache) put(key mediaThumbnailKey, bitmap *ui.Bitmap, budget int64) {
+	c.putWithTime(key, bitmap, budget, time.Time{})
+}
+
+func (c *mediaThumbnailCache) putWithTime(key mediaThumbnailKey, bitmap *ui.Bitmap, budget int64, decodedAt time.Time) {
 	// Bound failed entries too, so missing images do not restart background work
 	// on every frame or grow the cache without limit.
 	size := int64(128 + len(key.ref))
@@ -58,7 +73,7 @@ func (c *mediaThumbnailCache) put(key mediaThumbnailKey, bitmap *ui.Bitmap, budg
 	if c.entries == nil {
 		c.entries = make(map[mediaThumbnailKey]*list.Element)
 	}
-	c.entries[key] = c.recent.PushFront(mediaThumbnailEntry{key, bitmap, size})
+	c.entries[key] = c.recent.PushFront(mediaThumbnailEntry{key, bitmap, size, decodedAt})
 	c.bytes += size
 	for c.bytes > budget {
 		c.remove(c.recent.Back())
@@ -128,8 +143,26 @@ func (a *workspace) paintMediaThumbnail(p *ui.Painter, rect ui.Rect, ref string)
 	pixels := max(rect.W, rect.H) * p.Scale()
 	for i, side := range mediaThumbnailSizes {
 		if pixels <= float32(side) || i == len(mediaThumbnailSizes)-1 {
-			bitmap, settled := a.mediaThumbnailState(ref, i)
+			bitmap, decodedAt, settled := a.mediaThumbnailState(ref, i)
 			if bitmap != nil {
+				if !decodedAt.IsZero() {
+					fadeDur := animFade.Duration
+					elapsed := p.Now().Sub(decodedAt)
+					if elapsed >= 0 && elapsed < fadeDur {
+						alpha := ui.EaseOut(clamp(float32(elapsed)/float32(fadeDur), 0, 1))
+						if alpha < 1 {
+							p.AnimationFrame()
+							bw, bh := bitmap.Size()
+							if bw > 0 && bh > 0 {
+								scale := min(rect.W/float32(bw), rect.H/float32(bh))
+								dw, dh := float32(bw)*scale, float32(bh)*scale
+								dst := ui.Rect{X: rect.X + (rect.W-dw)/2, Y: rect.Y + (rect.H-dh)/2, W: dw, H: dh}
+								p.ImageRegion(bitmap, ui.Rect{}, dst, ui.ImageOptions{Tint: ui.RGBA(255, 255, 255, alpha)})
+								return
+							}
+						}
+					}
+				}
 				p.Image(bitmap, rect, ui.Contain)
 				return
 			}
@@ -141,7 +174,14 @@ func (a *workspace) paintMediaThumbnail(p *ui.Painter, rect ui.Rect, ref string)
 				p.Line(cx-pad/2, cy-pad/2, cx+pad/2, cy+pad/2, 1.5, col)
 				p.Line(cx-pad/2, cy+pad/2, cx+pad/2, cy-pad/2, 1.5, col)
 			} else {
-				p.Fill(rect, ui.RGBA(128, 128, 136, .08), 6)
+				alpha := float32(0.08)
+				if !p.Preferences().ReduceMotion {
+					sec := float64(p.Now().UnixNano()) / 1e9
+					wave := 0.5 - 0.5*math.Cos(sec*(2*math.Pi/1.4))
+					alpha = float32(0.06 + 0.05*wave)
+					p.AnimationFrame()
+				}
+				p.Fill(rect, ui.RGBA(128, 128, 136, alpha), 6)
 			}
 			return
 		}
@@ -149,30 +189,30 @@ func (a *workspace) paintMediaThumbnail(p *ui.Painter, rect ui.Rect, ref string)
 }
 
 func (a *workspace) mediaThumbnail(ref string, tier int) *ui.Bitmap {
-	bitmap, _ := a.mediaThumbnailState(ref, tier)
+	bitmap, _, _ := a.mediaThumbnailState(ref, tier)
 	return bitmap
 }
 
-func (a *workspace) mediaThumbnailState(ref string, tier int) (*ui.Bitmap, bool) {
+func (a *workspace) mediaThumbnailState(ref string, tier int) (*ui.Bitmap, time.Time, bool) {
 	m := &a.media
 	// A sharper cached thumbnail can also serve a smaller view.
 	for _, side := range mediaThumbnailSizes[tier:] {
-		if bitmap, ok := m.thumbnails.get(mediaThumbnailKey{ref, side}); ok {
-			return bitmap, true
+		if entry, ok := m.thumbnails.getEntry(mediaThumbnailKey{ref, side}); ok {
+			return entry.bitmap, entry.decodedAt, true
 		}
 	}
 	key := mediaThumbnailKey{ref, mediaThumbnailSizes[tier]}
 	if !m.pending[key] && m.decoding < 2 && a.store != nil {
 		path := a.store.MediaPath(ref)
 		if path == "" {
-			return nil, true
+			return nil, time.Time{}, true
 		}
 		win := a.window()
 		if win == nil {
 			bitmap := decodeMediaBitmap(path, key.side)
 			a.updateMediaOrientation(ref, bitmap)
 			m.thumbnails.put(key, bitmap, thumbnailBudget)
-			return bitmap, true
+			return bitmap, time.Time{}, true
 		}
 		if m.pending == nil {
 			m.pending = make(map[mediaThumbnailKey]bool)
@@ -187,18 +227,18 @@ func (a *workspace) mediaThumbnailState(ref string, tier int) (*ui.Bitmap, bool)
 				if m.generation == generation {
 					delete(m.pending, key)
 					a.updateMediaOrientation(ref, bitmap)
-					m.thumbnails.put(key, bitmap, thumbnailBudget)
+					m.thumbnails.putWithTime(key, bitmap, thumbnailBudget, time.Now())
 				}
 			})
 		}()
 	}
 	for i := tier - 1; i >= 0; i-- {
-		if bitmap, _ := m.thumbnails.get(mediaThumbnailKey{ref, mediaThumbnailSizes[i]}); bitmap != nil {
-			return bitmap, true
+		if entry, _ := m.thumbnails.getEntry(mediaThumbnailKey{ref, mediaThumbnailSizes[i]}); entry.bitmap != nil {
+			return entry.bitmap, entry.decodedAt, true
 		}
 	}
 	_, settled := m.thumbnails.get(key)
-	return nil, settled
+	return nil, time.Time{}, settled
 }
 
 func (a *workspace) updateMediaOrientation(ref string, bitmap *ui.Bitmap) {
