@@ -1587,7 +1587,7 @@ func (a *workspace) graph(c *ui.Context, p palette, width, height float32) {
 				if a.touchUI() {
 					fabSize = 44
 				}
-				designToolbarButton(c, p, icons[1], "打开笔盒", fabSize, true, a.editing(), func() {
+				designToolbarButton(c, p, icons[dockPen], "打开笔盒", fabSize, true, a.editing(), func() {
 					a.drawing.dockOpen, a.drawing.tool, a.drawing.penBrowseMode = true, penTool, false
 				})
 			})
@@ -1635,27 +1635,7 @@ func (a *workspace) cardActionBar(c *ui.Context, p palette, node mapNode, box ui
 		actionBtn := func(key, textLabel, a11yLabel string, icon *ui.SVG, rotateExpanded, danger, disabled bool, onClick func()) {
 			btn := ui.ButtonBase(c.Key(key)).Height(btnH).PaddingX(btnPadX).Gap(4).Radius(6).Center().
 				Label(a11yLabel).Tooltip(a11yLabel).Disabled(disabled).Transition(trColorMicro).OnClick(onClick)
-			fg := p.ink
-			icFg := p.secondary
-			if danger {
-				fg, icFg = p.danger, p.danger
-			}
-			if disabled {
-				fg, icFg = p.quiet.Alpha(.4), p.quiet.Alpha(.4)
-			} else if btn.Pressed() {
-				if danger {
-					btn.Background(p.dangerWash)
-				} else {
-					btn.Background(p.pressed)
-				}
-			} else if btn.Hovered() {
-				if danger {
-					btn.Background(p.dangerWash)
-				} else {
-					btn.Background(p.hover)
-				}
-			}
-			applyPressPose(btn, btn.Pressed(), disabled)
+			fg, icFg := styleActionPillButton(btn, p, p.ink, danger, disabled)
 			btn.Children(func() {
 				if icon != nil {
 					ic := ui.Icon(c, icon).Size(icSize, icSize).TextColor(icFg).Shrink(0)
@@ -2008,6 +1988,20 @@ func drawGrid(paint *ui.Painter, rect ui.Rect, p palette, panX, panY, scale floa
 	}
 }
 
+func strokeBezierEdge(paint *ui.Painter, p palette, rect ui.Rect, x1, y1, x2, y2 float32, active bool, baseW, activeW float32) {
+	if !onScreen(ui.Rect{X: min(x1, x2), Y: min(y1, y2), W: max(2, abs(x2-x1)), H: max(2, abs(y1-y2))}, rect.W, rect.H) {
+		return
+	}
+	mid := (x1 + x2) / 2
+	path := (&ui.Path{}).MoveTo(rect.X+x1, rect.Y+y1).
+		CubeTo(rect.X+mid, rect.Y+y1, rect.X+mid, rect.Y+y2, rect.X+x2, rect.Y+y2)
+	color, weight := p.edge, baseW
+	if active {
+		color, weight = p.accent, activeW
+	}
+	paint.StrokePath(path, weight, color)
+}
+
 func drawMapEdges(paint *ui.Painter, rect ui.Rect, p palette, nodes []mapNode, sections []boardSection, ox, oy, scale float32) {
 	baseW := max(.85, 1.4*scale)
 	activeW := max(1.3, 2.2*scale)
@@ -2019,19 +2013,7 @@ func drawMapEdges(paint *ui.Painter, rect ui.Rect, p palette, nodes []mapNode, s
 				continue
 			}
 			parent := nodes[node.parent]
-			x1, x2 := ox+(parent.x+parent.w)*scale, ox+node.x*scale
-			y1, y2 := oy+parent.y*scale, oy+node.y*scale
-			if !onScreen(ui.Rect{X: min(x1, x2), Y: min(y1, y2), W: max(2, abs(x2-x1)), H: max(2, abs(y1-y2))}, rect.W, rect.H) {
-				continue
-			}
-			mid := (x1 + x2) / 2
-			path := (&ui.Path{}).MoveTo(rect.X+x1, rect.Y+y1).
-				CubeTo(rect.X+mid, rect.Y+y1, rect.X+mid, rect.Y+y2, rect.X+x2, rect.Y+y2)
-			color, weight := p.edge, baseW
-			if active {
-				color, weight = p.accent, activeW
-			}
-			paint.StrokePath(path, weight, color)
+			strokeBezierEdge(paint, p, rect, ox+(parent.x+parent.w)*scale, oy+parent.y*scale, ox+node.x*scale, oy+node.y*scale, active, baseW, activeW)
 		}
 		// Single clean trunk edge from parent node into each 2D leaf-grid group box.
 		for _, sec := range sections {
@@ -2039,19 +2021,7 @@ func drawMapEdges(paint *ui.Painter, rect ui.Rect, p palette, nodes []mapNode, s
 				continue
 			}
 			parent := nodes[sec.parentNode]
-			x1, x2 := ox+(parent.x+parent.w)*scale, ox+sec.x*scale
-			y1, y2 := oy+parent.y*scale, oy+(sec.y+sec.h/2)*scale
-			if !onScreen(ui.Rect{X: min(x1, x2), Y: min(y1, y2), W: max(2, abs(x2-x1)), H: max(2, abs(y1-y2))}, rect.W, rect.H) {
-				continue
-			}
-			mid := (x1 + x2) / 2
-			path := (&ui.Path{}).MoveTo(rect.X+x1, rect.Y+y1).
-				CubeTo(rect.X+mid, rect.Y+y1, rect.X+mid, rect.Y+y2, rect.X+x2, rect.Y+y2)
-			color, weight := p.edge, baseW
-			if active {
-				color, weight = p.accent, activeW
-			}
-			paint.StrokePath(path, weight, color)
+			strokeBezierEdge(paint, p, rect, ox+(parent.x+parent.w)*scale, oy+parent.y*scale, ox+sec.x*scale, oy+(sec.y+sec.h/2)*scale, active, baseW, activeW)
 		}
 	}
 }
@@ -2597,27 +2567,31 @@ func (a *workspace) lassoMenu(c *ui.Context, p palette, camX, camY, camScale, wi
 					a.showActionMessage("已删除选中笔迹", "撤销", func() { a.stepDrawing(true) })
 				}
 			})
-			fg := p.secondary
-			if opt.value == "delete" {
-				fg = p.danger
-			}
-			if btn.Pressed() {
-				if opt.value == "delete" {
-					btn.Background(p.dangerWash)
-				} else {
-					btn.Background(p.pressed)
-				}
-			} else if btn.Hovered() {
-				if opt.value == "delete" {
-					btn.Background(p.dangerWash)
-				} else {
-					btn.Background(p.hover)
-				}
-			}
-			applyPressPose(btn, btn.Pressed(), false)
+			fg, _ := styleActionPillButton(btn, p, p.secondary, opt.value == "delete", false)
 			btn.Children(func() { ui.Text(c, opt.title).FontSize(fontSize).TextColor(fg) })
 		}
 	})
+}
+
+func styleActionPillButton(btn ui.Element, p palette, normalFg ui.Color, danger, disabled bool) (fg, icFg ui.Color) {
+	fg, icFg = normalFg, p.secondary
+	if danger {
+		fg, icFg = p.danger, p.danger
+	}
+	if disabled {
+		fg, icFg = p.quiet.Alpha(.4), p.quiet.Alpha(.4)
+	} else if pressed := btn.Pressed(); pressed || btn.Hovered() {
+		switch {
+		case danger:
+			btn.Background(p.dangerWash)
+		case pressed:
+			btn.Background(p.pressed)
+		default:
+			btn.Background(p.hover)
+		}
+	}
+	applyPressPose(btn, btn.Pressed(), disabled)
+	return fg, icFg
 }
 
 func (a *workspace) canvasCard(c *ui.Context, p palette, card notebook.CanvasCard, box ui.Rect, scale float32) {

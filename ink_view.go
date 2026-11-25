@@ -91,9 +91,19 @@ var penColorLabels = [...]string{"默认色", "钴蓝", "红色", "绿色"}
 var markerColorLabels = [...]string{"暖黄", "天蓝", "樱粉", "薄荷绿"}
 var penWidths = [...]float32{2, 3.5, 6}
 var penWidthLabels = [...]string{"细", "中", "粗"}
-var dockIcons = [2][8]*ui.SVG{
-	{designIcon("lasso"), designIcon("pen"), designIcon("highlighter"), designIcon("eraser"), designIcon("excerpt"), designIcon("card"), designIcon("undo"), designIcon("redo")},
-	{designIcon("lasso-dark"), designIcon("pen-dark"), designIcon("highlighter-dark"), designIcon("eraser-dark"), designIcon("excerpt-dark"), designIcon("card-dark"), designIcon("undo-dark"), designIcon("redo-dark")},
+const (
+	dockLasso = iota
+	dockPen
+	dockHighlighter
+	dockEraser
+	dockExcerpt
+	dockUndo
+	dockRedo
+)
+
+var dockIcons = [2][7]*ui.SVG{
+	{designIcon("lasso"), designIcon("pen"), designIcon("highlighter"), designIcon("eraser"), designIcon("excerpt"), designIcon("undo"), designIcon("redo")},
+	{designIcon("lasso-dark"), designIcon("pen-dark"), designIcon("highlighter-dark"), designIcon("eraser-dark"), designIcon("excerpt-dark"), designIcon("undo-dark"), designIcon("redo-dark")},
 }
 
 func (a *workspace) loadDrawing(bookID string) {
@@ -556,7 +566,7 @@ func (a *workspace) inkDock(c *ui.Context, p palette, mode workspaceMode, width 
 		}
 		ui.Box(c.Key("ink-fab")).Absolute().Left(16).Bottom(16).ZIndex(4).Radius(99).Background(p.elevated).Border(1, p.border).
 			Shadow(0, 4, 12, -2, p.shadow).Transition(trFloatingBarStatic).Children(func() {
-			designToolbarButton(c, p, icons[1], "打开笔盒", dockBtnSize, false, a.editing(), func() { d.pdfDockCollapsed = false })
+			designToolbarButton(c, p, icons[dockPen], "打开笔盒", dockBtnSize, false, a.editing(), func() { d.pdfDockCollapsed = false })
 		})
 		return
 	}
@@ -583,23 +593,9 @@ func (a *workspace) inkDock(c *ui.Context, p palette, mode workspaceMode, width 
 	ui.Column(c.Key("ink-dock")).Absolute().Bottom(16).Left(0).Right(0).ZIndex(4).
 		AlignItems(ui.Center).Gap(10).Transition(trFloatingBarStatic).Children(func() {
 		if d.loadErr != nil {
-			errPill := ui.ButtonBase(c.Key("ink-load-retry")).Height(28).PaddingX(12).Radius(14).Center().
-				Background(p.dangerWash).Border(1, p.danger.Alpha(.35)).Label("手写读取异常 · 重试").
-				Transition(trFloatingBarStatic).
-				OnClick(func() { a.loadDrawing(a.bookID) })
-			applyPressPose(errPill, errPill.Pressed(), false)
-			errPill.Children(func() {
-				ui.Text(c, "手写读取异常 · 重试").FontSize(11.5).FontWeight(550).TextColor(p.danger).SingleLine()
-			})
+			inkRetryPill(c, p, "ink-load-retry", "手写读取异常 · 重试", func() { a.loadDrawing(a.bookID) })
 		} else if d.saveFailed {
-			savePill := ui.ButtonBase(c.Key("ink-save-retry")).Height(28).PaddingX(12).Radius(14).Center().
-				Background(p.dangerWash).Border(1, p.danger.Alpha(.35)).Label("有未保存笔迹 · 重试").
-				Transition(trFloatingBarStatic).
-				OnClick(func() { a.saveDrawing(d.data) })
-			applyPressPose(savePill, savePill.Pressed(), false)
-			savePill.Children(func() {
-				ui.Text(c, "有未保存笔迹 · 重试").FontSize(11.5).FontWeight(550).TextColor(p.danger).SingleLine()
-			})
+			inkRetryPill(c, p, "ink-save-retry", "有未保存笔迹 · 重试", func() { a.saveDrawing(d.data) })
 		}
 		if d.toolPrefs {
 			a.penOptions(c, p)
@@ -625,11 +621,11 @@ func (a *workspace) inkDock(c *ui.Context, p palette, mode workspaceMode, width 
 				})
 			}
 			if mode != pdfMode {
-				toolButton(lassoTool, icons[0], "套索")
+				toolButton(lassoTool, icons[dockLasso], "套索")
 			}
-			toolButton(penTool, icons[1], "钢笔")
-			toolButton(markerTool, icons[2], "荧光笔")
-			a.inkButton(c, p, size, btnH, icons[3], "橡皮", d.tool == strokeEraser || d.tool == partialEraser, false, func() {
+			toolButton(penTool, icons[dockPen], "钢笔")
+			toolButton(markerTool, icons[dockHighlighter], "荧光笔")
+			a.inkButton(c, p, size, btnH, icons[dockEraser], "橡皮", d.tool == strokeEraser || d.tool == partialEraser, false, func() {
 				d.penBrowseMode = false
 				hapticSelection()
 				if d.tool != strokeEraser && d.tool != partialEraser {
@@ -639,11 +635,11 @@ func (a *workspace) inkDock(c *ui.Context, p palette, mode workspaceMode, width 
 				}
 			})
 			if mode != canvasMode {
-				toolButton(excerptTool, icons[4], "框选摘录")
+				toolButton(excerptTool, icons[dockExcerpt], "框选摘录")
 			}
 			ui.Box(c).Width(1).Height(18).Background(p.rule)
-			a.inkButton(c, p, size, btnH, icons[6], "撤销手写", false, len(d.undo) == 0, func() { a.stepDrawing(true) })
-			a.inkButton(c, p, size, btnH, icons[7], "重做手写", false, len(d.redo) == 0, func() { a.stepDrawing(false) })
+			a.inkButton(c, p, size, btnH, icons[dockUndo], "撤销手写", false, len(d.undo) == 0, func() { a.stepDrawing(true) })
+			a.inkButton(c, p, size, btnH, icons[dockRedo], "重做手写", false, len(d.redo) == 0, func() { a.stepDrawing(false) })
 			designToolbarButton(c, p, icClose, "收起笔盒", closeSize, false, false, func() {
 				if mode == canvasMode {
 					d.dockOpen = false
@@ -653,6 +649,17 @@ func (a *workspace) inkDock(c *ui.Context, p palette, mode workspaceMode, width 
 				d.toolPrefs, d.tool = false, panTool
 			})
 		})
+	})
+}
+
+func inkRetryPill(c *ui.Context, p palette, key, label string, onClick func()) {
+	pill := ui.ButtonBase(c.Key(key)).Height(28).PaddingX(12).Radius(14).Center().
+		Background(p.dangerWash).Border(1, p.danger.Alpha(.35)).Label(label).
+		Transition(trFloatingBarStatic).
+		OnClick(onClick)
+	applyPressPose(pill, pill.Pressed(), false)
+	pill.Children(func() {
+		ui.Text(c, label).FontSize(11.5).FontWeight(550).TextColor(p.danger).SingleLine()
 	})
 }
 
