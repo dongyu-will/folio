@@ -57,6 +57,19 @@ type pdfState struct {
 	pagePts                map[string][2]float32
 	focusedHighlightNoteID string
 	highlightSelectedAt    string
+
+	thumbsOpen   bool
+	thumbScroll  ui.ScrollState
+	searchOpen   bool
+	searchQuery  string
+	searchHits   []pdfSearchHit
+	searchIndex  int
+	searchBusy   bool
+	searchDoc    string
+	searchDone   bool
+	searchErr    string
+	searchSeq    uint64
+	searchScroll ui.ScrollState
 }
 
 type pdfDisplay struct {
@@ -66,7 +79,11 @@ type pdfDisplay struct {
 }
 
 func (a *workspace) resetPDF(documents []notebook.Document) {
-	a.pdf = pdfState{serial: a.pdf.serial + 1}
+	a.pdf = pdfState{
+		serial:     a.pdf.serial + 1,
+		marginOpen: a.settings.PDFMarginOpen,
+		margin:     a.settings.PDFMargin,
+	}
 	a.pdfHighlightNoteID = ""
 	a.pdfTOCOpen = false
 	a.mode = canvasMode
@@ -82,7 +99,10 @@ func (a *workspace) resetPDF(documents []notebook.Document) {
 	}
 }
 
-func (a *workspace) clearRenderCache() {
+// releaseMemoryCaches drops in-memory PDF bitmaps, renderer handles, ink layers,
+// and image thumbnails without touching on-disk files or showing a toast.
+func (a *workspace) releaseMemoryCaches() {
+	closePDFRendererCache()
 	a.pdf.cache, a.pdf.recent = nil, nil
 	a.pdf.displayed = pdfDisplay{}
 	a.pdf.thumbs, a.pdf.thumbRecent = nil, nil
@@ -91,7 +111,15 @@ func (a *workspace) clearRenderCache() {
 	a.pdf.prefetchAt = time.Time{}
 	a.drawing.pdf, a.drawing.canvas = inkLayers{}, inkLayers{}
 	a.clearMediaCache()
-	a.showMessage("已清理渲染缓存", false)
+}
+
+func (a *workspace) clearRenderCache() {
+	a.releaseMemoryCaches()
+	if a.store != nil {
+		a.store.CleanupStaleTempFiles(0)
+	}
+	a.refreshStorageBytes()
+	a.showMessage("已清理临时与显示缓存", false)
 }
 
 type pdfRequest uint8
@@ -267,7 +295,8 @@ func (a *workspace) setPDFPage(page int) {
 	if a.pdf.displayed.ref == (pageRef{a.pdf.document, a.pdf.page}) {
 		a.pdf.displayed.scroll = ui.ScrollState{X: a.pdf.scroll.X, Y: a.pdf.scroll.Y}
 	}
-	a.pdf.page = max(0, page)
+	nextPage := max(0, page)
+	a.pdf.page = nextPage
 	a.androidInk.pdf = penZone{}
 	a.pdf.scroll = ui.ScrollState{}
 	a.pdf.highlight = nil
@@ -275,11 +304,76 @@ func (a *workspace) setPDFPage(page int) {
 	a.pdf.focusedHighlightNoteID = ""
 	a.pdfHighlightNoteID = ""
 	a.pdf.jumpPageText = strconv.Itoa(a.pdf.page + 1)
+	a.recordDocumentPage(a.bookID, a.pdf.document, nextPage+1)
+}
+
+func (a *workspace) recordDocumentPage(bookID, docID string, pageNo int) {
+	if bookID == "" || docID == "" || pageNo < 1 {
+		return
+	}
+	for i := range a.tree.book.Documents {
+		if a.tree.book.Documents[i].ID == docID {
+			if a.tree.book.Documents[i].LastPage == pageNo {
+				return
+			}
+			a.tree.book.Documents[i].LastPage = pageNo
+			break
+		}
+	}
+	for bi := range a.books {
+		if a.books[bi].ID == bookID {
+			for di := range a.books[bi].Documents {
+				if a.books[bi].Documents[di].ID == docID {
+					a.books[bi].Documents[di].LastPage = pageNo
+					break
+				}
+			}
+			break
+		}
+	}
+	if a.store == nil {
+		return
+	}
+	a.pdfPageSaveMu.Lock()
+	a.pendingPDFSave.bookID = bookID
+	a.pendingPDFSave.docID = docID
+	a.pendingPDFSave.page = pageNo
+	if a.pdfPageSaveTimer != nil {
+		a.pdfPageSaveTimer.Stop()
+	}
+	if a.window() == nil {
+		a.pdfPageSaveMu.Unlock()
+		a.flushPendingPDFPageSave()
+		return
+	}
+	a.pdfPageSaveTimer = time.AfterFunc(600*time.Millisecond, a.flushPendingPDFPageSave)
+	a.pdfPageSaveMu.Unlock()
+}
+
+func (a *workspace) flushPendingPDFPageSave() {
+	a.pdfPageSaveMu.Lock()
+	if a.pdfPageSaveTimer != nil {
+		a.pdfPageSaveTimer.Stop()
+		a.pdfPageSaveTimer = nil
+	}
+	pending := a.pendingPDFSave
+	a.pendingPDFSave = struct {
+		bookID string
+		docID  string
+		page   int
+	}{}
+	a.pdfPageSaveMu.Unlock()
+	if a.store == nil || pending.bookID == "" || pending.docID == "" || pending.page < 1 {
+		return
+	}
+	_ = a.store.SaveDocumentPage(pending.bookID, pending.docID, pending.page)
 }
 
 func (a *workspace) setPDFDocument(id string) {
+	a.flushPendingPDFPageSave()
 	if a.pdf.document != id {
 		a.pdf.displayed = pdfDisplay{}
+		a.clearPDFSearch()
 	}
 	a.pdf.document = id
 	a.pdfTOCOpen = false
@@ -361,7 +455,11 @@ func (a *workspace) documentWorkspace(c *ui.Context, p palette, width, height fl
 		verticalSplit := width < 480 || (height > width*1.12 && width < 900)
 		if a.mode == splitMode && verticalSplit {
 			if a.splitRatio == 0 {
-				a.splitRatio = .48
+				if a.settings.SplitRatioV >= .2 && a.settings.SplitRatioV <= .8 {
+					a.splitRatio = a.settings.SplitRatioV
+				} else {
+					a.splitRatio = .48
+				}
 			}
 			minPane := min(float32(180), max(90, (bodyHeight-gripSize)*.3))
 			pdfHeight := clamp((bodyHeight-gripSize)*a.splitRatio, minPane, max(minPane, bodyHeight-gripSize-minPane))
@@ -373,7 +471,11 @@ func (a *workspace) documentWorkspace(c *ui.Context, p palette, width, height fl
 		pdfWidth := width
 		if a.mode == splitMode {
 			if a.splitRatio == 0 {
-				a.splitRatio = .425
+				if a.settings.SplitRatioH >= .2 && a.settings.SplitRatioH <= .8 {
+					a.splitRatio = a.settings.SplitRatioH
+				} else {
+					a.splitRatio = .425
+				}
 			}
 			minPane := min(float32(195), max(120, (width-gripSize)*.3))
 			pdfWidth = clamp((width-gripSize)*a.splitRatio, minPane, max(minPane, width-gripSize-minPane))
@@ -399,7 +501,7 @@ func (a *workspace) workspaceToolbar(c *ui.Context, p palette, width, barH float
 	}
 	ui.Row(c).Height(barH).FillWidth().Shrink(0).PaddingX(12).Gap(8).
 		AlignItems(ui.Center).Background(p.surface).Children(func() {
-		if a.settings.SidebarCollapsed || a.sidebarHiddenForSplit || (width >= 700 && a.lastViewWide && !a.lastViewSidebar) {
+		if a.lastViewWide && (a.settings.SidebarCollapsed || a.sidebarHiddenForSplit || !a.lastViewSidebar) {
 			designToolbarButton(c, p, icExpand, "展开侧边栏", btnSize, true, a.editing(), a.toggleSidebar)
 			ui.Box(c).Width(1).Height(16).Background(p.rule)
 		}
@@ -407,39 +509,57 @@ func (a *workspace) workspaceToolbar(c *ui.Context, p palette, width, barH float
 		if a.mode == canvasMode && a.scope != "" {
 			title = noteTitle(a.tree.notes[a.scope])
 		}
-		ui.Text(c, title).FontSize(14).FontWeight(650).TextColor(p.ink).SingleLine().MinWidth(0).Shrink(1)
+		ui.Text(c, title).FontSize(14).FontWeight(650).TextColor(p.ink).SingleLine().Ellipsis("…").MinWidth(0).Shrink(1)
 		if !compact {
-			if a.mode == canvasMode {
-				badgePill(c, p, fmt.Sprintf("%d 节点", len(a.tree.order)))
-			} else if page, ok := a.pdf.cache[pageRef{a.pdf.document, a.pdf.page}]; ok && page.count > 0 {
-				badgePill(c, p, fmt.Sprintf("%d / %d 页", a.pdf.page+1, page.count))
-			}
+			badgePill(c, p, fmt.Sprintf("%d 条笔记", len(a.tree.order)))
+		}
+		if a.scope != "" && a.mode != pdfMode {
+			pillButton(c, p, "返回全部", icArrowLeft, false, a.editing(), func() { a.selectScope("") }).Height(btnSize)
 		}
 		ui.Box(c).Grow(1).MinWidth(0)
 		if a.pdf.document != "" {
 			a.modeSegments(c, p, []segment[workspaceMode]{{"PDF", pdfMode}, {"分屏", splitMode}, {"画布", canvasMode}}, a.mode, a.setMode)
 			ui.Box(c).Grow(1).MinWidth(0)
 		}
-		if a.mode != canvasMode {
-			marginAction := func() { a.pdf.marginOpen = !a.pdf.marginOpen }
-			if compact || (touch && width < 860) {
-				designToolbarButton(c, p, icMargin, "留白", btnSize, a.pdf.marginOpen, false, marginAction)
-			} else {
-				pillButton(c, p, "留白", icMargin, a.pdf.marginOpen, false, marginAction).Height(btnSize)
+		if a.mode != pdfMode {
+			a.layoutSwitcher(c, p, btnSize)
+			if len(a.tree.order) > 0 && !compact {
+				if a.mode == canvasMode {
+					pillButton(c, p, "背诵", icBook, a.reciteMode, a.editing() || a.reviewOpen, a.toggleReciteMode).
+						Height(btnSize).Tooltip("开启或退出背诵遮罩模式")
+				}
+				pillButton(c, p, "抽卡", icLayers, a.reviewOpen, a.editing() || a.reviewOpen, a.startReview).
+					Height(btnSize).Tooltip("抽卡背诵当前范围笔记")
 			}
 		}
-		if !compact || a.mode == canvasMode {
-			if a.mode == pdfMode {
-				a.zoomControl(c, p, max(1, a.pdf.zoom), a.zoomPDF)
-			} else if layout := a.settings.LayoutMode(); layout != notebook.LayoutOutline {
+		if a.mode != canvasMode {
+			marginAction := func() {
+				a.pdf.marginOpen = !a.pdf.marginOpen
+				next := a.settings
+				next.PDFMarginOpen = a.pdf.marginOpen
+				if a.pdf.margin > 0 {
+					next.PDFMargin = a.pdf.margin
+				} else if next.PDFMargin <= 0 {
+					next.PDFMargin = .32
+				}
+				a.saveSettings(next)
+			}
+			if compact || (touch && width < 860) {
+				designToolbarButton(c, p, icMargin, "批注留白", btnSize, a.pdf.marginOpen, false, marginAction)
+			} else {
+				pillButton(c, p, "批注留白", icMargin, a.pdf.marginOpen, false, marginAction).Height(btnSize)
+			}
+		}
+		if (!compact || a.mode == canvasMode) && a.mode != pdfMode {
+			if layout := a.settings.LayoutMode(); layout != notebook.LayoutOutline {
 				showFoldAll := !compact && (!touch || a.mode == canvasMode || width >= 960)
-				if showFoldAll && (layout == notebook.LayoutCards || layout == notebook.LayoutBoard) && len(a.tree.order) > 1 {
+				if showFoldAll && (layout == notebook.LayoutCards || layout == notebook.LayoutBoard) && a.hasExpandableBranches() {
 					if a.hasCollapsedBranches() {
-						pillButton(c, p, "展开全部", icLayers, false, a.editing(), func() {
+						pillButton(c, p, "全部展开", icLayers, false, a.editing(), func() {
 							a.setAllExpanded(true)
 						}).Height(btnSize)
 					} else {
-						pillButton(c, p, "折叠分支", icLayers, false, a.editing(), func() {
+						pillButton(c, p, "全部收起", icLayers, false, a.editing(), func() {
 							a.setAllExpanded(false)
 						}).Height(btnSize)
 					}
@@ -456,8 +576,70 @@ func (a *workspace) workspaceToolbar(c *ui.Context, p palette, width, barH float
 				})
 			}
 		}
-		if a.settings.SidebarCollapsed || a.sidebarHiddenForSplit || a.mode != canvasMode {
-			designToolbarButton(c, p, icSettings, "设置", btnSize, true, a.editing(), a.openPreferences)
+		if a.lastViewWide && (a.settings.SidebarCollapsed || a.sidebarHiddenForSplit || a.mode != canvasMode) {
+			ui.Box(c).Shrink(0).Children(func() {
+				designToolbarButton(c, p, icSettings, "设置", btnSize, true, a.editing(), a.openPreferences)
+				if a.hasUpdateBadge() {
+					ui.Box(c.Key("toolbar-update-dot")).Absolute().Top(4).Right(4).Size(6, 6).
+						Radius(99).Background(p.accent).IgnoreInput(true)
+				}
+			})
+		}
+	})
+}
+
+func (a *workspace) layoutLabel(mode string) string {
+	switch mode {
+	case notebook.LayoutBoard:
+		return "专题框架"
+	case notebook.LayoutOutline:
+		return "大纲流"
+	case notebook.LayoutCompact:
+		return "精简树"
+	default:
+		return "卡片树"
+	}
+}
+
+func (a *workspace) layoutSwitcher(c *ui.Context, p palette, btnSize float32) {
+	mode := a.settings.LayoutMode()
+	label := a.layoutLabel(mode)
+	b := ui.ButtonBase(c.Key("layout-switcher")).Height(btnSize).Padding(0, 10).Gap(5).
+		Center().Radius(8).Shrink(0).Background(p.elevated).Border(1, p.border).
+		Shadow(0, 1, 2, 0, p.shadowSoft).
+		Label("视图样式：" + label).Tooltip("切换视图样式").Disabled(a.editing()).FocusRingColor(p.accent)
+	fg := p.ink
+	switch {
+	case a.editing():
+		fg = p.quiet.Alpha(.55)
+	case b.Pressed():
+		b.Background(p.pressed)
+	case b.Hovered():
+		b.Background(p.hover)
+	}
+	b.Children(func() {
+		ui.Icon(c, icLayers).Size(13, 13).TextColor(p.accent).Shrink(0)
+		ui.Text(c, label).FontSize(12).FontWeight(550).TextColor(fg).SingleLine()
+		ui.Icon(c, icChevronDown).Size(11, 11).TextColor(p.quiet).Shrink(0)
+	})
+	options := []segment[string]{
+		{"卡片树", notebook.LayoutCards},
+		{"专题框架", notebook.LayoutBoard},
+		{"大纲流", notebook.LayoutOutline},
+		{"精简树", notebook.LayoutCompact},
+	}
+	b.PopoverMenuButton(func(m *ui.Menu) {
+		for _, opt := range options {
+			if m.Item(opt.title).ID("layout-" + opt.value).Radio(opt.value == mode).Chosen() {
+				next := a.settings
+				next.GraphLayout = opt.value
+				if a.saveSettings(next) {
+					a.canvasReady = false
+					a.focusSelected = true
+					a.cardMenuOpen = false
+					a.outlineScroll = ui.ScrollState{}
+				}
+			}
 		}
 	})
 }
@@ -486,6 +668,10 @@ func (a *workspace) modeSegments(c *ui.Context, p palette, options []segment[wor
 }
 
 func (a *workspace) zoomControl(c *ui.Context, p palette, scale float32, action func(float32)) {
+	a.zoomControlWithLabels(c, p, scale, "", "", action)
+}
+
+func (a *workspace) zoomControlWithLabels(c *ui.Context, p palette, scale float32, keyPrefix, suffix string, action func(float32)) {
 	touch := a.touchUI()
 	rowH, btnSz, pctW, icSz, fontSz := float32(32), float32(26), float32(46), float32(13.5), float32(11.5)
 	if touch {
@@ -496,8 +682,8 @@ func (a *workspace) zoomControl(c *ui.Context, p palette, scale float32, action 
 		InsetShadow(0, 1, 0, 0, p.specular).
 		Shadow(0, 1, 2, 0, p.shadowSoft).Children(func() {
 		zoomBtn := func(key string, icon *ui.SVG, label string, onClick func()) {
-			b := ui.ButtonBase(c.Key(key)).Size(btnSz, btnSz).Radius(6).Center().
-				Label(label).FocusRingColor(p.accent).OnClick(onClick)
+			b := ui.ButtonBase(c.Key(keyPrefix+key)).Size(btnSz, btnSz).Radius(6).Center().
+				Label(label).Tooltip(label).FocusRingColor(p.accent).OnClick(onClick)
 			fg := p.secondary
 			if b.Pressed() {
 				b.Background(p.pressed)
@@ -511,9 +697,10 @@ func (a *workspace) zoomControl(c *ui.Context, p palette, scale float32, action 
 			})
 		}
 
-		zoomBtn("zoom-out", icMinus, "缩小", func() { action(1 / 1.18) })
-		pct := ui.ButtonBase(c.Key("zoom-reset")).Height(btnSz).MinWidth(pctW).PaddingX(5).Radius(6).Center().
-			Label("重置为 100%").FocusRingColor(p.accent).OnClick(func() { action(-1) })
+		zoomBtn("zoom-out", icMinus, "缩小"+suffix, func() { action(1 / 1.18) })
+		resetLabel := "重置为 100%" + suffix
+		pct := ui.ButtonBase(c.Key(keyPrefix+"zoom-reset")).Height(btnSz).MinWidth(pctW).PaddingX(5).Radius(6).Center().
+			Label(resetLabel).Tooltip(resetLabel).FocusRingColor(p.accent).OnClick(func() { action(-1) })
 		pctColor := p.secondary
 		if pct.Pressed() {
 			pct.Background(p.pressed)
@@ -526,9 +713,9 @@ func (a *workspace) zoomControl(c *ui.Context, p palette, scale float32, action 
 			ui.Text(c, fmt.Sprintf("%d%%", int(scale*100+.5))).FontSize(fontSz).FontWeight(600).
 				FontFeatures("tnum").TextColor(pctColor).SingleLine()
 		})
-		zoomBtn("zoom-in", icPlus, "放大", func() { action(1.18) })
+		zoomBtn("zoom-in", icPlus, "放大"+suffix, func() { action(1.18) })
 		ui.Box(c).Width(1).Height(14).Background(p.rule).Margin(0, 2)
-		zoomBtn("zoom-fit", icFit, "适应视图", func() { action(0) })
+		zoomBtn("zoom-fit", icFit, "适应视图"+suffix, func() { action(0) })
 	})
 }
 
@@ -560,6 +747,10 @@ func (a *workspace) splitGrip(c *ui.Context, p palette, width, left, gripSize fl
 					a.splitDragging = false
 					if ev.Canceled {
 						a.splitRatio = a.splitStart
+					} else {
+						next := a.settings
+						next.SplitRatioH = a.splitRatio
+						a.saveSettings(next)
 					}
 					return true
 				}
@@ -598,6 +789,10 @@ func (a *workspace) splitGripVertical(c *ui.Context, p palette, height, top, gri
 					a.splitDragging = false
 					if ev.Canceled {
 						a.splitRatio = a.splitStart
+					} else {
+						next := a.settings
+						next.SplitRatioH = a.splitRatio
+						a.saveSettings(next)
 					}
 					return true
 				}
@@ -720,14 +915,121 @@ func (a *workspace) pdfResolution(c *ui.Context, ref pageRef, width, height floa
 	return fitSide, side
 }
 
+func (a *workspace) clearPDFSearch() {
+	a.pdf.searchSeq++
+	a.pdf.searchHits = nil
+	a.pdf.searchIndex = 0
+	a.pdf.searchBusy = false
+	a.pdf.searchDoc = ""
+	a.pdf.searchDone = false
+	a.pdf.searchErr = ""
+	a.pdf.searchScroll = ui.ScrollState{}
+}
+
+func (a *workspace) togglePDFSearch() {
+	a.pdf.searchOpen = !a.pdf.searchOpen
+	if !a.pdf.searchOpen {
+		a.pdf.searchBusy = false
+		a.pdf.searchSeq++
+	}
+}
+
+func (a *workspace) startPDFSearch() {
+	query := strings.TrimSpace(a.pdf.searchQuery)
+	if query == "" {
+		a.clearPDFSearch()
+		return
+	}
+	if a.store == nil || a.pdf.document == "" {
+		return
+	}
+	docID := a.pdf.document
+	docPath := a.store.DocumentPath(docID)
+	if docPath == "" {
+		return
+	}
+	a.pdf.searchSeq++
+	seq := a.pdf.searchSeq
+	a.pdf.searchBusy = true
+	a.pdf.searchDone = false
+	a.pdf.searchErr = ""
+	a.pdf.searchDoc = docID
+	a.pdf.searchHits = nil
+	a.pdf.searchIndex = 0
+	a.pdf.searchScroll = ui.ScrollState{}
+
+	win := a.window()
+	if win == nil {
+		hits, err := searchPDFText(docPath, query, 200)
+		a.applyPDFSearchResult(seq, docID, hits, err)
+		return
+	}
+	go func() {
+		hits, err := searchPDFText(docPath, query, 200)
+		win.Update(func() {
+			a.applyPDFSearchResult(seq, docID, hits, err)
+		})
+	}()
+}
+
+func (a *workspace) applyPDFSearchResult(seq uint64, docID string, hits []pdfSearchHit, err error) {
+	if seq != a.pdf.searchSeq || a.pdf.document != docID {
+		return
+	}
+	a.pdf.searchBusy = false
+	a.pdf.searchDone = true
+	if err != nil {
+		a.pdf.searchErr = err.Error()
+		a.pdf.searchHits = nil
+		return
+	}
+	a.pdf.searchErr = ""
+	a.pdf.searchHits = hits
+	a.pdf.searchIndex = 0
+	if len(hits) > 0 {
+		a.jumpPDFSearchHit(0)
+	}
+}
+
+func (a *workspace) jumpPDFSearchHit(idx int) {
+	if len(a.pdf.searchHits) == 0 {
+		return
+	}
+	n := len(a.pdf.searchHits)
+	idx = ((idx % n) + n) % n
+	a.pdf.searchIndex = idx
+	hit := a.pdf.searchHits[idx]
+	if hit.Page >= 0 {
+		a.setPDFPage(hit.Page)
+	}
+}
+
 func (a *workspace) pdfPane(c *ui.Context, p palette, width, height float32) {
 	navH := float32(38)
 	if a.touchUI() {
 		navH = 46
 	}
-	sheetHeight := max(1, height-navH)
-	ref := pageRef{a.pdf.document, a.pdf.page}
-	fitSide, renderSide := a.pdfResolution(c, ref, width, sheetHeight)
+	searchH := float32(0)
+	if a.pdf.searchOpen {
+		searchH = 42
+		if len(a.pdf.searchHits) > 0 || a.pdf.searchDone || a.pdf.searchErr != "" {
+			if len(a.pdf.searchHits) > 0 {
+				searchH += min(116, float32(len(a.pdf.searchHits))*32+8)
+			} else {
+				searchH += 30
+			}
+		}
+	}
+	thumbRailW := float32(0)
+	refDoc := pageRef{a.pdf.document, a.pdf.page}
+	knownCount := a.pdf.counts[refDoc.document]
+	if a.pdf.thumbsOpen && width >= 360 && (knownCount == 0 || knownCount > 0) {
+		thumbRailW = 108
+	}
+	sheetWidth := max(1, width-thumbRailW)
+	sheetHeight := max(1, height-navH-searchH)
+	ref := refDoc
+	fitSide, renderSide := a.pdfResolution(c, ref, sheetWidth, sheetHeight)
 	page, ready := a.requestPDF(ref, pdfVisible, p.dark && a.settings.PDFNight, renderSide)
 	count := max(page.count, a.pdf.counts[ref.document])
 	if ready && page.err == nil {
@@ -738,33 +1040,56 @@ func (a *workspace) pdfPane(c *ui.Context, p palette, width, height float32) {
 		a.publishPenZones()
 	}
 	ui.Column(c).Fill().Background(p.shell).Children(func() {
-		a.pdfNavigation(c, p, count, navH)
-		if ready && page.err == nil {
-			a.pdfSheet(c, p, width, sheetHeight, ref, page, false)
-			return
+		a.pdfNavigation(c, p, count, navH, width)
+		if a.pdf.searchOpen {
+			a.pdfSearchPanel(c, p, width)
 		}
-		shown := &a.pdf.displayed
-		if !ready && shown.ref.document == ref.document && shown.page.light != nil {
-			a.pdfSheet(c, p, width, sheetHeight, shown.ref, shown.page, true)
-			return
-		}
-		ui.Box(c).Grow(1).FillWidth().Center().Children(func() {
-			if page.err != nil {
-				ui.Text(c, page.err.Error()).Padding(12).TextColor(p.danger).FontSize(13)
-			} else {
-				ui.Text(c, "正在渲染 PDF…").TextColor(p.quiet).FontSize(13)
+		ui.Row(c).Grow(1).MinHeight(0).FillWidth().Children(func() {
+			if thumbRailW > 0 && count > 0 {
+				a.pdfThumbRail(c, p, thumbRailW, sheetHeight, count)
 			}
+			ui.Column(c).Grow(1).MinWidth(0).FillHeight().Children(func() {
+				if ready && page.err == nil {
+					a.pdfSheet(c, p, sheetWidth, sheetHeight, ref, page, false)
+					return
+				}
+				shown := &a.pdf.displayed
+				if !ready && shown.ref.document == ref.document && shown.page.light != nil {
+					a.pdfSheet(c, p, sheetWidth, sheetHeight, shown.ref, shown.page, true)
+					return
+				}
+				ui.Box(c).Grow(1).FillWidth().Center().Children(func() {
+					if page.err != nil {
+						msg := friendlyError(page.err)
+						if msg == "" {
+							msg = "这一页暂时无法显示"
+						}
+						ui.Column(c).Center().Gap(10).Padding(16).Children(func() {
+							ui.Text(c, msg).TextColor(p.danger).FontSize(13).LineHeight(1.5).Center()
+							pillButton(c, p, "重新加载", icUpdateRefresh, true, false, func() {
+								delete(a.pdf.cache, ref)
+								if a.pdf.foreground != nil && *a.pdf.foreground == ref {
+									a.pdf.foreground = nil
+								}
+								_ = a.loadPDFPage(ref, pdfVisible, p.dark && a.settings.PDFNight, renderSide)
+							})
+						})
+					} else {
+						ui.Text(c, "正在渲染 PDF…").TextColor(p.quiet).FontSize(13)
+					}
+				})
+			})
 		})
 	})
 }
 
-func (a *workspace) pdfNavigation(c *ui.Context, p palette, count int, navH float32) {
+func (a *workspace) pdfNavigation(c *ui.Context, p palette, count int, navH, width float32) {
 	activeDoc, hasDoc := a.activePDFDocument()
 	hasTOC := hasDoc && len(activeDoc.TOC) > 0
 	touch := a.touchUI()
-	btnH, navBtnSz, inputW, inputH, tocRowH := float32(26), float32(24), float32(34), float32(23), float32(30)
+	btnH, navBtnSz, inputW, inputH, tocRowH := float32(26), float32(24), float32(44), float32(23), float32(30)
 	if touch {
-		btnH, navBtnSz, inputW, inputH, tocRowH = 34, 36, 46, 32, 38
+		btnH, navBtnSz, inputW, inputH, tocRowH = 34, 36, 54, 32, 38
 	}
 	ui.Row(c).Height(navH).PaddingX(8).Gap(6).AlignItems(ui.Center).Shrink(0).FillWidth().
 		Background(p.surface).BorderColor(p.rule).BorderWidth(0, 0, 1, 0).Children(func() {
@@ -789,8 +1114,9 @@ func (a *workspace) pdfNavigation(c *ui.Context, p palette, count int, navH floa
 				ui.Icon(c, icLayers).Size(12.5, 12.5).TextColor(fg)
 				ui.Text(c, "目录").FontSize(12).FontWeight(550).TextColor(fg).SingleLine()
 			})
+			tocW := min(300, max(180, width-24))
 			ui.PopoverBase(c.Key("pdf-toc-popover"), tocBtn, &a.pdfTOCOpen, func(panel ui.Element) {
-				panel.Width(300).MaxHeight(400).Radius(10).Clip().
+				panel.Width(tocW).MaxHeight(400).Radius(10).Clip().
 					Background(p.elevated).Border(1, p.border).
 					InsetShadow(0, 1, 0, 0, p.specular).
 					Shadow(0, 12, 32, -6, p.shadow)
@@ -855,7 +1181,9 @@ func (a *workspace) pdfNavigation(c *ui.Context, p palette, count int, navH floa
 					title = doc.Title
 				}
 			}
-			b.Children(func() { ui.Text(c, title+" ▾").SingleLine().FontSize(12).TextColor(p.secondary) })
+			b.Children(func() {
+				ui.Text(c, title+" ▾").SingleLine().Ellipsis("…").MaxWidth(160).FontSize(12).TextColor(p.secondary)
+			})
 			b.PopoverMenuButton(func(m *ui.Menu) {
 				for _, doc := range docs {
 					if m.Item(doc.Title).ID(doc.ID).Radio(doc.ID == a.pdf.document).Chosen() {
@@ -867,7 +1195,7 @@ func (a *workspace) pdfNavigation(c *ui.Context, p palette, count int, navH floa
 		if len(a.tree.book.Documents) <= 1 {
 			ui.Box(c).Grow(1).MinWidth(0)
 		}
-		designToolbarButton(c, p, icArrowLeft, "上一页", navBtnSz, false, a.pdf.page == 0, func() { a.setPDFPage(a.pdf.page - 1) })
+		designToolbarButton(c, p, icChevronLeft, "上一页", navBtnSz, false, a.pdf.page == 0, func() { a.setPDFPage(a.pdf.page - 1) })
 		pageNum := strconv.Itoa(a.pdf.page + 1)
 		if a.pdf.jumpPageText == "" {
 			a.pdf.jumpPageText = pageNum
@@ -879,8 +1207,9 @@ func (a *workspace) pdfNavigation(c *ui.Context, p palette, count int, navH floa
 		field := ui.TextInput(c.Key("pdf-page-number"), &a.pdf.jumpPageText).Size(inputW, inputH).
 			PaddingX(6).Radius(6).FontSize(inputFont).Label("页码")
 		if field.Submitted() {
-			if n, err := strconv.Atoi(strings.TrimSpace(a.pdf.jumpPageText)); err == nil && n > 0 && n <= count {
-				a.setPDFPage(n - 1)
+			if n, err := strconv.Atoi(strings.TrimSpace(a.pdf.jumpPageText)); err == nil && count > 0 {
+				clamped := max(1, min(count, n))
+				a.setPDFPage(clamped - 1)
 			} else {
 				a.pdf.jumpPageText = pageNum
 			}
@@ -888,7 +1217,147 @@ func (a *workspace) pdfNavigation(c *ui.Context, p palette, count int, navH floa
 		ui.Text(c, fmt.Sprintf("/ %d", count)).SingleLine().FontSize(inputFont).TextColor(p.quiet).Shrink(0)
 		designToolbarButton(c, p, icChevronRight, "下一页", navBtnSz, false, count == 0 || a.pdf.page+1 >= count, func() { a.setPDFPage(a.pdf.page + 1) })
 		ui.Box(c).Grow(1).MinWidth(0)
+		if width >= 300 {
+			designToolbarButton(c, p, icSidebar, "缩略图", navBtnSz, a.pdf.thumbsOpen, count == 0, func() {
+				a.pdf.thumbsOpen = !a.pdf.thumbsOpen
+			})
+		}
+		if width >= 320 {
+			designToolbarButton(c, p, icPDFSearch, "搜全文", navBtnSz, a.pdf.searchOpen, a.pdf.document == "", a.togglePDFSearch)
+		}
+		if width >= 340 {
+			pillButton(c, p, "背诵", icBook, a.reciteMode, a.editing(), a.toggleReciteMode).
+				Height(btnH).Tooltip("遮盖并点按揭晓 PDF 挖空区")
+		}
+		if p.dark && width >= 360 {
+			nightLabel := "原色"
+			if a.settings.PDFNight {
+				nightLabel = "反色"
+			}
+			pillButton(c, p, nightLabel, nil, a.settings.PDFNight, false, func() {
+				next := a.settings
+				next.PDFNight = !next.PDFNight
+				a.saveSettings(next)
+			}).Height(btnH).Tooltip("切换深色模式下 PDF 反色显示")
+		}
+		if width >= 380 {
+			a.zoomControlWithLabels(c, p, max(1, a.pdf.zoom), "pdf-", " PDF", a.zoomPDF)
+		}
 	})
+}
+
+func (a *workspace) pdfSearchPanel(c *ui.Context, p palette, width float32) {
+	ui.Column(c).FillWidth().Shrink(0).Background(p.surface).BorderColor(p.rule).BorderWidth(0, 0, 1, 0).Children(func() {
+		ui.Row(c).Height(42).PaddingX(10).Gap(6).AlignItems(ui.Center).FillWidth().Children(func() {
+			field := ui.TextInput(c.Key("pdf-search-input"), &a.pdf.searchQuery).
+				Grow(1).MinWidth(80).Height(28).PaddingX(8).Radius(7).FontSize(12.5).
+				Background(p.inputBg).Border(1, p.border).TextColor(p.ink).
+				Placeholder("搜索 PDF 全文关键词…").Label("搜索 PDF 全文")
+			if field.Submitted() {
+				a.startPDFSearch()
+			}
+			searchLabel := "搜索"
+			if a.pdf.searchBusy {
+				searchLabel = "搜索中…"
+			}
+			pillButton(c, p, searchLabel, nil, false, a.pdf.searchBusy || strings.TrimSpace(a.pdf.searchQuery) == "", a.startPDFSearch).Height(26)
+			if len(a.pdf.searchHits) > 0 {
+				ui.Text(c, fmt.Sprintf("%d/%d", a.pdf.searchIndex+1, len(a.pdf.searchHits))).
+					FontSize(11.5).TextColor(p.quiet).SingleLine().Shrink(0)
+				designToolbarButton(c, p, icChevronLeft, "上一处", 24, false, false, func() { a.jumpPDFSearchHit(a.pdf.searchIndex - 1) })
+				designToolbarButton(c, p, icChevronRight, "下一处", 24, false, false, func() { a.jumpPDFSearchHit(a.pdf.searchIndex + 1) })
+			}
+			designToolbarButton(c, p, icClose, "关闭全文搜索", 24, false, false, a.togglePDFSearch)
+		})
+		if a.pdf.searchErr != "" {
+			ui.Text(c, a.pdf.searchErr).Padding(4, 12, 8).FontSize(11.5).TextColor(p.danger)
+		} else if a.pdf.searchDone && len(a.pdf.searchHits) == 0 {
+			ui.Text(c, "未找到匹配内容（纯图片扫描版 PDF 暂不支持全文检索）").
+				Padding(4, 12, 8).FontSize(11.5).TextColor(p.quiet)
+		} else if len(a.pdf.searchHits) > 0 {
+			listH := min(116, float32(len(a.pdf.searchHits))*32+8)
+			ui.Scroll(c.Key("pdf-search-hits")).FillWidth().Height(listH).Padding(2, 10, 6).Gap(4).
+				TrackScroll(&a.pdf.searchScroll).Children(func() {
+				for idx, hit := range a.pdf.searchHits {
+					if idx >= 80 {
+						break
+					}
+					active := idx == a.pdf.searchIndex
+					bg, border := p.canvas, p.rule
+					if active {
+						bg, border = p.selectedBg, p.accent.Alpha(.45)
+					}
+					row := ui.ButtonBase(c.Key(fmt.Sprintf("pdf-hit-%d", idx))).
+						FillWidth().Height(28).PaddingX(8).Radius(6).Gap(8).AlignItems(ui.Center).
+						Background(bg).Border(1, border).OnClick(func() { a.jumpPDFSearchHit(idx) })
+					row.Children(func() {
+						ui.Text(c, fmt.Sprintf("P.%d", hit.Page+1)).FontSize(11).FontWeight(600).
+							TextColor(p.accent).SingleLine().Shrink(0)
+						ui.Text(c, hit.Snippet).FontSize(11.5).TextColor(p.ink).
+							SingleLine().Ellipsis("…").Grow(1).MinWidth(0)
+					})
+				}
+			})
+		}
+	})
+}
+
+func (a *workspace) pdfThumbRail(c *ui.Context, p palette, railW, railH float32, count int) {
+	const (
+		itemH  = float32(132)
+		itemGap = float32(6)
+		stride  = itemH + itemGap
+	)
+	ui.Scroll(c.Key("pdf-thumb-rail")).Width(railW).Height(railH).Shrink(0).
+		Background(p.surface).BorderColor(p.rule).BorderWidth(0, 1, 0, 0).
+		Padding(6, 6).Gap(itemGap).TrackScroll(&a.pdf.thumbScroll).Label("PDF 缩略图").
+		Children(func() {
+			start := max(0, int(a.pdf.thumbScroll.Y/stride)-2)
+			visibleCount := max(6, int(railH/stride)+4)
+			end := min(count, start+visibleCount)
+			if start > 0 {
+				ui.Box(c).FillWidth().Height(float32(start)*stride - itemGap).Shrink(0)
+			}
+			dark := p.dark && a.settings.PDFNight
+			for idx := start; idx < end; idx++ {
+				pageIdx := idx
+				ref := pageRef{a.pdf.document, pageIdx}
+				thumb, ready := a.requestPDF(ref, pdfThumbnail, dark, 160)
+				active := pageIdx == a.pdf.page
+				border, bg := p.rule, p.canvas
+				if active {
+					border, bg = p.accent, p.selectedBg
+				}
+				cell := ui.ButtonBase(c.Key(fmt.Sprintf("thumb-%d", pageIdx))).
+					FillWidth().Height(itemH).Shrink(0).Padding(4).Radius(8).
+					Background(bg).Border(1.5, border).Label(fmt.Sprintf("第 %d 页", pageIdx+1)).
+					OnClick(func() { a.setPDFPage(pageIdx) })
+				cell.Children(func() {
+					ui.Column(c).Fill().Center().Gap(3).Children(func() {
+						ui.Box(c).Grow(1).MinHeight(0).FillWidth().Radius(5).Clip().
+							Background(ui.Hex("#ffffff")).Center().Children(func() {
+							if ready && thumb.err == nil && thumb.light != nil {
+								img := thumb.light
+								if dark && thumb.night != nil {
+									img = thumb.night
+								}
+								ui.Image(c, img).Fill().Fit(ui.Contain)
+							} else {
+								ui.Text(c, fmt.Sprintf("%d", pageIdx+1)).FontSize(12).TextColor(p.quiet)
+							}
+						})
+						numColor := p.quiet
+						if active {
+							numColor = p.accent
+						}
+						ui.Text(c, fmt.Sprintf("%d", pageIdx+1)).FontSize(10.5).FontWeight(600).TextColor(numColor).SingleLine()
+					})
+				})
+			}
+			if tail := count - end; tail > 0 {
+				ui.Box(c).FillWidth().Height(float32(tail)*stride - itemGap).Shrink(0)
+			}
+		})
 }
 
 func (a *workspace) pdfSheet(c *ui.Context, p palette, width, height float32, ref pageRef, page renderedPDFPage, pending bool) {
@@ -956,6 +1425,9 @@ func (a *workspace) pdfSheet(c *ui.Context, p palette, width, height float32, re
 						return true
 					case ev.Kind == ui.InputPointerDown:
 						d.lastZoomAt = time.Time{}
+						if ev.Button == 0 && a.drawing.tool == panTool && a.reciteMode && a.toggleMaskAt(ref.document, ref.page, ui.Rect{W: paperW, H: paperH}, ev.X, ev.Y) {
+							return true
+						}
 					}
 					point := inkPoint{X: ev.X / paperW, Y: ev.Y / paperW, Pressure: ev.Pressure}
 					accept := a.drawing.tool != excerptTool || ev.X <= paperW
@@ -995,7 +1467,7 @@ func (a *workspace) pdfSheet(c *ui.Context, p palette, width, height float32, re
 				}
 				sheet.Children(func() {
 					grip := ui.Box(c.Key("pdf-margin-grip")).Absolute().Top(0).Bottom(0).Left(paperW-marginGripW/2).Width(marginGripW).
-						Center().IgnoreInput(a.drawing.tool != panTool).
+						Center().
 						Label("拖动调整留白宽度").Role(ui.RoleSeparator).
 						Draggable(nil, ui.DraggableOptions{Axis: ui.Horizontal, Bounds: &ui.Rect{}, Rigid: true}).
 						HandleInput(func(ev ui.InputEvent) bool {
@@ -1020,6 +1492,11 @@ func (a *workspace) pdfSheet(c *ui.Context, p palette, width, height float32, re
 								a.marginDragging = false
 								if ev.Canceled {
 									d.margin = a.marginStart
+								} else {
+									next := a.settings
+									next.PDFMargin = d.margin
+									next.PDFMarginOpen = true
+									a.saveSettings(next)
 								}
 							default:
 								return false
@@ -1038,9 +1515,9 @@ func (a *workspace) pdfSheet(c *ui.Context, p palette, width, height float32, re
 				})
 			}
 		})
-		if a.mode == pdfMode {
+		if a.mode == pdfMode || (a.mode == splitMode && a.settings.LayoutMode() == notebook.LayoutOutline) {
 			a.inkDock(c, p, pdfMode, width)
-		} else if !pending && width > 235 {
+		} else if !pending && width > 235 && a.touchUI() {
 			hint := "手指导航 · 触控笔书写"
 			if !a.stylusDrawsOnPDF() {
 				hint = "手指导航 · 触控笔选择"
@@ -1069,6 +1546,7 @@ func (a *workspace) pdfSheet(c *ui.Context, p palette, width, height float32, re
 					OnClick(func() {
 						a.pdfHighlightNoteID = ""
 						d.focusedHighlightNoteID = ""
+						d.highlight = nil
 					})
 				if clearBtn.Hovered() {
 					clearBtn.Background(p.tint)
@@ -1288,6 +1766,28 @@ func (a *workspace) mapHighlightRect(hr notebook.HighlightRect, original ui.Rect
 	}, true
 }
 
+func (a *workspace) toggleMaskAt(docID string, pageZeroBased int, original ui.Rect, x, y float32) bool {
+	pageNo := pageZeroBased + 1
+	for _, n := range a.tree.book.Notes {
+		for mi, mr := range n.MaskRects {
+			if mr.Page != pageNo {
+				continue
+			}
+			r, valid := a.mapHighlightRect(mr, original, docID)
+			if !valid {
+				continue
+			}
+			if x >= r.X && x <= r.X+r.W && y >= r.Y && y <= r.Y+r.H {
+				key := fmt.Sprintf("%s:%d:%d", n.ID, mr.Page, mi)
+				a.setMaskRevealed(key, !a.revealedMasks[key])
+				hapticLight()
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func (a *workspace) pdfHighlights(paint *ui.Painter, p palette, original ui.Rect, ref pageRef, key string) {
 	show := func(region notebook.PDFRegion, active bool) {
 		r := ui.Rect{X: original.X + region.X*original.W, Y: original.Y + region.Y*original.H,
@@ -1303,6 +1803,35 @@ func (a *workspace) pdfHighlights(paint *ui.Painter, p palette, original ui.Rect
 		r := card.Excerpt
 		if r != nil && r.Document == ref.document && r.Page == ref.page {
 			show(*r, a.pdf.highlight != nil && *r == *a.pdf.highlight)
+		}
+	}
+	amber := ui.Hex("#f59e0b")
+	if p.dark {
+		amber = ui.Hex("#b45309")
+	}
+	if a.reciteMode {
+		pageNo := ref.page + 1
+		for _, n := range a.tree.book.Notes {
+			for mi, mr := range n.MaskRects {
+				if mr.Page != pageNo {
+					continue
+				}
+				r, valid := a.mapHighlightRect(mr, original, ref.document)
+				if !valid {
+					continue
+				}
+				maskKey := fmt.Sprintf("%s:%d:%d", n.ID, mr.Page, mi)
+				if a.revealedMasks[maskKey] {
+					paint.Fill(r, amber.Alpha(.12), 4)
+					paint.StrokePath(rectPath(r).Dash(0, 4, 3), 1.25, amber.Alpha(.7))
+				} else {
+					paint.Fill(r, amber, 4)
+					paint.StrokePath(rectPath(r), 1.25, amber.Alpha(.9))
+					if r.W >= 54 && r.H >= 18 {
+						paint.Text(r.X+6, r.Y+4, "点击揭晓", 10, ui.Hex("#ffffff"))
+					}
+				}
+			}
 		}
 	}
 	if a.pdfHighlightNoteID != "" {
@@ -1323,14 +1852,15 @@ func (a *workspace) pdfHighlights(paint *ui.Painter, p palette, original ui.Rect
 					paint.StrokePath(rectPath(r), 1.75, hlColor.Alpha(.88))
 				}
 			}
-			amber := ui.Hex("#f59e0b")
-			for _, mr := range hlNote.MaskRects {
-				if mr.Page != pageNo {
-					continue
-				}
-				if r, valid := a.mapHighlightRect(mr, original, ref.document); valid {
-					paint.Fill(r, amber.Alpha(.24), 3)
-					paint.StrokePath(rectPath(r).Dash(0, 4, 3), 1.5, amber.Alpha(.88))
+			if !a.reciteMode {
+				for _, mr := range hlNote.MaskRects {
+					if mr.Page != pageNo {
+						continue
+					}
+					if r, valid := a.mapHighlightRect(mr, original, ref.document); valid {
+						paint.Fill(r, amber.Alpha(.24), 3)
+						paint.StrokePath(rectPath(r).Dash(0, 4, 3), 1.5, amber.Alpha(.88))
+					}
 				}
 			}
 		}
@@ -1363,15 +1893,36 @@ func (a *workspace) createExcerpt(box ui.Rect) {
 	if !a.commitDrawing(next) {
 		return
 	}
+	hapticSuccess()
 	a.pdf.highlight, a.pdf.focusHighlight = &region, true
-	a.setMode(splitMode)
+	if a.mode == pdfMode {
+		a.showActionMessage("已摘录到画布", "分屏查看", func() {
+			if a.settings.LayoutMode() == notebook.LayoutOutline {
+				next := a.settings
+				next.GraphLayout = notebook.LayoutCards
+				a.saveSettings(next)
+			}
+			a.setMode(splitMode)
+			a.jumpToCard = card.ID
+		})
+		return
+	}
+	if a.settings.LayoutMode() == notebook.LayoutOutline {
+		a.showActionMessage("已摘录到画布（大纲流不显示手写卡片）", "切到卡片树", func() {
+			next := a.settings
+			next.GraphLayout = notebook.LayoutCards
+			a.saveSettings(next)
+			a.jumpToCard = card.ID
+		})
+		return
+	}
 	a.jumpToCard = card.ID
 }
 
 func (a *workspace) excerptPreview(c *ui.Context, p palette, region notebook.PDFRegion) {
 	page, ok := a.requestPDF(pageRef{region.Document, region.Page}, pdfThumbnail, p.dark && a.settings.PDFNight, 480)
 	if !ok || page.err != nil {
-		message := "正在载入摘录…"
+		message := "正在加载摘录…"
 		if page.err != nil {
 			message = "原文暂不可用"
 		}

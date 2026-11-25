@@ -17,14 +17,22 @@ const (
 )
 
 type Settings struct {
-	SidebarCollapsed    bool   `json:"sidebarCollapsed"`
-	Appearance          string `json:"appearance,omitempty"`
-	GraphZoom           int    `json:"graphZoom,omitempty"`
-	GraphLayout         string `json:"graphLayout,omitempty"`
-	HideGrid            bool   `json:"hideGrid,omitempty"`
-	PDFNight            bool   `json:"pdfNight"`
-	PenTapToSelect      bool   `json:"penTapToSelect,omitempty"`
-	LastUpdateCheckUnix int64  `json:"lastUpdateCheckUnix,omitempty"`
+	SidebarCollapsed    bool    `json:"sidebarCollapsed"`
+	Appearance          string  `json:"appearance,omitempty"`
+	GraphZoom           int     `json:"graphZoom,omitempty"`
+	GraphLayout         string  `json:"graphLayout,omitempty"`
+	HideGrid            bool    `json:"hideGrid,omitempty"`
+	PDFNight            bool    `json:"pdfNight"`
+	PenTapToSelect      bool    `json:"penTapToSelect,omitempty"`
+	LastUpdateCheckUnix int64   `json:"lastUpdateCheckUnix,omitempty"`
+	LastBookID          string  `json:"lastBookId,omitempty"`
+	SplitRatioH         float32 `json:"splitRatioH,omitempty"`
+	SplitRatioV         float32 `json:"splitRatioV,omitempty"`
+	PDFMarginOpen       bool    `json:"pdfMarginOpen,omitempty"`
+	PDFMargin           float32 `json:"pdfMargin,omitempty"`
+	WebDAVURL           string  `json:"webdavUrl,omitempty"`
+	WebDAVUsername      string  `json:"webdavUsername,omitempty"`
+	WebDAVLastSyncUnix  int64   `json:"webdavLastSyncUnix,omitempty"`
 }
 
 func (s Settings) LayoutMode() string {

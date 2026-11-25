@@ -34,8 +34,8 @@ func TestSharedDAGNodeKeepsClickedBranchTrail(t *testing.T) {
 	if got := app.currentTrail(); !slices.Equal(got, branch2Trail) {
 		t.Fatalf("expected active trail %v, got %v", branch2Trail, got)
 	}
-	if app.scope != "b2" {
-		t.Fatalf("expected scope b2, got %q", app.scope)
+	if app.scope != "" {
+		t.Fatalf("selecting graph node must not overwrite scope, got %q", app.scope)
 	}
 
 	nodes, picked := app.mapNodes(600)
@@ -92,12 +92,12 @@ func TestApplyImportFeedbackMessages(t *testing.T) {
 	app := &workspace{}
 
 	app.applyImport(notebook.ImportResult{Library: lib, BookID: book.ID, Added: 1})
-	if app.message != "已导入笔记本" || app.messageError {
+	if app.message != "已导入「Book」" || app.messageError {
 		t.Fatalf("unexpected added message: %q (err=%v)", app.message, app.messageError)
 	}
 
 	app.applyImport(notebook.ImportResult{Library: lib, BookID: book.ID, Updated: 1})
-	if app.message != "已更新本地笔记本" || app.messageError {
+	if app.message != "已更新「Book」" || app.messageError {
 		t.Fatalf("unexpected updated message: %q (err=%v)", app.message, app.messageError)
 	}
 
@@ -140,7 +140,7 @@ func TestBlocksCoverBodyAndSanitizeExportName(t *testing.T) {
 	if got := sanitizeExportName("高数/级数:总结*?"); got != "高数_级数_总结__" {
 		t.Fatalf("unexpected sanitized filename: %q", got)
 	}
-	if got := sanitizeExportName("   "); got != "mgnote" {
-		t.Fatalf("expected fallback name mgnote, got %q", got)
+	if got := sanitizeExportName("   "); got != "Folio" {
+		t.Fatalf("expected fallback name Folio, got %q", got)
 	}
 }

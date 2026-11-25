@@ -108,16 +108,51 @@ func (a *workspace) ensureExpanded(trail []string) {
 	a.expanded[a.tree.root] = true
 }
 
+func (a *workspace) activeRootID() string {
+	if a.scope != "" {
+		if _, ok := a.tree.notes[a.scope]; ok {
+			return a.scope
+		}
+	}
+	return a.tree.root
+}
+
+func (a *workspace) walkBranchState(visit func(id string, hasKids bool) bool) bool {
+	rootID := a.activeRootID()
+	seen := make(map[string]bool, len(a.tree.order))
+	var walk func(id string) bool
+	walk = func(id string) bool {
+		if seen[id] {
+			return false
+		}
+		seen[id] = true
+		kids := a.visibleKids(id)
+		if id != rootID && len(kids) > 0 && visit(id, true) {
+			return true
+		}
+		for _, cid := range kids {
+			if walk(cid) {
+				return true
+			}
+		}
+		return false
+	}
+	return walk(rootID)
+}
+
+func (a *workspace) hasExpandableBranches() bool {
+	return a.walkBranchState(func(_ string, hasKids bool) bool {
+		return hasKids
+	})
+}
+
 func (a *workspace) hasCollapsedBranches() bool {
 	if a.expanded == nil {
 		return false
 	}
-	for _, id := range a.tree.order {
-		if id != a.tree.root && len(a.visibleKids(id)) > 0 && !a.expanded[id] {
-			return true
-		}
-	}
-	return false
+	return a.walkBranchState(func(id string, hasKids bool) bool {
+		return hasKids && !a.expanded[id]
+	})
 }
 
 func (a *workspace) toggleBranch(id string) {
@@ -506,9 +541,21 @@ func (a *workspace) mapLayout() ([]mapNode, []boardSection, int) {
 	}
 }
 
-func (a *workspace) compactMapNodes() ([]mapNode, int) {
+func (a *workspace) scopedTrail(rootID string) []string {
 	trail := a.currentTrail()
-	nodes := []mapNode{{id: a.tree.root, w: rootWidth, h: nodeH, y: 0, parent: -1, active: true}}
+	if rootID != a.tree.root {
+		if idx := slices.Index(trail, rootID); idx >= 0 {
+			return trail[idx:]
+		}
+		return []string{rootID}
+	}
+	return trail
+}
+
+func (a *workspace) compactMapNodes() ([]mapNode, int) {
+	rootID := a.activeRootID()
+	trail := a.scopedTrail(rootID)
+	nodes := []mapNode{{id: rootID, w: rootWidth, h: nodeH, y: 0, parent: -1, active: a.selected == rootID || len(trail) == 1}}
 	parent, picked := 0, 0
 	for depth := 0; depth < len(trail); depth++ {
 		children := a.tree.kids[nodes[parent].id]
@@ -570,14 +617,18 @@ type cardTreeNode struct {
 }
 
 func (a *workspace) cardMapNodes() ([]mapNode, []boardSection, int) {
-	trail := a.currentTrail()
-	a.ensureExpanded(trail)
+	fullTrail := a.currentTrail()
+	a.ensureExpanded(fullTrail)
 	// Keep every ancestor on the active trail expanded so the active node is always reachable.
-	for i := 0; i < len(trail)-1; i++ {
-		a.expanded[trail[i]] = true
+	for i := 0; i < len(fullTrail)-1; i++ {
+		a.expanded[fullTrail[i]] = true
 	}
 
-	rootID := a.tree.root
+	rootID := a.activeRootID()
+	trail := a.scopedTrail(rootID)
+	if a.expanded != nil {
+		a.expanded[rootID] = true
+	}
 
 	var build func(id string, path []string, depth int) *cardTreeNode
 	build = func(id string, path []string, depth int) *cardTreeNode {
@@ -1238,15 +1289,6 @@ func (a *workspace) selectGraphNode(id string, trail []string) {
 		trail = a.tree.trail(id)
 	}
 	wasSelected := id == a.selected && slices.Equal(trail, a.currentTrail())
-	if a.settings.LayoutMode() != notebook.LayoutBoard {
-		a.scope = ""
-		if len(trail) > 1 && len(a.tree.kids[trail[1]]) > 0 {
-			a.scope = trail[1]
-		}
-	}
-	if a.expanded != nil && len(a.tree.kids[id]) > 0 && !a.expanded[id] {
-		a.expanded[id] = true
-	}
 	// Select in place without jerking the camera; only a second click opens the detail focus modal.
 	a.setNoteAt(id, trail, false)
 	if wasSelected {
@@ -1256,6 +1298,7 @@ func (a *workspace) selectGraphNode(id string, trail []string) {
 	}
 	a.page = browse
 	a.cardMenuOpen = true
+	hapticLight()
 }
 
 type canvasPointer struct {
@@ -1269,7 +1312,7 @@ func (a *workspace) graph(c *ui.Context, p palette, width, height float32) {
 	a.canvasWidth, a.canvasHeight = width, height
 	layoutMode := a.settings.LayoutMode()
 	nodes, sections, picked := a.mapLayout()
-	world := layoutBounds(nodes, sections)
+	world := a.withInkAndCardBounds(layoutBounds(nodes, sections))
 	if a.scale == 0 {
 		fitW := (width - 2*mapInset) / max(1, world.W)
 		fitH := (height - 2*mapInset) / max(1, world.H)
@@ -1554,15 +1597,23 @@ func (a *workspace) cardActionBar(c *ui.Context, p palette, node mapNode, box ui
 		Background(p.elevated).Border(1, p.border).
 		InsetShadow(0, 1, 0, 0, p.specular).
 		Shadow(0, 8, 22, -4, p.modalShadow).Children(func() {
-		actionBtn := func(key, label string, icon *ui.SVG, danger, disabled bool, onClick func()) {
+		actionBtn := func(key, textLabel, a11yLabel string, icon *ui.SVG, danger, disabled bool, onClick func()) {
 			btn := ui.ButtonBase(c.Key(key)).Height(btnH).PaddingX(btnPadX).Gap(4).Radius(6).Center().
-				Label(label).Disabled(disabled).OnClick(onClick)
+				Label(a11yLabel).Tooltip(a11yLabel).Disabled(disabled).OnClick(onClick)
 			fg := p.ink
 			icFg := p.secondary
 			if danger {
 				fg, icFg = p.danger, p.danger
 			}
-			if btn.Hovered() {
+			if disabled {
+				fg, icFg = p.quiet.Alpha(.4), p.quiet.Alpha(.4)
+			} else if btn.Pressed() {
+				if danger {
+					btn.Background(p.dangerWash)
+				} else {
+					btn.Background(p.pressed)
+				}
+			} else if btn.Hovered() {
 				if danger {
 					btn.Background(p.dangerWash)
 				} else {
@@ -1573,37 +1624,39 @@ func (a *workspace) cardActionBar(c *ui.Context, p palette, node mapNode, box ui
 				if icon != nil {
 					ui.Icon(c, icon).Size(icSize, icSize).TextColor(icFg).Shrink(0)
 				}
-				if label != "" {
-					ui.Text(c, label).FontSize(fontSize).FontWeight(550).TextColor(fg).SingleLine()
+				if textLabel != "" {
+					ui.Text(c, textLabel).FontSize(fontSize).FontWeight(550).TextColor(fg).SingleLine()
 				}
 			})
 		}
 
-		actionBtn("act-detail", "详情", icBook, false, false, func() {
+		actionBtn("act-detail", "详情", "查看笔记详情", icBook, false, false, func() {
 			a.cardMenuOpen = false
 			a.page = detail
 		})
-		actionBtn("act-edit", "编辑", icEdit, false, a.busy, a.startEditNote)
-		actionBtn("act-child", "子卡片", icPlus, false, a.busy, a.startAddChild)
+		actionBtn("act-edit", "编辑", "编辑笔记", icEdit, false, a.busy, a.startEditNote)
+		actionBtn("act-child", "子笔记", "新建子笔记", icPlus, false, a.busy, a.startAddChild)
 		if len(imgs) > 0 {
-			actionBtn("act-img", "原图", icPage, false, false, func() {
+			actionBtn("act-img", "原图", "查看大图", icPage, false, false, func() {
 				a.preview = imgs[0]
 			})
 		}
-		if node.hasKids && node.depth > 0 {
+		if node.hasKids && node.depth > 0 && a.settings.LayoutMode() != notebook.LayoutCompact {
 			foldLabel := "折叠"
+			foldTooltip := "折叠下级分支"
 			foldIcon := icChevronDown
 			if !node.expanded {
 				foldLabel = "展开"
+				foldTooltip = "展开下级分支"
 				foldIcon = icChevronRight
 			}
-			actionBtn("act-fold", foldLabel, foldIcon, false, false, func() {
+			actionBtn("act-fold", foldLabel, foldTooltip, foldIcon, false, false, func() {
 				a.toggleBranch(node.id)
 			})
 		}
 		if n.ID != "" {
 			ui.Box(c).Width(1).Height(14).Background(p.rule).Margin(0, 2)
-			actionBtn("act-del", "", icTrash, true, a.busy, a.confirmDeleteNote)
+			actionBtn("act-del", "", "删除笔记", icTrash, true, a.busy, a.confirmDeleteNote)
 		}
 	})
 }
@@ -2327,24 +2380,46 @@ func (a *workspace) richGraphNode(c *ui.Context, p palette, node mapNode, box ui
 	})
 }
 
+func (a *workspace) withInkAndCardBounds(world ui.Rect) ui.Rect {
+	ink := &a.drawing.canvas.bounds
+	ink.update(a.drawing.data.Ink)
+	hasWorld := world.W > 0 || world.H > 0
+	extend := func(r ui.Rect) {
+		if r.W <= 0 && r.H <= 0 {
+			return
+		}
+		if !hasWorld {
+			world = r
+			hasWorld = true
+			return
+		}
+		world = unionRect(world, r)
+	}
+	for _, card := range a.drawing.data.Cards {
+		extend(ui.Rect{X: card.X, Y: card.Y, W: card.W, H: card.H})
+	}
+	if len(ink.boxes) > 0 {
+		extend(ink.extent)
+	}
+	return world
+}
+
 func (a *workspace) minimap(c *ui.Context, p palette, nodes []mapNode, sections []boardSection, extent ui.Rect, width, height float32) {
 	miniW, miniH, inset := float32(126), float32(82), float32(9)
 	if width < 700 {
 		miniW, miniH, inset = 104, 66, 7
 	}
-	if width < 380 && (a.drawing.dockOpen || a.mode == splitMode) {
+	if (width < 520 && a.drawing.dockOpen) || (width < 380 && a.mode == splitMode) {
 		return
+	}
+	bottomPad := float32(16)
+	if a.drawing.dockOpen {
+		bottomPad = 78
 	}
 	cam := ui.Rect{X: -a.panX / a.scale, Y: -a.panY / a.scale, W: width / a.scale, H: height / a.scale}
 	extent = unionRect(extent, cam)
-	for _, card := range a.drawing.data.Cards {
-		extent = unionRect(extent, ui.Rect{X: card.X, Y: card.Y, W: card.W, H: card.H})
-	}
+	extent = a.withInkAndCardBounds(extent)
 	ink := &a.drawing.canvas.bounds
-	ink.update(a.drawing.data.Ink)
-	if len(ink.boxes) > 0 {
-		extent = unionRect(extent, ink.extent)
-	}
 	k := min((miniW-2*inset)/max(1, extent.W), (miniH-2*inset)/max(1, extent.H))
 	x0, y0 := (miniW-extent.W*k)/2, (miniH-extent.H*k)/2
 	mapRect := func(r ui.Rect) ui.Rect {
@@ -2354,12 +2429,29 @@ func (a *workspace) minimap(c *ui.Context, p palette, nodes []mapNode, sections 
 		a.panX = width/2 - (extent.X+(x-x0)/k)*a.scale
 		a.panY = height/2 - (extent.Y+(y-y0)/k)*a.scale
 	}
-	button := ui.ButtonBase(c.Key("minimap")).Absolute().Right(16).Bottom(16).ZIndex(5).Size(miniW, miniH).
+	button := ui.ButtonBase(c.Key("minimap")).Absolute().Right(16).Bottom(bottomPad).ZIndex(5).Size(miniW, miniH).
 		Radius(10).Background(p.elevated).Border(1, p.border).Shadow(0, 3, 12, -2, p.shadow).
-		Label("导航缩略图，定位到画布中心").OnClick(func() { a.recenter = true }).
+		Label("导航缩略图").
 		HandleInput(func(ev ui.InputEvent) bool {
-			if ev.Kind == ui.InputPointerDown && ev.Button == 0 {
+			switch ev.Kind {
+			case ui.InputPointerDown:
+				if ev.Button != 0 {
+					return false
+				}
+				a.minimapDragging = true
 				center(ev.X, ev.Y)
+				return true
+			case ui.InputPointerMove:
+				if !a.minimapDragging {
+					return false
+				}
+				center(ev.X, ev.Y)
+				return true
+			case ui.InputPointerUp:
+				if !a.minimapDragging {
+					return false
+				}
+				a.minimapDragging = false
 				return true
 			}
 			return false
@@ -2422,12 +2514,34 @@ func (a *workspace) lassoMenu(c *ui.Context, p palette, width, height float32) {
 		AlignItems(ui.Center).Background(p.elevated).Radius(10).Border(1, p.border).
 		Shadow(0, 4, 14, -2, p.shadow).Children(func() {
 		for _, opt := range []segment[string]{{"转成脑图卡片", "card"}, {"换色", "color"}, {"删除", "delete"}} {
-			btn := ui.ButtonBase(c.Key(opt.value)).Height(btnH).PaddingX(btnPadX).Center().Radius(6).
-				Label(opt.title).OnClick(func() { a.editLasso(opt.value) })
-			if btn.Hovered() {
-				btn.Background(p.hover)
+			if opt.value == "delete" {
+				ui.Box(c).Width(1).Height(14).Background(p.rule).Margin(0, 2)
 			}
-			btn.Children(func() { ui.Text(c, opt.title).FontSize(fontSize).TextColor(p.secondary) })
+			btn := ui.ButtonBase(c.Key(opt.value)).Height(btnH).PaddingX(btnPadX).Center().Radius(6).
+				Label(opt.title).OnClick(func() {
+				a.editLasso(opt.value)
+				if opt.value == "delete" {
+					a.showActionMessage("已删除选中笔迹", "撤销", func() { a.stepDrawing(true) })
+				}
+			})
+			fg := p.secondary
+			if opt.value == "delete" {
+				fg = p.danger
+			}
+			if btn.Pressed() {
+				if opt.value == "delete" {
+					btn.Background(p.dangerWash)
+				} else {
+					btn.Background(p.pressed)
+				}
+			} else if btn.Hovered() {
+				if opt.value == "delete" {
+					btn.Background(p.dangerWash)
+				} else {
+					btn.Background(p.hover)
+				}
+			}
+			btn.Children(func() { ui.Text(c, opt.title).FontSize(fontSize).TextColor(fg) })
 		}
 	})
 }
@@ -2441,7 +2555,9 @@ func (a *workspace) canvasCard(c *ui.Context, p palette, card notebook.CanvasCar
 			if m.Item("删除画布卡片").Danger().Chosen() {
 				next := a.drawing.data
 				next.Cards = slices.DeleteFunc(slices.Clone(next.Cards), func(c notebook.CanvasCard) bool { return c.ID == card.ID })
-				a.commitDrawing(next)
+				if a.commitDrawing(next) {
+					a.showActionMessage("已删除画布卡片", "撤销", func() { a.stepDrawing(true) })
+				}
 			}
 		})
 	if card.Excerpt == nil {
@@ -2453,7 +2569,7 @@ func (a *workspace) canvasCard(c *ui.Context, p palette, card notebook.CanvasCar
 		ui.Row(c).FillWidth().Padding(7*scale, 12*scale).Gap(4*scale).AlignItems(ui.Center).Children(func() {
 			ui.Text(c, card.Title).Grow(1).MinWidth(0).FontSize(max(3.5, 13*scale)).FontWeight(650).TextColor(p.ink).SingleLine()
 			if r := card.Excerpt; r != nil && scale >= .45 {
-				label := fmt.Sprintf("P.%d ↗", r.Page+1)
+				label := fmt.Sprintf("第 %d 页 ↗", r.Page+1)
 				pillH := 20 * scale
 				if a.touchUI() {
 					pillH = max(pillH, 26)

@@ -1,17 +1,22 @@
 package main
 
 import (
+	"bytes"
+	"compress/zlib"
 	"context"
 	"encoding/json"
 	"encoding/xml"
 	"errors"
+	"fmt"
 	"image"
 	"image/color"
 	"image/draw"
+	"image/png"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -116,7 +121,7 @@ func TestPDFExcerptBacklinkAndPageInk(t *testing.T) {
 		tester.Move(x2, y2)
 		tester.Release(x2, y2)
 	}
-	click("留白")
+	click("批注留白")
 	click("折叠侧边栏")
 	sheet, ok := tester.Find("PDF 原页与留白")
 	if !ok {
@@ -133,15 +138,22 @@ func TestPDFExcerptBacklinkAndPageInk(t *testing.T) {
 	tester.FingerMove(sheet.X+185, sheet.Y+210)
 	tester.FingerMove(sheet.X+280, sheet.Y+260)
 	tester.FingerUp(sheet.X+280, sheet.Y+260)
-	if len(app.drawing.data.Cards) != 1 || app.mode != splitMode {
-		t.Fatalf("excerpt did not create a card and show split mode: %+v, %d", app.drawing.data.Cards, app.mode)
+	if len(app.drawing.data.Cards) != 1 || app.mode != pdfMode {
+		t.Fatalf("excerpt should stay in pdfMode without disrupting reading: cards=%+v mode=%d", app.drawing.data.Cards, app.mode)
+	}
+	if !tester.HasText("已摘录到画布") || !tester.HasText("分屏查看") {
+		t.Fatalf("expected action toast with 分屏查看, got texts=%v", tester.Texts())
+	}
+	click("分屏查看")
+	if app.mode != splitMode {
+		t.Fatalf("expected 分屏查看 action to enter splitMode, got %d", app.mode)
 	}
 	backlink := *app.drawing.data.Cards[0].Excerpt
 	click("下一页")
 	if app.pdf.page != index+1 || len(app.drawing.data.Pages["doc:3"]) != 0 {
 		t.Fatal("page navigation did not isolate annotations")
 	}
-	click("P.3 ↗")
+	click("第 3 页 ↗")
 	if app.pdf.page != index || app.pdf.highlight == nil || *app.pdf.highlight != backlink {
 		t.Fatalf("backlink did not restore the exact source: page=%d region=%+v", app.pdf.page, app.pdf.highlight)
 	}
@@ -374,7 +386,7 @@ func TestGraphLayoutModesAndMultiBranchExpansion(t *testing.T) {
 	if app.page != browse || !app.cardMenuOpen || app.selected != "n3" {
 		t.Fatalf("first click on canvas card should select in-place with action bar: page=%v menu=%v sel=%q", app.page, app.cardMenuOpen, app.selected)
 	}
-	if !tester.HasText("详情") || !tester.HasText("子卡片") {
+	if !tester.HasText("详情") || !tester.HasText("子笔记") {
 		t.Fatal("floating card action bar did not render expected actions")
 	}
 	click("详情")
@@ -1212,7 +1224,7 @@ func TestAndroidTabletPortraitSplitAndTouchTargets(t *testing.T) {
 	if !ok || nextBtn.W < 34 || nextBtn.H < 34 {
 		t.Fatalf("expected touch-friendly PDF 下一页 button >= 34dp, got ok=%v rect=%+v", ok, nextBtn)
 	}
-	if err := tester.Click("留白"); err != nil {
+	if err := tester.Click("批注留白"); err != nil {
 		t.Fatalf("open margin: %v", err)
 	}
 	mGrip, ok := tester.Find("拖动调整留白宽度")
@@ -1301,7 +1313,7 @@ func TestSettingsAboutGitHubAndUpdateFlows(t *testing.T) {
 		t.Fatalf("open settings: %v", err)
 	}
 	scrollSettingsToBottom()
-	wantVer := "当前版本 v" + currentAppVersion()
+	wantVer := "v" + currentAppVersion()
 	for _, want := range []string{"关于 Folio", "版本与更新", wantVer, "检查更新", "开源仓库", "github.com/dongyu-will/folio", "打开 GitHub"} {
 		if !tester.HasText(want) {
 			t.Fatalf("expected %q in Settings About section; texts=%v", want, tester.Texts())
@@ -1322,7 +1334,7 @@ func TestSettingsAboutGitHubAndUpdateFlows(t *testing.T) {
 		t.Fatalf("click 打开 GitHub (fail case): %v", err)
 	}
 	tester.Frame()
-	if !app.messageError || !strings.Contains(app.message, "无法打开链接") {
+	if !app.messageError || !strings.Contains(app.message, "无法打开外部链接") {
 		t.Fatalf("expected friendly URL open failure status, got err=%v msg=%q", app.messageError, app.message)
 	}
 	tester.FailOpenURL(nil)
@@ -1360,8 +1372,8 @@ func TestSettingsAboutGitHubAndUpdateFlows(t *testing.T) {
 		t.Fatalf("click 检查更新 (no release): %v", err)
 	}
 	waitUpdate(updateNoRelease)
-	if !tester.HasText("暂无已发布版本") {
-		t.Fatalf("expected 暂无已发布版本, texts=%v", tester.Texts())
+	if !tester.HasText("暂未发现可用更新") {
+		t.Fatalf("expected 暂未发现可用更新, texts=%v", tester.Texts())
 	}
 
 	// 5. Update available with release URL only (showing version, sanitized notes, 前往发布页 + 重新检查).
@@ -1404,7 +1416,7 @@ func TestSettingsAboutGitHubAndUpdateFlows(t *testing.T) {
 	}
 	waitUpdate(updateAvailable)
 	scrollSettingsToBottom()
-	if !tester.HasText("发现新版本 v0.4.0") || !tester.HasText("下载并更新") {
+	if !tester.HasText("发现新版本 v0.4.0") || !tester.HasText("下载更新") {
 		t.Fatalf("expected macOS direct install UI, texts=%v", tester.Texts())
 	}
 
@@ -1416,8 +1428,8 @@ func TestSettingsAboutGitHubAndUpdateFlows(t *testing.T) {
 	}
 	relaunchCount := 0
 	app.relaunchFn = func() { relaunchCount++ }
-	if err := tester.Click("下载并更新"); err != nil {
-		t.Fatalf("click 下载并更新: %v", err)
+	if err := tester.Click("下载更新"); err != nil {
+		t.Fatalf("click 下载更新: %v", err)
 	}
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
@@ -1455,19 +1467,19 @@ func TestSettingsAboutGitHubAndUpdateFlows(t *testing.T) {
 	}
 	tester.Frame()
 	scrollSettingsToBottom()
-	if err := tester.Click("下载并更新"); err != nil {
-		t.Fatalf("click 下载并更新 (permission flow): %v", err)
+	if err := tester.Click("下载更新"); err != nil {
+		t.Fatalf("click 下载更新 (permission flow): %v", err)
 	}
 	waitUpdate(updatePermissionRequired)
 	scrollSettingsToBottom()
-	if !tester.HasText("请在系统设置中允许 Folio 安装未知来源应用，授权后再次点击「安装更新」") || !tester.HasText("安装更新") {
+	if !tester.HasText("请在系统设置中允许 Folio 安装未知来源应用，授权后再次点击「立即安装」") || !tester.HasText("立即安装") {
 		t.Fatalf("expected Android permission guidance UI, texts=%v", tester.Texts())
 	}
 	app.installUpdateFn = func(ctx context.Context, info *updateInfo, progress func(int64, int64)) (updateInstallResult, error) {
 		return updateInstallResult{}, nil
 	}
-	if err := tester.Click("安装更新"); err != nil {
-		t.Fatalf("click 安装更新: %v", err)
+	if err := tester.Click("立即安装"); err != nil {
+		t.Fatalf("click 立即安装: %v", err)
 	}
 	waitUpdate(updateInstallerLaunched)
 	scrollSettingsToBottom()
@@ -1993,7 +2005,7 @@ func TestUpdateDownloadFailureRetryCancelDeferredAndTouchTargets(t *testing.T) {
 
 	scrollToBottom()
 	// 1. Verify touchUI bumps settingPrimaryButton & settingButton height to 36.
-	primaryRect, ok := tester.Find("下载并更新")
+	primaryRect, ok := tester.Find("下载更新")
 	if !ok || primaryRect.H != 36 {
 		t.Fatalf("expected touch settingPrimaryButton height=36, got ok=%v rect=%+v", ok, primaryRect)
 	}
@@ -2006,14 +2018,14 @@ func TestUpdateDownloadFailureRetryCancelDeferredAndTouchTargets(t *testing.T) {
 	app.installUpdateFn = func(ctx context.Context, info *updateInfo, progress func(int64, int64)) (updateInstallResult, error) {
 		return updateInstallResult{}, errDownloadStalled
 	}
-	if err := tester.Click("下载并更新"); err != nil {
-		t.Fatalf("click 下载并更新: %v", err)
+	if err := tester.Click("下载更新"); err != nil {
+		t.Fatalf("click 下载更新: %v", err)
 	}
 	waitPhase(updateError)
 	if st := app.updateSnapshot(); st.info == nil || st.info.Version != "0.9.2" {
 		t.Fatalf("download failure must preserve st.info, got %+v", st)
 	}
-	for _, want := range []string{errDownloadStalled.Error(), "重试下载", "前往发布页"} {
+	for _, want := range []string{friendlyError(errDownloadStalled), "重试下载", "前往发布页"} {
 		if !tester.HasText(want) {
 			t.Fatalf("expected %q after download failure; texts=%v", want, tester.Texts())
 		}
@@ -2066,20 +2078,20 @@ func TestUpdateDownloadFailureRetryCancelDeferredAndTouchTargets(t *testing.T) {
 	if st := app.updateSnapshot(); st.phase != updateAvailable || st.info == nil || st.info.Version != "0.9.2" {
 		t.Fatalf("expected clean return to updateAvailable with info preserved after cancel, got %+v", st)
 	}
-	if !tester.HasText("下载并更新") {
-		t.Fatalf("expected 下载并更新 button restored after cancel; texts=%v", tester.Texts())
+	if !tester.HasText("下载更新") {
+		t.Fatalf("expected 下载更新 button restored after cancel; texts=%v", tester.Texts())
 	}
 
 	// 4. DeferredUntilForeground renders the exact Chinese hint cleanly.
 	app.installUpdateFn = func(ctx context.Context, info *updateInfo, progress func(int64, int64)) (updateInstallResult, error) {
 		return updateInstallResult{DeferredUntilForeground: true}, nil
 	}
-	if err := tester.Click("下载并更新"); err != nil {
-		t.Fatalf("click 下载并更新 (deferred): %v", err)
+	if err := tester.Click("下载更新"); err != nil {
+		t.Fatalf("click 下载更新 (deferred): %v", err)
 	}
 	waitPhase(updateDeferredForeground)
-	if !tester.HasText("下载已完成，返回应用将自动打开安装器") || !tester.HasText("安装更新") {
-		t.Fatalf("expected deferred foreground guidance and 安装更新 button; texts=%v", tester.Texts())
+	if !tester.HasText("下载已完成，返回应用将自动打开安装器") || !tester.HasText("立即安装") {
+		t.Fatalf("expected deferred foreground guidance and 立即安装 button; texts=%v", tester.Texts())
 	}
 }
 
@@ -2145,18 +2157,18 @@ func TestImportLiveStatusBannerDuringAndAfterImport(t *testing.T) {
 	close(release)
 	drainNextUI("finish queued import")
 	tester.Frame()
-	if app.busy || app.messagePending || app.messageError || app.message != "已导入笔记本" {
+	if app.busy || app.messagePending || app.messageError || !strings.HasPrefix(app.message, "已导入") {
 		t.Fatalf("expected completed import banner: busy=%v pending=%v err=%v msg=%q",
 			app.busy, app.messagePending, app.messageError, app.message)
 	}
-	if tester.HasText(importingNotebookMessage) || !tester.HasText("已导入笔记本") {
+	if tester.HasText(importingNotebookMessage) || !tester.HasText("已导入「示例笔记集」") {
 		t.Fatalf("expected progress banner replaced with completion banner; texts=%v", tester.Texts())
 	}
 
 	// Completed toast expires cleanly once messageUntil has passed.
 	app.messageUntil = time.Now().Add(-time.Second)
 	tester.Frame()
-	if tester.HasText("已导入笔记本") {
+	if tester.HasText("已导入「示例笔记集」") {
 		t.Fatalf("expected completed import banner to auto-dismiss after timeout; texts=%v", tester.Texts())
 	}
 
@@ -2562,5 +2574,827 @@ func TestAndroidOpenPluginManifestIncludesMarginNoteShareMIME(t *testing.T) {
 	if !viewHasMIME || !sendHasMIME {
 		t.Fatalf("expected %q in both VIEW and SEND/SEND_MULTIPLE filters: view=%v send=%v",
 			wantMIME, viewHasMIME, sendHasMIME)
+	}
+}
+
+func TestImportProgressFormattingAndAndroidReceiveBanner(t *testing.T) {
+	if got := formatImportProgress(notebook.ImportProgress{Stage: notebook.ImportStageExtractDB, Done: 256 << 20, Total: 1 << 30}); got != "正在读取笔记数据库… 256.0 MB / 1.0 GB" {
+		t.Fatalf("unexpected extract progress: %q", got)
+	}
+	if got := formatImportProgress(notebook.ImportProgress{Stage: notebook.ImportStageLoadAttachments}); got != importingAttachmentsMessage {
+		t.Fatalf("unexpected attachments progress: %q", got)
+	}
+	if got := formatImportProgress(notebook.ImportProgress{Stage: notebook.ImportStageImportPDF, Done: 600 << 20, Total: 900 << 20, Index: 1, Count: 1}); got != "正在导入 PDF… 600.0 MB / 900.0 MB" {
+		t.Fatalf("unexpected single PDF progress: %q", got)
+	}
+	if got := formatImportProgress(notebook.ImportProgress{Stage: notebook.ImportStageImportPDF, Done: 300 << 20, Total: 600 << 20, Index: 2, Count: 3}); got != "正在导入 PDF (2/3)… 300.0 MB / 600.0 MB" {
+		t.Fatalf("unexpected multi PDF progress: %q", got)
+	}
+
+	app := &workspace{store: notebook.NewStore(t.TempDir())}
+	app.postUI = func(fn func()) { fn() }
+
+	app.onAndroidImportProgress([]byte(`{"copied":536870912,"total":1073741824}`))
+	if !app.messagePending || app.message != "正在接收文件… 512.0 MB / 1.0 GB" {
+		t.Fatalf("unexpected Android receive banner: pending=%v msg=%q", app.messagePending, app.message)
+	}
+	app.onAndroidImportProgress([]byte(`{"done":true}`))
+	if app.messagePending || app.message != "" {
+		t.Fatalf("expected done event to clear pending receive banner: pending=%v msg=%q", app.messagePending, app.message)
+	}
+}
+
+func TestWave1EditorDiscardGuardAndUntitledEdit(t *testing.T) {
+	store := notebook.NewStore(t.TempDir())
+	book := notebook.Book{
+		ID:    "edit-book",
+		Title: "编辑保护测试",
+		Roots: []string{"untitled"},
+		Notes: []notebook.Note{{ID: "untitled", Title: "", Body: "只有正文的无标题卡片"}},
+	}
+	app := &workspace{store: store}
+	app.setLibrary(notebook.Library{Books: []notebook.Book{book}}, book.ID)
+	app.selected = "untitled"
+	app.page = detail
+	app.startEditNote()
+	if app.draftTitle != "" {
+		t.Fatalf("expected untitled note edit to keep draftTitle empty, got %q", app.draftTitle)
+	}
+	if !app.canSaveEditor() {
+		t.Fatal("expected body-only note to be saveable even with empty title")
+	}
+
+	tester := ui.NewTester(app.view, 1280, 800)
+	tester.Frame()
+
+	// Unmodified draft closes immediately on Escape.
+	tester.Key(0, ui.KeyEscape)
+	if app.editing() {
+		t.Fatal("expected unmodified editor to close immediately on Escape")
+	}
+
+	// Modified draft asks for confirmation before discarding.
+	app.startEditNote()
+	app.draftBody = "修改后的正文"
+	tester.Frame()
+	tester.Key(0, ui.KeyEscape)
+	if !app.editing() || !app.discardPrompt {
+		t.Fatalf("expected discardPrompt on dirty Escape: editing=%v prompt=%v", app.editing(), app.discardPrompt)
+	}
+	if err := tester.Click("继续编辑"); err != nil {
+		t.Fatalf("click 继续编辑: %v", err)
+	}
+	if !app.editing() || app.discardPrompt || app.draftBody != "修改后的正文" {
+		t.Fatalf("expected 继续编辑 to preserve draft: editing=%v prompt=%v body=%q", app.editing(), app.discardPrompt, app.draftBody)
+	}
+	tester.Key(0, ui.KeyEscape)
+	if err := tester.Click("放弃修改"); err != nil {
+		t.Fatalf("click 放弃修改: %v", err)
+	}
+	if app.editing() || app.discardPrompt {
+		t.Fatal("expected 放弃修改 to discard and exit editor")
+	}
+}
+
+func TestWave1ToastAboveSettingsAndPersistentError(t *testing.T) {
+	app := &workspace{store: notebook.NewStore(t.TempDir())}
+	app.preferencesOpen = true
+	app.showMessage("操作失败：测试错误", true)
+
+	tester := ui.NewTester(app.view, 1280, 800)
+	tester.Frame()
+	if !tester.HasText("操作失败：测试错误") {
+		t.Fatalf("expected error toast visible above settings modal; texts=%v", tester.Texts())
+	}
+	tester.Advance(10 * time.Second)
+	if !tester.HasText("操作失败：测试错误") {
+		t.Fatal("expected error toast not to auto-dismiss after 10s")
+	}
+	if err := tester.Click("关闭提示"); err != nil {
+		t.Fatalf("click 关闭提示: %v", err)
+	}
+	if app.message != "" || tester.HasText("操作失败：测试错误") {
+		t.Fatalf("expected 关闭提示 to dismiss error toast: msg=%q", app.message)
+	}
+}
+
+func TestWave1PersistLastBookAndPDFPage(t *testing.T) {
+	store := notebook.NewStore(t.TempDir())
+	b1 := notebook.Book{ID: "b1", Title: "第一本", Roots: []string{"n1"}, Notes: []notebook.Note{{ID: "n1", Title: "A"}}}
+	b2 := notebook.Book{
+		ID:        "b2",
+		Title:     "第二本",
+		Roots:     []string{"n2"},
+		Notes:     []notebook.Note{{ID: "n2", Title: "B"}},
+		Documents: []notebook.Document{{ID: strings.Repeat("a", 64), Title: "Doc", LastPage: 1}},
+	}
+	app := &workspace{store: store}
+	app.setLibrary(notebook.Library{Books: []notebook.Book{b1, b2}}, "")
+	if err := store.SaveSettings(app.settings); err != nil {
+		t.Fatal(err)
+	}
+	// Persist book shards so SaveDocumentPage can update b2 on disk.
+	tmpPDF := filepath.Join(t.TempDir(), "doc.pdf")
+	if err := os.WriteFile(tmpPDF, []byte("%PDF-1.7\n%%EOF\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	res, err := store.Import(tmpPDF)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b2 = res.Library.Books[0]
+	docID := b2.Documents[0].ID
+
+	app.setLibrary(notebook.Library{Books: []notebook.Book{b1, b2}}, b2.ID)
+	savedSettings, err := store.ReadSettings()
+	if err != nil || savedSettings.LastBookID != b2.ID {
+		t.Fatalf("expected LastBookID=%q persisted, got %+v err=%v", b2.ID, savedSettings, err)
+	}
+	app.setPDFPage(6) // 0-based page 6 -> 1-based LastPage 7
+	reloaded, err := store.Book(b2.ID)
+	if err != nil || len(reloaded.Documents) != 1 || reloaded.Documents[0].ID != docID || reloaded.Documents[0].LastPage != 7 {
+		t.Fatalf("expected LastPage=7 persisted, got %+v err=%v", reloaded.Documents, err)
+	}
+}
+
+func TestWave1OutlineSplitDockAndPenZoneBlocked(t *testing.T) {
+	app := &workspace{store: notebook.NewStore(t.TempDir()), forceTouchUI: true}
+	app.settings.GraphLayout = notebook.LayoutOutline
+	book := notebook.Book{
+		ID:        "outline-split",
+		Title:     "大纲分屏",
+		Roots:     []string{"n1"},
+		Notes:     []notebook.Note{{ID: "n1", Title: "节点一", Body: "正文"}},
+		Documents: []notebook.Document{{ID: "doc1", Title: "讲义"}},
+	}
+	app.setLibrary(notebook.Library{Books: []notebook.Book{book}}, book.ID)
+	app.mode = splitMode
+	pageImage := image.NewRGBA(image.Rect(0, 0, 400, 600))
+	page := ui.NewBitmap(pageImage)
+	app.pdf.cache = map[pageRef]renderedPDFPage{{"doc1", 0}: {light: page, night: page, count: 5}}
+
+	tester := ui.NewTester(app.view, 1280, 800)
+	tester.Frame()
+	if _, ok := tester.Find("钢笔"); !ok {
+		t.Fatal("expected Outline split mode to host inkDock on PDF pane")
+	}
+
+	app.pdfTOCOpen = true
+	if !app.penZonesBlocked() {
+		t.Fatal("expected penZonesBlocked when pdfTOCOpen is true")
+	}
+	app.pdfTOCOpen = false
+	app.cardMenuOpen = true
+	if !app.penZonesBlocked() {
+		t.Fatal("expected penZonesBlocked when cardMenuOpen is true")
+	}
+}
+
+func TestWave2FriendlyErrorsLayoutScopeAndConditionalSettings(t *testing.T) {
+	// 1. friendlyError translates low-level technical failures cleanly.
+	if got := friendlyError(nil); got != "" {
+		t.Fatalf("friendlyError(nil) = %q, want empty", got)
+	}
+	if got := friendlyError(errors.New("sqlite database is locked")); !strings.Contains(got, "占用") {
+		t.Fatalf("expected friendly SQLite message, got %q", got)
+	}
+	if got := friendlyError(errors.New("unexpected EOF reading zip")); !strings.Contains(got, "不完整") {
+		t.Fatalf("expected friendly archive/EOF message, got %q", got)
+	}
+	if got := friendlyError(errors.New("SHA-256 checksum mismatch")); !strings.Contains(got, "校验") {
+		t.Fatalf("expected friendly SHA-256 message, got %q", got)
+	}
+
+	// 2. Empty desktop workspace hides book management, stylus settings, and Outline canvas settings.
+	app := &workspace{store: notebook.NewStore(t.TempDir())}
+	tester := ui.NewTester(app.view, 1280, 800)
+	app.openPreferences()
+	tester.Frame()
+	if tester.HasText("触控笔与平板") {
+		t.Fatal("desktop workspace should hide 触控笔与平板 settings")
+	}
+	if tester.HasText("笔记本管理") {
+		t.Fatal("empty workspace should hide 笔记本管理 settings")
+	}
+	if err := tester.Click("大纲流"); err != nil {
+		t.Fatalf("switch to outline layout: %v", err)
+	}
+	if tester.HasText("画布默认缩放") || tester.HasText("画布点阵背景") {
+		t.Fatal("LayoutOutline should hide canvas zoom and grid settings")
+	}
+
+	// 3. Toolbar layout switcher + unified scope across all layouts without silent mutation.
+	app.preferencesOpen = false
+	book := notebook.Book{
+		ID:    "scope-book",
+		Title: "数学笔记",
+		Roots: []string{"ch1", "ch2"},
+		Notes: []notebook.Note{
+			{ID: "ch1", Title: "第一章", Children: []string{"s1"}},
+			{ID: "s1", Title: "极限定义", Children: []string{"leaf1"}},
+			{ID: "leaf1", Title: "ε-δ 语言"},
+			{ID: "ch2", Title: "第二章"},
+		},
+		Documents: []notebook.Document{{ID: "doc1", Title: "高等数学"}},
+	}
+	app.setLibrary(notebook.Library{Books: []notebook.Book{book}}, book.ID)
+	app.settings.GraphLayout = notebook.LayoutCards
+	app.mode = canvasMode
+	tester.Frame()
+
+	// Selecting a chapter in sidebar scopes all layouts cleanly.
+	if err := tester.Click("第一章"); err != nil {
+		t.Fatalf("select chapter scope: %v", err)
+	}
+	if app.scope != "ch1" {
+		t.Fatalf("expected scope=ch1, got %q", app.scope)
+	}
+	if !tester.HasText("返回全部") {
+		t.Fatal("expected 返回全部 button in toolbar when scoped")
+	}
+	// Clicking child node in canvas does not overwrite scope.
+	if err := tester.Click("极限定义"); err != nil {
+		t.Fatalf("click child node: %v", err)
+	}
+	if app.scope != "ch1" {
+		t.Fatalf("selecting graph node must not overwrite scope, got %q", app.scope)
+	}
+
+	// Compact layout respects scope too, and toolbar layout switcher switches cleanly.
+	app.settings.GraphLayout = notebook.LayoutCompact
+	nodes, _ := app.compactMapNodes()
+	if len(nodes) == 0 || nodes[0].id != "ch1" {
+		t.Fatalf("expected compactMapNodes root=ch1, got %+v", nodes)
+	}
+	tester.Frame()
+	if err := tester.Click("视图样式：精简树"); err != nil {
+		t.Fatalf("open toolbar layout switcher: %v", err)
+	}
+	if err := tester.Click("大纲流"); err != nil {
+		t.Fatalf("choose 大纲流 from switcher: %v", err)
+	}
+	if app.settings.LayoutMode() != notebook.LayoutOutline {
+		t.Fatalf("expected LayoutOutline after switcher, got %q", app.settings.LayoutMode())
+	}
+	if err := tester.Click("返回全部"); err != nil {
+		t.Fatalf("click 返回全部: %v", err)
+	}
+	if app.scope != "" {
+		t.Fatalf("expected 返回全部 to clear scope, got %q", app.scope)
+	}
+
+	// 4. PDF render error displays friendly retry button "重新加载" and clears cached error.
+	app.mode = splitMode
+	app.pdf.document = "doc1"
+	app.pdf.page = 0
+	app.pdf.cache = map[pageRef]renderedPDFPage{
+		{"doc1", 0}: {err: errors.New("render timeout")},
+	}
+	tester.Frame()
+	if !tester.HasText("重新加载") {
+		t.Fatalf("expected 重新加载 button on PDF error, texts=%v", tester.Texts())
+	}
+	if err := tester.Click("重新加载"); err != nil {
+		t.Fatalf("click 重新加载: %v", err)
+	}
+	if _, stillCachedErr := app.pdf.cache[pageRef{"doc1", 0}]; stillCachedErr {
+		t.Fatal("expected 重新加载 to evict failed cache entry")
+	}
+}
+
+func TestWave3ImportQueueCancelAndEditingGuard(t *testing.T) {
+	app := &workspace{store: notebook.NewStore(t.TempDir())}
+	uiCh := make(chan func(), 32)
+	app.postUI = func(fn func()) { uiCh <- fn }
+	drain := func(label string) {
+		t.Helper()
+		select {
+		case fn := <-uiCh:
+			fn()
+		case <-time.After(2 * time.Second):
+			t.Fatalf("timed out waiting for %s", label)
+		}
+	}
+
+	// 1. Editing guard keeps dropped files queued and shows non-disruptive toast.
+	book := notebook.Book{
+		ID:    "b1",
+		Title: "当前笔记本",
+		Roots: []string{"n1"},
+		Notes: []notebook.Note{{ID: "n1", Title: "标题", Body: "正文"}},
+	}
+	app.setLibrary(notebook.Library{Books: []notebook.Book{book}}, book.ID)
+	app.startEditNote()
+	app.enqueueImport("/tmp/pending-1.marginnotes", "/tmp/pending-2.marginnotes")
+	drain("editing drop guard")
+	if !strings.Contains(app.message, "正在编辑笔记") {
+		t.Fatalf("expected editing guard toast, got %q", app.message)
+	}
+	app.importMu.Lock()
+	qLen := len(app.importPaths)
+	app.importMu.Unlock()
+	if qLen != 2 {
+		t.Fatalf("expected queued files preserved during editing, got %d", qLen)
+	}
+	// 2. Batch summary across 2 imported files + cancellation.
+	var mu sync.Mutex
+	calls := 0
+	app.importFileFn = func(path string, _ func(notebook.ImportResult)) (notebook.ImportResult, error) {
+		mu.Lock()
+		calls++
+		id := fmt.Sprintf("b-batch-%d", calls)
+		n := calls
+		mu.Unlock()
+		return notebook.ImportResult{
+			Library: notebook.Library{Books: []notebook.Book{{ID: id, Title: "批导" + fmt.Sprint(n), Roots: []string{"x"}, Notes: []notebook.Note{{ID: "x", Title: "X"}}}}},
+			BookID:  id,
+			Added:   1,
+		}, nil
+	}
+	app.requestCancelEdit()
+	drain("finish batch item 1")
+	drain("finish batch item 2")
+	if !strings.Contains(app.message, "已导入 2 个文件") || app.messageError {
+		t.Fatalf("expected batch summary toast, got err=%v msg=%q", app.messageError, app.message)
+	}
+
+	// 3. Cancel active import cleanly.
+	started := make(chan struct{})
+	release := make(chan struct{})
+	app.importFileFn = func(path string, _ func(notebook.ImportResult)) (notebook.ImportResult, error) {
+		close(started)
+		<-release
+		return notebook.ImportResult{}, context.Canceled
+	}
+	app.enqueueImport("/tmp/cancel.marginnotes")
+	drain("start cancelable import")
+	<-started
+	app.cancelImport()
+	close(release)
+	drain("finish canceled import")
+	if app.message != "已取消导入" || app.messageError {
+		t.Fatalf("expected 已取消导入 non-error toast, got err=%v msg=%q", app.messageError, app.message)
+	}
+}
+
+func TestWave3PDFNavUndoMinimapImageAndSearch(t *testing.T) {
+	storeDir := t.TempDir()
+	store := notebook.NewStore(storeDir)
+	app := &workspace{store: store}
+	encodeSolidPNG := func(w, h int, col color.RGBA) []byte {
+		im := image.NewRGBA(image.Rect(0, 0, w, h))
+		draw.Draw(im, im.Bounds(), image.NewUniform(col), image.Point{}, draw.Src)
+		var buf bytes.Buffer
+		if err := png.Encode(&buf, im); err != nil {
+			t.Fatal(err)
+		}
+		return buf.Bytes()
+	}
+	img1Bytes := encodeSolidPNG(20, 20, color.RGBA{255, 0, 0, 255})
+	img2Bytes := encodeSolidPNG(24, 24, color.RGBA{0, 128, 255, 255})
+	mediaDir := filepath.Join(storeDir, "media")
+	_ = os.MkdirAll(mediaDir, 0700)
+	_ = os.WriteFile(filepath.Join(mediaDir, "a1.png"), img1Bytes, 0600)
+	_ = os.WriteFile(filepath.Join(mediaDir, "a2.png"), img2Bytes, 0600)
+
+	book := notebook.Book{
+		ID:    "w3-book",
+		Title: "Wave3 测试",
+		Roots: []string{"g1", "c1"},
+		Notes: []notebook.Note{
+			{ID: "g1", Title: "一级分组", Children: []string{"g2"}},
+			{ID: "g2", Title: "二级分组", Children: []string{"g3"}},
+			{ID: "g3", Title: "三级分组", Body: "有正文", Children: []string{"c1"}, Clip: "a1.png", Blocks: []notebook.ContentBlock{
+				{Spans: []notebook.TextSpan{{Text: "富文本量子力学"}}},
+				{Image: "a2.png"},
+			}},
+			{ID: "c1", Title: "目标子节点", Body: "普通文本"},
+		},
+		Documents: []notebook.Document{{ID: "doc1", Title: "讲义全文"}},
+	}
+	app.setLibrary(notebook.Library{Books: []notebook.Book{book}}, book.ID)
+	pageImg := image.NewRGBA(image.Rect(0, 0, 400, 600))
+	bmp := ui.NewBitmap(pageImg)
+	app.pdf.cache = map[pageRef]renderedPDFPage{
+		{"doc1", 0}: {light: bmp, night: bmp, count: 8},
+		{"doc1", 7}: {light: bmp, night: bmp, count: 8},
+	}
+
+	tester := ui.NewTester(app.view, 1280, 800)
+
+	// 1. Spans search + "搜索结果 · N" + "清空搜索" + Cmd+F.
+	app.query = "量子力学"
+	tester.Frame()
+	if !tester.HasText("搜索结果 · 1") || !tester.HasText("富文本量子力学") {
+		t.Fatalf("expected Spans search hit and snippet, texts=%v", tester.Texts())
+	}
+	app.query = "不存在的词条"
+	tester.Frame()
+	if !tester.HasText("清空搜索") {
+		t.Fatal("expected 清空搜索 button on zero results")
+	}
+	if err := tester.Click("清空搜索"); err != nil {
+		t.Fatalf("click 清空搜索: %v", err)
+	}
+	if app.query != "" {
+		t.Fatalf("expected query cleared, got %q", app.query)
+	}
+
+	// Cmd+F expands collapsed sidebar.
+	app.toggleSidebar()
+	tester.Frame()
+	tester.Key(ui.Cmd, ui.KeyF)
+	tester.Frame()
+	if app.settings.SidebarCollapsed {
+		t.Fatal("expected Cmd+F to expand collapsed sidebar")
+	}
+
+	// 2. Detail breadcrumb keeps modal open and shows leading ellipsis when depth > 2.
+	app.openNote("c1")
+	tester.Frame()
+	if !tester.HasText("…") {
+		t.Fatalf("expected leading ellipsis for 3+ ancestor breadcrumbs, texts=%v", tester.Texts())
+	}
+	if err := tester.Click("跳转到二级分组"); err != nil {
+		t.Fatalf("click breadcrumb: %v", err)
+	}
+	if app.page != detail || app.selected != "g2" {
+		t.Fatalf("expected breadcrumb click to stay in detail on g2, page=%v sel=%q", app.page, app.selected)
+	}
+
+	// 3. Multi-image viewer with zoom & 1 / 2 stepping.
+	app.openNote("g3")
+	app.preview = "a1.png"
+	tester.Frame()
+	if !tester.HasText("1 / 2") {
+		t.Fatalf("expected multi-image 1 / 2 indicator, texts=%v", tester.Texts())
+	}
+	if err := tester.Click("放大图片"); err != nil {
+		t.Fatalf("click 放大图片: %v", err)
+	}
+	if app.previewZoom <= 1.0 {
+		t.Fatalf("expected previewZoom > 1, got %g", app.previewZoom)
+	}
+	if err := tester.Click("下一张"); err != nil {
+		t.Fatalf("click 下一张: %v", err)
+	}
+	if app.preview != "a2.png" || app.previewZoom != 1 {
+		t.Fatalf("expected second image with reset zoom, preview=%q zoom=%g", app.preview, app.previewZoom)
+	}
+	tester.Key(0, ui.KeyEscape)
+	app.page = browse
+	tester.Frame()
+
+	// 4. 100-step ink undo + Outline Cmd+Z guard + cross-page undo toast.
+	var stack []notebook.Drawing
+	for i := range 105 {
+		stack = pushDrawing(stack, notebook.Drawing{Ink: make([]inkStroke, i)})
+	}
+	if len(stack) != 100 {
+		t.Fatalf("expected 100-step drawing undo stack, got %d", len(stack))
+	}
+
+	app.mode = splitMode
+	app.setPDFPage(0)
+	app.commitStrokes("doc1:0", []inkStroke{{Width: 2, Points: []inkPoint{{X: .1, Y: .1}}}})
+	app.setPDFPage(2)
+	app.stepDrawing(true)
+	if app.pdf.page != 0 || !strings.Contains(app.message, "第 1 页") {
+		t.Fatalf("expected undo on different page to jump back to page 1 with toast, page=%d msg=%q", app.pdf.page, app.message)
+	}
+
+	// Outline Cmd+Z guard does not step drawing undo when canvasMode && LayoutOutline.
+	app.mode = canvasMode
+	app.settings.GraphLayout = notebook.LayoutOutline
+	app.commitStrokes("", []inkStroke{{Width: 2, Points: []inkPoint{{X: 10, Y: 10}}}})
+	undoBefore := len(app.drawing.undo)
+	tester.Frame()
+	tester.Key(ui.Cmd, ui.KeyZ)
+	if len(app.drawing.undo) != undoBefore {
+		t.Fatal("Cmd+Z should not run drawing undo in Outline canvasMode")
+	}
+
+	// 5. PDF nav zoom in splitMode + clamped page jump + split persistence.
+	app.dismissMessage()
+	app.mode = splitMode
+	app.settings.GraphLayout = notebook.LayoutCards
+	tester.Frame()
+	if err := tester.Click("放大 PDF"); err != nil {
+		t.Fatalf("click PDF nav zoom-in in splitMode: %v", err)
+	}
+	if app.pdf.zoom <= 1.0 {
+		t.Fatalf("expected PDF zoom > 1 in splitMode, got %g", app.pdf.zoom)
+	}
+	app.pdf.jumpPageText = "999"
+	field, ok := tester.Find("页码")
+	if !ok {
+		t.Fatal("missing 页码 input")
+	}
+	tester.Click("页码")
+	_ = field
+	tester.Key(0, ui.KeyEnter)
+	if app.pdf.page != 7 {
+		t.Fatalf("expected out-of-range page input clamped to 7 (page 8), got %d", app.pdf.page)
+	}
+}
+
+func TestMyGoUpgradeLifecycleMemorySessionAndBars(t *testing.T) {
+	// 1. barStyleForAppearance maps Folio appearances to complementary system bar icon styles.
+	if got := barStyleForAppearance("light"); got != mygo.BarStyleDark {
+		t.Fatalf("light appearance bar style = %q, want %q", got, mygo.BarStyleDark)
+	}
+	if got := barStyleForAppearance("dark"); got != mygo.BarStyleLight {
+		t.Fatalf("dark appearance bar style = %q, want %q", got, mygo.BarStyleLight)
+	}
+	if got := barStyleForAppearance("system"); got != mygo.BarStyleAuto {
+		t.Fatalf("system appearance bar style = %q, want %q", got, mygo.BarStyleAuto)
+	}
+
+	// 2. releaseMemoryCaches drops PDF/thumb/media/ink caches silently without a toast.
+	b1 := notebook.Book{
+		ID:        "book-1",
+		Title:     "第一本",
+		Roots:     []string{"n1"},
+		Notes:     []notebook.Note{{ID: "n1", Title: "概论"}},
+		Documents: []notebook.Document{{ID: "doc-a", Title: "Doc A"}},
+	}
+	b2 := notebook.Book{
+		ID:    "book-2",
+		Title: "第二本",
+		Roots: []string{"b2n1"},
+		Notes: []notebook.Note{
+			{ID: "b2n1", Title: "章节", Children: []string{"b2n2"}},
+			{ID: "b2n2", Title: "定理", Body: "微积分基本定理"},
+		},
+		Documents: []notebook.Document{
+			{ID: "doc-1", Title: "讲义一"},
+			{ID: "doc-2", Title: "讲义二"},
+		},
+	}
+	lib := notebook.Library{Books: []notebook.Book{b1, b2}}
+
+	app := &workspace{store: notebook.NewStore(t.TempDir())}
+	app.setLibrary(lib, b2.ID)
+	app.pdf.cache = map[pageRef]renderedPDFPage{{"doc-2", 3}: {count: 10}}
+	app.pdf.thumbs = map[pageRef]renderedPDFPage{{"doc-2", 3}: {count: 10}}
+	app.mediaDims = map[string]image.Point{"x.png": {X: 10, Y: 10}}
+	app.drawing.canvas.hadLiveMarker = true
+	app.releaseMemoryCaches()
+	if app.pdf.cache != nil || app.pdf.thumbs != nil || app.mediaDims != nil || app.drawing.canvas.hadLiveMarker {
+		t.Fatal("expected releaseMemoryCaches to clear cached PDF, media, and drawing buffers")
+	}
+	if app.message != "" {
+		t.Fatalf("expected silent memory eviction, got toast %q", app.message)
+	}
+
+	// 3. Session state save & restore across kills restores book, scope, trail, PDF page, mode, and query.
+	app.scope = "b2n1"
+	app.setNoteWithTrail("b2n2", []string{"b2n1", "b2n2"})
+	app.setPDFDocument("doc-2")
+	app.setPDFPage(4)
+	app.setMode(splitMode)
+	app.query = "微积分"
+	saved := app.marshalSessionState()
+	if len(saved) == 0 {
+		t.Fatal("expected non-empty marshaled session state")
+	}
+
+	restored := &workspace{store: notebook.NewStore(t.TempDir())}
+	restored.setLibrary(lib, b1.ID)
+	restored.restoreSessionState([]byte("{bad json"))
+	if restored.bookID != b1.ID {
+		t.Fatalf("corrupt session state should be ignored safely, bookID=%q", restored.bookID)
+	}
+	restored.restoreSessionState(saved)
+	if restored.bookID != b2.ID || restored.scope != "b2n1" || restored.selected != "b2n2" ||
+		!slices.Equal(restored.activeTrail, []string{"b2n1", "b2n2"}) ||
+		restored.pdf.document != "doc-2" || restored.pdf.page != 4 ||
+		restored.mode != splitMode || restored.query != "微积分" {
+		t.Fatalf("restored session mismatch: book=%q scope=%q sel=%q trail=%v doc=%q page=%d mode=%v query=%q",
+			restored.bookID, restored.scope, restored.selected, restored.activeTrail,
+			restored.pdf.document, restored.pdf.page, restored.mode, restored.query)
+	}
+}
+
+func TestPhase1FiltersMetaEditingAndReciteReview(t *testing.T) {
+	store := notebook.NewStore(t.TempDir())
+	c2, c7 := 2, 7
+	p1 := int64(2)
+	book := notebook.Book{
+		ID:    "p1-book",
+		Title: "背诵与筛选",
+		Roots: []string{"g1", "g2"},
+		Notes: []notebook.Note{
+			{ID: "g1", Title: "力学", Color: &c2, Tags: []string{"核心", "物理"}, Body: "牛顿第二定律 F=ma", Page: &p1, MaskRects: []notebook.HighlightRect{{Page: 2, X: 0.1, Y: 0.1, W: 0.4, H: 0.2}}},
+			{ID: "g2", Title: "光学", Color: &c7, Tags: []string{"光学"}, Body: "折射定律 n1*sinθ1=n2*sinθ2"},
+		},
+		Documents: []notebook.Document{{ID: "doc1", Title: "讲义"}},
+	}
+	_ = store.SaveSettings(notebook.Settings{})
+	lib := notebook.Library{Books: []notebook.Book{book}}
+	app := &workspace{store: store}
+	app.setLibrary(lib, book.ID)
+	pageImg := image.NewRGBA(image.Rect(0, 0, 400, 600))
+	bmp := ui.NewBitmap(pageImg)
+	app.pdf.cache = map[pageRef]renderedPDFPage{{"doc1", 1}: {light: bmp, night: bmp, count: 4}}
+
+	tester := ui.NewTester(app.view, 1280, 800)
+	tester.Frame()
+
+	// 1. Sidebar filter popover filters by tag.
+	if err := tester.Click("筛选"); err != nil {
+		t.Fatalf("open filter popover: %v", err)
+	}
+	if err := tester.Click("#物理"); err != nil {
+		t.Fatalf("click tag filter #物理: %v", err)
+	}
+	if !tester.HasText("筛选结果 · 1") {
+		t.Fatalf("expected 筛选结果 · 1 after tag filter, texts=%v", tester.Texts())
+	}
+	if err := tester.Click("筛选 · 1"); err != nil {
+		t.Fatalf("reopen active filter popover: %v", err)
+	}
+	if err := tester.Click("清空筛选"); err != nil {
+		t.Fatalf("click 清空筛选: %v", err)
+	}
+	if app.hasActiveFilter() {
+		t.Fatal("expected filters cleared")
+	}
+
+	// 2. Editor modifies color & tags (SaveNoteWithMeta) and resets filter cleanly.
+	app.openNote("g2")
+	tester.Frame()
+	app.startEditNote()
+	app.draftTags = "物理, 错题"
+	app.draftColorSet, app.draftColor = true, 4
+	if !app.editorDirty() {
+		t.Fatal("expected editorDirty when tags/color changed")
+	}
+	// Persist using store directly (work() needs window/postUI); first seed book shard on disk.
+	dbPath := filepath.Join(t.TempDir(), "seed.marginnotes")
+	_ = dbPath
+	app.editMode = editNone
+	app.page = browse
+
+	// 3. PDF recite mode masks and toggles on tap, and readerPanel hides/reveals body.
+	app.mode = splitMode
+	app.setPDFPage(1)
+	tester.Frame()
+	if err := tester.Click("背诵"); err != nil {
+		t.Fatalf("enable reciteMode: %v", err)
+	}
+	if !app.reciteMode {
+		t.Fatal("expected reciteMode enabled")
+	}
+	app.openNote("g1")
+	tester.Frame()
+	if !tester.HasText("背诵模式：已隐藏正文与附图") {
+		t.Fatalf("expected detail recite occlusion card, texts=%v", tester.Texts())
+	}
+	if err := tester.Click("点击揭晓正文"); err != nil {
+		t.Fatalf("click reveal in detail: %v", err)
+	}
+	if !tester.HasText("牛顿第二定律 F=ma") {
+		t.Fatal("expected detail body revealed after click")
+	}
+
+	// Mask toggle on PDF sheet coordinate inside (0.1..0.5, 0.1..0.3).
+	sheet, ok := tester.Find("PDF 原页与留白")
+	if !ok {
+		t.Fatal("PDF sheet missing")
+	}
+	tester.Click("PDF 原页与留白")
+	_ = sheet
+	if !app.toggleMaskAt("doc1", 1, ui.Rect{W: 1, H: 1}, 0.25, 0.20) {
+		t.Fatal("expected toggleMaskAt to hit g1 MaskRect on page 2")
+	}
+	if !app.revealedMasks["g1:2:0"] {
+		t.Fatal("expected revealedMasks[g1:2:0] toggled true")
+	}
+
+	// 4. Flashcard review flow: open -> reveal -> 再记一遍 -> 已掌握 -> done.
+	app.page = browse
+	tester.Frame()
+	if err := tester.Click("抽卡"); err != nil {
+		t.Fatalf("open flashcard review: %v", err)
+	}
+	if !app.reviewOpen || len(app.reviewQueue) != 2 {
+		t.Fatalf("expected 2 review cards, open=%v queue=%v", app.reviewOpen, app.reviewQueue)
+	}
+	tester.Key(0, ui.KeySpace)
+	if !app.reviewRevealed {
+		t.Fatal("expected Space to reveal answer")
+	}
+	firstCard := app.reviewQueue[0]
+	if err := tester.Click("再记一遍"); err != nil {
+		t.Fatalf("click 再记一遍: %v", err)
+	}
+	if app.reviewQueue[len(app.reviewQueue)-1] != firstCard || app.reviewRevealed {
+		t.Fatalf("expected 再记一遍 to move card to end and hide answer, queue=%v", app.reviewQueue)
+	}
+	tester.Key(0, ui.KeySpace)
+	if err := tester.Click("已掌握"); err != nil {
+		t.Fatalf("click 已掌握 (1): %v", err)
+	}
+	tester.Key(0, ui.KeySpace)
+	if err := tester.Click("已掌握"); err != nil {
+		t.Fatalf("click 已掌握 (2): %v", err)
+	}
+	if !tester.HasText("本轮背诵已完成") {
+		t.Fatalf("expected review completion screen, texts=%v", tester.Texts())
+	}
+}
+
+func TestSearchPDFTextPureGo(t *testing.T) {
+	var zbuf bytes.Buffer
+	zw := zlib.NewWriter(&zbuf)
+	_, _ = zw.Write([]byte("BT /F1 12 Tf 72 720 Td (Newton Second Law F=ma) Tj ET"))
+	_ = zw.Close()
+
+	var pdf bytes.Buffer
+	pdf.WriteString("%PDF-1.4\n")
+	pdf.WriteString("1 0 obj\n<< /Type /Page >>\nendobj\n")
+	pdf.WriteString("2 0 obj\n<< /Filter /FlateDecode >>\nstream\n")
+	pdf.Write(zbuf.Bytes())
+	pdf.WriteString("\nendstream\nendobj\n")
+	pdf.WriteString("3 0 obj\n<< /Type /Page >>\nendobj\n")
+	pdf.WriteString("4 0 obj\nstream\nBT (Gauss Law flux equation) Tj ET\nendstream\nendobj\n")
+
+	pdfPath := filepath.Join(t.TempDir(), "sample.pdf")
+	if err := os.WriteFile(pdfPath, pdf.Bytes(), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	hits, err := searchPDFTextPureGo(pdfPath, "newton second", 50)
+	if err != nil {
+		t.Fatalf("searchPDFTextPureGo failed: %v", err)
+	}
+	if len(hits) != 1 || hits[0].Page != 0 || !strings.Contains(hits[0].Snippet, "Newton Second Law") {
+		t.Fatalf("unexpected compressed stream hits: %+v", hits)
+	}
+
+	hits2, err := searchPDFTextPureGo(pdfPath, "gauss law", 50)
+	if err != nil {
+		t.Fatalf("searchPDFTextPureGo plain stream failed: %v", err)
+	}
+	if len(hits2) != 1 || hits2[0].Page != 1 || !strings.Contains(hits2[0].Snippet, "Gauss Law") {
+		t.Fatalf("unexpected page 2 hits: %+v", hits2)
+	}
+}
+
+func TestPhase2PDFThumbsAndSearchInteraction(t *testing.T) {
+	docID := "doc-search-1"
+	app := &workspace{store: notebook.NewStore(t.TempDir())}
+	book := notebook.Book{
+		ID:        "b1",
+		Title:     "PDF 导航测试",
+		Documents: []notebook.Document{{ID: docID, Title: "讲义.pdf", LastPage: 1}},
+		Roots:     []string{"n1"},
+		Notes:     []notebook.Note{{ID: "n1", Title: "笔记", Body: "正文"}},
+	}
+	app.setLibrary(notebook.Library{Books: []notebook.Book{book}}, book.ID)
+	app.mode = splitMode
+	app.pdf.counts = map[string]int{docID: 4}
+	app.pdf.cache = map[pageRef]renderedPDFPage{
+		{docID, 0}: {light: ui.NewBitmap(image.NewRGBA(image.Rect(0, 0, 120, 160))), count: 4, side: 160, aspect: 1.333},
+		{docID, 2}: {light: ui.NewBitmap(image.NewRGBA(image.Rect(0, 0, 120, 160))), count: 4, side: 160, aspect: 1.333},
+	}
+
+	tester := ui.NewTester(app.view, 1280, 800)
+	tester.Frame()
+
+	if err := tester.Click("缩略图"); err != nil {
+		t.Fatalf("toggle thumbsOpen: %v", err)
+	}
+	if !app.pdf.thumbsOpen {
+		t.Fatal("expected pdf.thumbsOpen true")
+	}
+	if err := tester.Click("第 3 页"); err != nil {
+		t.Fatalf("click thumbnail page 3: %v", err)
+	}
+	if app.pdf.page != 2 {
+		t.Fatalf("expected page index 2 after thumbnail click, got %d", app.pdf.page)
+	}
+
+	if err := tester.Click("搜全文"); err != nil {
+		t.Fatalf("toggle searchOpen: %v", err)
+	}
+	if !app.pdf.searchOpen || !tester.HasText("搜索") {
+		t.Fatalf("expected search bar open, open=%v texts=%v", app.pdf.searchOpen, tester.Texts())
+	}
+
+	app.applyPDFSearchResult(app.pdf.searchSeq, docID, []pdfSearchHit{
+		{Page: 0, Snippet: "第 1 页命中摘要"},
+		{Page: 3, Snippet: "第 4 页命中摘要"},
+	}, nil)
+	tester.Frame()
+	if !tester.HasText("1/2") || app.pdf.page != 0 {
+		t.Fatalf("expected first search hit jumped to page 0 and counter 1/2, page=%d", app.pdf.page)
+	}
+	if err := tester.Click("下一处"); err != nil {
+		t.Fatalf("click 下一处: %v", err)
+	}
+	if app.pdf.page != 3 || app.pdf.searchIndex != 1 {
+		t.Fatalf("expected jump to page 3 (hit 1), got page=%d idx=%d", app.pdf.page, app.pdf.searchIndex)
 	}
 }

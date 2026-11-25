@@ -118,6 +118,7 @@ var (
 	icImport       = svgIcon(`<path d="M12 4v11m-4-3.5 4 4 4-4"/><path d="M4.5 16.5v2a1.5 1.5 0 0 0 1.5 1.5h12a1.5 1.5 0 0 0 1.5-1.5v-2"/>`)
 	icBook         = svgIcon(`<path d="M4 19.5v-15A2.5 2.5 0 0 1 6.5 2H19a1 1 0 0 1 1 1v18a1 1 0 0 1-1 1H6.5a2.5 2.5 0 0 1 0-5H20"/>`)
 	icChevronDown  = svgIcon(`<path d="m6.5 9.5 5.5 5.5 5.5-5.5"/>`)
+	icChevronLeft  = svgIcon(`<path d="m14.5 6.5-5.5 5.5 5.5 5.5"/>`)
 	icChevronRight = svgIcon(`<path d="m9.5 6.5 5.5 5.5-5.5 5.5"/>`)
 	icTrash        = svgIcon(`<path d="M3.5 6h17"/><path d="M8.5 6V4.2A1.2 1.2 0 0 1 9.7 3h4.6a1.2 1.2 0 0 1 1.2 1.2V6"/><path d="M6.5 6l.9 13.3A1.7 1.7 0 0 0 9.1 21h5.8a1.7 1.7 0 0 0 1.7-1.7L17.5 6"/>`)
 	icPlus         = svgIcon(`<path d="M12 5v14M5 12h14"/>`)
@@ -133,6 +134,7 @@ var (
 	icPage         = svgIcon(`<path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8Z"/><path d="M14 3v5h5"/>`)
 	icFit          = svgIcon(`<path d="M4 9V6a2 2 0 0 1 2-2h3"/><path d="M15 4h3a2 2 0 0 1 2 2v3"/><path d="M20 15v3a2 2 0 0 1-2 2h-3"/><path d="M9 20H6a2 2 0 0 1-2-2v-3"/>`)
 	icPointer      = svgIcon(`<path d="M5 3.5 17.5 11l-5.3 1.4L9.8 18Z"/><path d="m12.8 12.8 4.4 4.4"/>`)
+	icPDFSearch    = svgIcon(`<circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/>`)
 )
 
 func clamp(n, low, high float32) float32 { return max(low, min(n, high)) }
@@ -191,7 +193,11 @@ func primaryButton(c *ui.Context, p palette, label string, icon *ui.SVG, disable
 
 // pillButton renders an Apple/Linear secondary or ghost pill button with optional icon.
 func pillButton(c *ui.Context, p palette, label string, icon *ui.SVG, elevated, disabled bool, pressed func()) ui.Element {
-	b := ui.ButtonBase(c).Label(label).MinHeight(34).Padding(0, 10).Radius(8).Center().Gap(5).
+	minH := float32(34)
+	if isMobilePlatform() {
+		minH = 38
+	}
+	b := ui.ButtonBase(c).Label(label).Tooltip(label).MinHeight(minH).Padding(0, 10).Radius(8).Center().Gap(5).
 		Disabled(disabled).FocusRingColor(p.accent).OnClick(pressed)
 	fg := p.secondary
 	if elevated {
@@ -220,9 +226,13 @@ func pillButton(c *ui.Context, p palette, label string, icon *ui.SVG, elevated, 
 	return b
 }
 
-// iconButton renders a compact 34x34 tactile icon button (or danger icon button).
+// iconButton renders a tactile icon button (or danger icon button).
 func iconButton(c *ui.Context, p palette, icon *ui.SVG, label string, danger, disabled bool, pressed func()) ui.Element {
-	b := ui.ButtonBase(c).Label(label).Size(34, 34).Radius(8).Center().Shrink(0).
+	sz := float32(34)
+	if isMobilePlatform() {
+		sz = 38
+	}
+	b := ui.ButtonBase(c).Label(label).Tooltip(label).Size(sz, sz).Radius(8).Center().Shrink(0).
 		Disabled(disabled).FocusRingColor(p.accent).OnClick(pressed)
 	fg := p.quiet
 	if !disabled {

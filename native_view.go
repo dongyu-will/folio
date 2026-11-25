@@ -42,9 +42,28 @@ func (a *workspace) view(c *ui.Context) {
 	a.lastViewW = width
 	a.lastViewWide, a.lastViewSidebar = wide, side
 	if a.preview != "" {
-		closePreview := func() { a.preview = "" }
+		closePreview := func() {
+			a.preview = ""
+			a.previewZoom = 1
+		}
 		c.OnShortcut(0, ui.KeyBack, closePreview)
 		c.OnShortcut(0, ui.KeyEscape, closePreview)
+		c.OnShortcut(0, ui.KeyLeft, func() { a.stepPreviewImage(-1) })
+		c.OnShortcut(0, ui.KeyRight, func() { a.stepPreviewImage(1) })
+	} else if a.reviewOpen {
+		closeReview := func() { a.reviewOpen = false }
+		c.OnShortcut(0, ui.KeyBack, closeReview)
+		c.OnShortcut(0, ui.KeyEscape, closeReview)
+		c.OnShortcut(0, ui.KeySpace, func() {
+			if a.reviewIndex < len(a.reviewQueue) {
+				a.reviewRevealed = !a.reviewRevealed
+			}
+		})
+		c.OnShortcut(0, ui.KeyRight, func() {
+			if a.reviewRevealed {
+				a.markReviewCard(true)
+			}
+		})
 	} else if a.preferencesOpen {
 		closeSettings := func() {
 			if a.renameOpen {
@@ -56,14 +75,10 @@ func (a *workspace) view(c *ui.Context) {
 		c.OnShortcut(0, ui.KeyBack, closeSettings)
 		c.OnShortcut(0, ui.KeyEscape, closeSettings)
 	} else if a.editing() {
-		cancelEdit := func() {
-			a.editMode = editNone
-			a.flushImports()
-		}
-		c.OnShortcut(0, ui.KeyBack, cancelEdit)
-		c.OnShortcut(0, ui.KeyEscape, cancelEdit)
+		c.OnShortcut(0, ui.KeyBack, a.requestCancelEdit)
+		c.OnShortcut(0, ui.KeyEscape, a.requestCancelEdit)
 		c.OnShortcut(ui.Cmd, ui.KeyS, func() {
-			if (a.editMode == editNote || a.editMode == editNewChild) && !a.busy && strings.TrimSpace(a.draftTitle) != "" {
+			if (a.editMode == editNote || a.editMode == editNewChild) && !a.busy {
 				a.saveEditor()
 			}
 		})
@@ -88,9 +103,28 @@ func (a *workspace) view(c *ui.Context) {
 		c.OnShortcut(0, ui.KeyBack, dismiss)
 		c.OnShortcut(0, ui.KeyEscape, dismiss)
 	}
+	if a.bookID != "" && a.preview == "" && !a.preferencesOpen && !a.editing() {
+		c.OnShortcut(ui.Cmd, ui.KeyF, func() {
+			a.sidebarHiddenForSplit = false
+			if !wide {
+				a.page = libraryScreen
+			} else if a.settings.SidebarCollapsed {
+				next := a.settings
+				next.SidebarCollapsed = false
+				a.saveSettings(next)
+			}
+			a.focusSearch = true
+		})
+	}
 	if a.bookID != "" && a.preview == "" && !a.preferencesOpen && !a.editing() && a.page == browse {
-		c.OnShortcut(ui.Cmd, ui.KeyZ, func() { a.stepDrawing(true) })
-		c.OnShortcut(ui.Cmd|ui.Shift, ui.KeyZ, func() { a.stepDrawing(false) })
+		if a.mode != canvasMode || a.settings.LayoutMode() != notebook.LayoutOutline {
+			c.OnShortcut(ui.Cmd, ui.KeyZ, func() { a.stepDrawing(true) })
+			c.OnShortcut(ui.Cmd|ui.Shift, ui.KeyZ, func() { a.stepDrawing(false) })
+		}
+		if a.mode != canvasMode && !a.pdfTOCOpen {
+			c.OnShortcut(0, ui.KeyPageUp, func() { a.setPDFPage(a.pdf.page - 1) })
+			c.OnShortcut(0, ui.KeyPageDown, func() { a.setPDFPage(a.pdf.page + 1) })
+		}
 		if a.mode == pdfMode {
 			c.OnShortcut(ui.Cmd, ui.KeyEqual, func() { a.zoomPDF(1.18) })
 			c.OnShortcut(ui.Cmd, ui.KeyMinus, func() { a.zoomPDF(1 / 1.18) })
@@ -126,9 +160,6 @@ func (a *workspace) view(c *ui.Context) {
 			if !wide || a.bookID == "" {
 				a.mobileHeader(c, p, wide)
 				availableH -= 55
-			}
-			if a.statusBanner(c, p) {
-				availableH -= 30
 			}
 			if a.updateBanner(c, p) {
 				availableH -= a.updateBannerHeight()
@@ -172,6 +203,9 @@ func (a *workspace) view(c *ui.Context) {
 						if a.page == detail {
 							a.noteModal(c, p, paneW, max(1, availableH-2*inset))
 						}
+						if a.reviewOpen {
+							a.reviewModal(c, p, paneW, max(1, availableH-2*inset))
+						}
 						if wide && a.preferencesOpen {
 							a.settingsCard(c, p, paneW, max(1, availableH-2*inset))
 						}
@@ -179,42 +213,73 @@ func (a *workspace) view(c *ui.Context) {
 				})
 			})
 		})
+		if a.reviewOpen && !wide && a.preview == "" && a.bookID != "" {
+			a.reviewModal(c, p, width, height)
+		}
 		if a.preferencesOpen && a.preview == "" && (!wide || a.bookID == "") {
 			a.settingsCard(c, p, width, height)
 		}
+		a.statusToast(c, p, width, !wide || a.bookID == "")
 	})
 	if w > 0 && h > 0 {
 		a.markAndroidFramePainted()
 	}
 }
 
-func (a *workspace) statusBanner(c *ui.Context, p palette) bool {
+func (a *workspace) statusToast(c *ui.Context, p palette, width float32, hasMobileHeader bool) {
 	if a.message == "" {
-		return false
+		return
 	}
 	var left time.Duration
-	if !a.messagePending {
+	if !a.messagePending && !a.messageError {
 		left = time.Until(a.messageUntil)
 		if left <= 0 {
-			return false
+			return
 		}
 	}
-	fg, bg, ic := p.accent, p.tint, icCheck
+	fg, bg, borderCol, ic := p.accent, p.elevated, p.tintBorder, icCheck
 	if a.messageError {
-		fg, bg, ic = p.danger, p.dangerWash, icAlert
+		fg, bg, borderCol, ic = p.danger, p.dangerWash, p.danger.Alpha(.35), icAlert
 	} else if a.messagePending {
-		ic = icImport
+		fg, bg, borderCol, ic = p.accent, p.tint, p.tintBorder, icImport
 	}
-	ui.Row(c.Key("status-banner")).FillWidth().Shrink(0).Padding(7, 16).Gap(8).AlignItems(ui.Center).
-		Background(bg).Children(func() {
-		ui.Icon(c, ic).Size(14, 14).TextColor(fg).Shrink(0)
-		ui.Text(c, a.message).FontSize(12.5).FontWeight(550).TextColor(fg).Grow(1).MinWidth(0).SingleLine().Ellipsis("…")
+	topOffset := float32(14)
+	if hasMobileHeader {
+		topOffset = 62
+	}
+	maxW := max(220, min(540, width-24))
+	ui.Row(c.Key("status-toast")).Absolute().Top(topOffset).Left(0).Right(0).ZIndex(30).Center().Children(func() {
+		pill := ui.Row(c.Key("status-banner")).MaxWidth(maxW).Padding(8, 14).Gap(8).Radius(12).
+			AlignItems(ui.Center).Background(bg).Border(1, borderCol).
+			Shadow(0, 8, 22, -4, p.shadow)
+		pill.Children(func() {
+			ui.Icon(c, ic).Size(15, 15).TextColor(fg).Shrink(0)
+			txt := ui.Text(c, a.message).FontSize(12.5).FontWeight(550).TextColor(fg).Shrink(1).MinWidth(0)
+			if !a.messageError {
+				txt.SingleLine().Ellipsis("…")
+			} else {
+				txt.LineHeight(1.35)
+			}
+			if a.toastActionLabel != "" && a.toastActionFn != nil && !a.messageError {
+				fn := a.toastActionFn
+				act := ui.ButtonBase(c.Key("toast-action")).Height(24).PaddingX(8).Radius(6).Center().Shrink(0).
+					Background(p.accent).Label(a.toastActionLabel).FocusRingColor(p.accent).
+					OnClick(func() {
+						a.dismissMessage()
+						fn()
+					})
+				act.Children(func() {
+					ui.Text(c, a.toastActionLabel).FontSize(11.5).FontWeight(600).TextColor(p.onAccent).SingleLine()
+				})
+			}
+			if a.messageError {
+				designToolbarButton(c, p, icClose, "关闭提示", 24, false, false, a.dismissMessage)
+			}
+		})
 	})
-	horizontalRule(c, p)
-	if !a.messagePending {
+	if !a.messagePending && !a.messageError {
 		c.After(left)
 	}
-	return true
 }
 
 func (a *workspace) updateBannerHeight() float32 {
@@ -225,7 +290,7 @@ func (a *workspace) updateBannerHeight() float32 {
 }
 
 func (a *workspace) updateBanner(c *ui.Context, p palette) bool {
-	if a.preferencesOpen {
+	if a.preferencesOpen || a.editing() || a.page == detail {
 		return false
 	}
 	st, dismissed := a.updateViewState()
@@ -270,7 +335,7 @@ func (a *workspace) updateBanner(c *ui.Context, p palette) bool {
 			bannerText = "更新已下载，请开启安装权限"
 		}
 		primaryLabel = "查看更新"
-		primaryFn = a.openPreferences
+		primaryFn = a.openPreferencesAtUpdate
 	default:
 		if ver != "" {
 			bannerText = fmt.Sprintf("发现新版本 v%s", ver)
@@ -278,7 +343,7 @@ func (a *workspace) updateBanner(c *ui.Context, p palette) bool {
 			bannerText = "发现新版本"
 		}
 		primaryLabel = "查看更新"
-		primaryFn = a.openPreferences
+		primaryFn = a.openPreferencesAtUpdate
 	}
 
 	barH := float32(36)
@@ -329,12 +394,12 @@ func (a *workspace) emptyState(c *ui.Context, p palette) {
 			Shadow(0, 8, 28, -6, p.shadow).Children(func() {
 			brandMark(c, p, 48)
 			ui.Column(c).Center().Gap(6).Children(func() {
-				ui.Text(c, "打开笔记或 PDF").FontSize(22).FontWeight(700).LetterSpacing(-0.4).TextColor(p.ink)
-				ui.Text(c, ".marginpkg、.marginnotes、.pdf").
+				ui.Text(c, "开始阅读与整理").FontSize(22).FontWeight(700).LetterSpacing(-0.4).TextColor(p.ink)
+				ui.Text(c, "导入 MarginNote 笔记包或 PDF 文档，桌面端可直接拖入").
 					FontSize(13).LineHeight(1.5).TextColor(p.quiet)
 			})
 			ui.Box(c).Height(4)
-			primaryButton(c, p, "选择笔记文件", icImport, a.busy, a.chooseImport).Height(40).Padding(0, 18)
+			primaryButton(c, p, "导入笔记或 PDF", icImport, a.busy, a.chooseImport).Height(40).Padding(0, 18)
 		})
 	})
 }
@@ -343,19 +408,23 @@ func (a *workspace) mobileHeader(c *ui.Context, p palette, side bool) {
 	ui.Row(c).Height(54).FillWidth().Shrink(0).AlignItems(ui.Center).Padding(0, 14).Gap(8).
 		Background(p.surface).Children(func() {
 		if a.bookID != "" && !side {
-			if a.page == libraryScreen {
-				pillButton(c, p, "脑图", icArrowLeft, false, a.editing(), func() { a.page = browse })
-			} else {
-				pillButton(c, p, "目录", icSidebar, false, a.editing(), func() { a.page = libraryScreen }).Label("笔记本与搜索")
+			switch a.page {
+			case libraryScreen:
+				pillButton(c, p, "返回", icArrowLeft, false, a.editing(), func() { a.page = browse })
+			case detail:
+				target := browse
+				if a.prevPage == libraryScreen {
+					target = libraryScreen
+				}
+				pillButton(c, p, "返回", icArrowLeft, false, a.editing(), func() { a.page = target })
+			default:
+				pillButton(c, p, "笔记库", icSidebar, false, a.editing(), func() { a.page = libraryScreen }).Label("笔记本与搜索")
 			}
 		}
 		ui.Row(c).AlignItems(ui.Center).Gap(8).Grow(1).MinWidth(0).Children(func() {
 			brandMark(c, p, 22)
 			ui.Text(c, "Folio").FontSize(15).FontWeight(700).LetterSpacing(-0.3).TextColor(p.ink).SingleLine()
 		})
-		if !side && a.bookID != "" && a.page == detail {
-			pillButton(c, p, "脑图", icArrowLeft, false, a.editing(), func() { a.page = browse })
-		}
 		a.transferButton(c, p)
 		a.mobileSettingsButton(c, p)
 	})
@@ -413,7 +482,7 @@ func (a *workspace) sidebar(c *ui.Context, p palette, width float32, showBrandBa
 				Shadow(0, 1, 2, 0, p.shadowSoft).
 				Disabled(a.editing()).Label("切换笔记本").Children(func() {
 				ui.Icon(c, icBook).Size(14, 14).TextColor(p.accent).Shrink(0)
-				ui.Text(c, a.tree.book.Title).Grow(1).MinWidth(0).SingleLine().
+				ui.Text(c, a.tree.book.Title).Grow(1).MinWidth(0).SingleLine().Ellipsis("…").
 					FontSize(13).FontWeight(650).LetterSpacing(-0.15).TextColor(p.ink)
 				ui.Icon(c, icChevronDown).Size(13, 13).TextColor(p.quiet).Shrink(0)
 			})
@@ -436,33 +505,64 @@ func (a *workspace) sidebar(c *ui.Context, p palette, width float32, showBrandBa
 						}
 						row.Children(func() {
 							ui.Icon(c, icBook).Size(13, 13).TextColor(fg).Shrink(0)
-							ui.Text(c, book.Title).SingleLine().Shrink(1).FontSize(13).FontWeight(550).TextColor(fg)
+							ui.Text(c, book.Title).SingleLine().Ellipsis("…").Shrink(1).FontSize(13).FontWeight(550).TextColor(fg)
 						})
 					}
 				})
 			})
 		})
 
-		// Recessed Apple/Linear search field
-		ui.SearchField(c, &a.query).Height(36).FillWidth().PaddingX(10).Radius(8).FontSize(12.5).
-			Background(p.inputBg).Border(1, p.rule).TextColor(p.ink).Label("搜索笔记").
-			Placeholder("搜索笔记…").Disabled(a.editing())
+		// Recessed Apple/Linear search field + filter popover button
+		ui.Row(c).FillWidth().Gap(6).AlignItems(ui.Center).Shrink(0).Children(func() {
+			sf := ui.SearchField(c, &a.query).Height(36).Grow(1).MinWidth(0).PaddingX(10).Radius(8).FontSize(12.5).
+				Background(p.inputBg).Border(1, p.rule).TextColor(p.ink).Label("搜索笔记").
+				Placeholder("搜索笔记…").Disabled(a.editing())
+			if a.focusSearch {
+				sf.Focus(ui.FocusOptions{PreventScroll: true})
+				a.focusSearch = false
+			}
+			a.filterButton(c, p)
+		})
 
 		// Section kicker + scrollable nav list
+		queryActive := strings.TrimSpace(a.query) != ""
+		filtering := a.hasActiveFilter()
+		var searchIDs []string
 		kicker := "分组目录"
-		if strings.TrimSpace(a.query) != "" {
-			kicker = "搜索结果"
+		if queryActive || filtering {
+			searchIDs = a.searchNotes()
+			switch {
+			case queryActive && filtering:
+				kicker = fmt.Sprintf("搜索与筛选 · %d", len(searchIDs))
+			case filtering:
+				kicker = fmt.Sprintf("筛选结果 · %d", len(searchIDs))
+			default:
+				kicker = fmt.Sprintf("搜索结果 · %d", len(searchIDs))
+			}
 		}
 		sectionKicker(c, p, kicker)
 
 		ui.Scroll(c.Key("sidebar-scroll")).Grow(1).MinHeight(0).FillWidth().Gap(2).Children(func() {
-			if strings.TrimSpace(a.query) != "" {
-				ids := a.searchNotes()
-				if len(ids) == 0 {
-					ui.Text(c, "没有匹配的笔记").Padding(14, 10).FontSize(12.5).TextColor(p.quiet)
+			if queryActive || filtering {
+				if len(searchIDs) == 0 {
+					ui.Column(c).FillWidth().Padding(16, 10).Gap(10).Center().Children(func() {
+						ui.Text(c, "没有匹配的笔记").FontSize(12.5).TextColor(p.quiet)
+						clearLabel := "清空搜索"
+						if filtering && !queryActive {
+							clearLabel = "清空筛选"
+						} else if filtering && queryActive {
+							clearLabel = "清空搜索与筛选"
+						}
+						pillButton(c, p, clearLabel, icClose, true, false, func() {
+							a.query = ""
+							a.clearFilters()
+						}).Height(28)
+					})
+					return
 				}
-				for _, id := range ids {
-					a.navItem(c.Key(id), p, noteTitle(a.tree.notes[id]), nil, "", id == a.selected, func() { a.openNote(id) })
+				for _, id := range searchIDs {
+					sub := a.searchResultSubtitle(id, a.query)
+					a.searchNavItem(c.Key(id), p, noteTitle(a.tree.notes[id]), sub, id == a.selected, func() { a.openNote(id) })
 				}
 				return
 			}
@@ -529,11 +629,173 @@ func (a *workspace) navItem(c *ui.Context, p palette, label string, icon *ui.SVG
 		if icon != nil {
 			ui.Icon(c, icon).Size(14, 14).TextColor(icColor).Shrink(0)
 		}
-		ui.Text(c, label).SingleLine().FontSize(13).FontWeight(weight).LetterSpacing(-0.1).
+		ui.Text(c, label).SingleLine().Ellipsis("…").FontSize(13).FontWeight(weight).LetterSpacing(-0.1).
 			TextColor(fg).Grow(1).MinWidth(0)
 		if count != "" {
 			ui.Text(c, count).FontSize(11).FontWeight(550).FontFeatures("tnum").TextColor(p.quiet).Shrink(0)
 		}
+	})
+}
+
+func (a *workspace) applyTagFilter(tag string) {
+	if a.filterTag == tag {
+		a.filterTag = ""
+	} else {
+		a.filterTag = tag
+	}
+	a.filterPopoverOpen = false
+	a.invalidateSearch()
+	hapticSelection()
+}
+
+func (a *workspace) filterButton(c *ui.Context, p palette) {
+	cnt := a.activeFilterCount()
+	label := "筛选"
+	if cnt > 0 {
+		label = fmt.Sprintf("筛选 · %d", cnt)
+	}
+	btn := ui.ButtonBase(c.Key("filter-btn")).Height(36).Padding(0, 10).Radius(8).Center().Shrink(0).
+		Label(label).Tooltip("按颜色、标签或附件筛选笔记").Disabled(a.editing()).FocusRingColor(p.accent).
+		Selected(cnt > 0).OnClick(func() { a.filterPopoverOpen = !a.filterPopoverOpen })
+	fg := p.secondary
+	switch {
+	case cnt > 0 || a.filterPopoverOpen:
+		btn.Background(p.tint).Border(1, p.tintBorder)
+		fg = p.accent
+	case btn.Pressed():
+		btn.Background(p.pressed).Border(1, p.rule)
+		fg = p.ink
+	case btn.Hovered():
+		btn.Background(p.hover).Border(1, p.rule)
+		fg = p.ink
+	default:
+		btn.Background(p.inputBg).Border(1, p.rule)
+	}
+	btn.Children(func() {
+		ui.Text(c, label).FontSize(12).FontWeight(550).TextColor(fg).SingleLine()
+	})
+	ui.PopoverBase(c.Key("filter-popover"), btn, &a.filterPopoverOpen, func(panel ui.Element) {
+		panel.Width(252).MaxHeight(380).Radius(12).Clip().Background(p.elevated).
+			Border(1, p.border).Shadow(0, 12, 30, -6, p.shadow)
+		ui.Scroll(c.Key("filter-scroll")).FillWidth().MaxHeight(380).Padding(12).Gap(10).Children(func() {
+			ui.Row(c).FillWidth().AlignItems(ui.Center).Children(func() {
+				ui.Text(c, "筛选笔记").FontSize(12.5).FontWeight(650).TextColor(p.ink).Grow(1)
+				if a.hasActiveFilter() {
+					pillButton(c, p, "清空筛选", icClose, true, false, a.clearFilters).Height(24)
+				}
+			})
+			usedColors := a.bookUsedColors()
+			if len(usedColors) > 0 {
+				ui.Column(c).FillWidth().Gap(6).Children(func() {
+					ui.Text(c, "颜色").FontSize(11).FontWeight(600).TextColor(p.quiet)
+					ui.Row(c).FillWidth().Wrap().Gap(6).Children(func() {
+						allBtn := ui.ButtonBase(c.Key("fcol-all")).Height(24).PaddingX(8).Radius(99).Center().
+							Label("全部颜色").OnClick(func() {
+							a.filterColorSet, a.filterColor = false, 0
+							a.invalidateSearch()
+						})
+						if !a.filterColorSet {
+							allBtn.Background(p.tint).Border(1, p.tintBorder)
+						} else {
+							allBtn.Background(p.shell).Border(1, p.rule)
+						}
+						allBtn.Children(func() { ui.Text(c, "全部").FontSize(11).TextColor(p.secondary) })
+						for _, ci := range usedColors {
+							ci := ci
+							ct := mnCardLight[ci]
+							if p.dark {
+								ct = mnCardDark[ci]
+							}
+							sel := a.filterColorSet && a.filterColor == ci
+							sw := ui.ButtonBase(c.Key(fmt.Sprintf("fcol-%d", ci))).Size(24, 24).Radius(99).
+								Center().Label(fmt.Sprintf("筛选颜色 %d", ci)).OnClick(func() {
+								if sel {
+									a.filterColorSet, a.filterColor = false, 0
+								} else {
+									a.filterColorSet, a.filterColor = true, ci
+								}
+								a.invalidateSearch()
+							})
+							sw.Children(func() {
+								dot := ui.Box(c).Size(16, 16).Radius(99).Background(ct.accent)
+								if sel {
+									dot.Border(2, p.ink)
+								}
+							})
+						}
+					})
+				})
+			}
+			usedTags := a.bookUsedTags()
+			if len(usedTags) > 0 {
+				ui.Column(c).FillWidth().Gap(6).Children(func() {
+					ui.Text(c, "标签").FontSize(11).FontWeight(600).TextColor(p.quiet)
+					ui.Row(c).FillWidth().Wrap().Gap(6).Children(func() {
+						for _, tag := range usedTags {
+							tag := tag
+							sel := a.filterTag == tag
+							pill := ui.ButtonBase(c.Key("ftag-"+tag)).Height(24).Padding(0, 8).Radius(99).
+								Center().Label("#"+tag).OnClick(func() { a.applyTagFilter(tag) })
+							fg := p.secondary
+							if sel {
+								pill.Background(p.tint).Border(1, p.tintBorder)
+								fg = p.accent
+							} else {
+								pill.Background(p.shell).Border(1, p.rule)
+							}
+							pill.Children(func() { ui.Text(c, "#"+tag).FontSize(11).TextColor(fg).SingleLine() })
+						}
+					})
+				})
+			}
+			ui.Column(c).FillWidth().Gap(6).Children(func() {
+				ui.Text(c, "包含内容").FontSize(11).FontWeight(600).TextColor(p.quiet)
+				ui.Row(c).FillWidth().Wrap().Gap(6).Children(func() {
+					pillButton(c, p, "有附图", icPage, a.filterHasImage, false, func() {
+						a.filterHasImage = !a.filterHasImage
+						a.invalidateSearch()
+					}).Height(26)
+					pillButton(c, p, "有页码", icBook, a.filterHasPage, false, func() {
+						a.filterHasPage = !a.filterHasPage
+						a.invalidateSearch()
+					}).Height(26)
+				})
+			})
+		})
+	})
+}
+
+func (a *workspace) searchNavItem(c *ui.Context, p palette, label, subtitle string, selected bool, onClick func()) {
+	if subtitle == "" {
+		a.navItem(c, p, label, nil, "", selected, onClick)
+		return
+	}
+	row := ui.ButtonBase(c).FillWidth().MinHeight(46).Padding(6, 10).Gap(2).
+		Justify(ui.Center).Radius(8).
+		Label(label).Disabled(a.editing()).Selected(selected).FocusRingColor(p.accent).OnClick(onClick)
+	fg := p.secondary
+	weight := 500
+	switch {
+	case selected:
+		row.Background(p.selectedBg).Border(1, p.rule).
+			InsetShadow(0, 1, 0, 0, p.specular).
+			Shadow(0, 1, 2, 0, p.shadowSoft)
+		fg = p.ink
+		weight = 600
+	case row.Pressed():
+		row.Background(p.pressed).Border(1, ui.Color{})
+		fg = p.ink
+	case row.Hovered():
+		row.Background(p.hover).Border(1, ui.Color{})
+		fg = p.ink
+	default:
+		row.Border(1, ui.Color{})
+	}
+	row.Children(func() {
+		ui.Column(c).FillWidth().Gap(2).Children(func() {
+			ui.Text(c, label).SingleLine().Ellipsis("…").FontSize(13).FontWeight(weight).LetterSpacing(-0.1).TextColor(fg)
+			ui.Text(c, subtitle).SingleLine().Ellipsis("…").FontSize(11).TextColor(p.quiet)
+		})
 	})
 }
 
@@ -559,7 +821,9 @@ func (a *workspace) noteModal(c *ui.Context, p palette, paneW, paneH float32) {
 		ui.ButtonBase(c.Key("note-modal-scrim")).Absolute().Left(0).Top(0).Right(0).Bottom(0).
 			Label("关闭笔记卡片").Background(p.scrim).
 			OnClick(func() {
-				if !a.editing() {
+				if a.editing() {
+					a.requestCancelEdit()
+				} else {
 					a.page = browse
 				}
 			})
@@ -605,6 +869,10 @@ func (a *workspace) readerPanel(c *ui.Context, p palette, width, height float32,
 			startIdx := max(0, len(ancestors)-2)
 			if len(ancestors) > 0 {
 				ui.Row(c).AlignItems(ui.Center).Gap(2).Grow(1).MinWidth(0).Children(func() {
+					if startIdx > 0 {
+						ui.Text(c, "…").FontSize(12).FontWeight(500).TextColor(p.quiet).Padding(0, 2)
+						ui.Icon(c, icChevronRight).Size(11, 11).TextColor(p.quiet).Shrink(0)
+					}
 					for i := startIdx; i < len(ancestors); i++ {
 						ancID := ancestors[i]
 						ancTrail := slices.Clone(trail[:i+1])
@@ -612,9 +880,7 @@ func (a *workspace) readerPanel(c *ui.Context, p palette, width, height float32,
 							Height(30).Padding(0, 6).Radius(6).AlignItems(ui.Center).Gap(4).
 							Disabled(a.editing()).OnClick(func() {
 							a.setNoteWithTrail(ancID, ancTrail)
-							if !hasNoteContent(a.tree.notes[ancID]) && len(a.tree.kids[ancID]) > 0 {
-								a.page = browse
-							}
+							a.page = detail
 						})
 						fg := p.quiet
 						if crumb.Hovered() && !a.editing() {
@@ -623,9 +889,9 @@ func (a *workspace) readerPanel(c *ui.Context, p palette, width, height float32,
 						}
 						crumb.Children(func() {
 							ui.Text(c, noteTitle(a.tree.notes[ancID])).FontSize(12).FontWeight(500).
-								TextColor(fg).SingleLine().Shrink(1)
+								TextColor(fg).SingleLine().Ellipsis("…").Shrink(1)
 						})
-						if i < len(ancestors)-1 || len(trail) > 1 {
+						if i < len(ancestors)-1 {
 							ui.Icon(c, icChevronRight).Size(11, 11).TextColor(p.quiet).Shrink(0)
 						}
 					}
@@ -635,8 +901,9 @@ func (a *workspace) readerPanel(c *ui.Context, p palette, width, height float32,
 				ui.Box(c).Grow(1)
 			}
 			if !a.editing() {
-				pillButton(c, p, "新增", icPlus, false, a.busy, a.startAddChild).Label("新建子笔记")
+				pillButton(c, p, "新建子笔记", icPlus, false, a.busy, a.startAddChild)
 				pillButton(c, p, "编辑", icEdit, true, a.busy || n.ID == "", a.startEditNote)
+				ui.Box(c).Width(2).Shrink(0)
 				iconButton(c, p, icSettingDelete, "删除笔记", true, a.busy || n.ID == "", a.confirmDeleteNote)
 			}
 			if showClose {
@@ -711,10 +978,32 @@ func (a *workspace) readerPanel(c *ui.Context, p palette, width, height float32,
 				TextColor(p.ink).LineHeight(1.24).Shrink(0)
 
 			if len(n.Tags) > 0 {
-				tagPillsRow(c, p, n.Tags)
+				tagPillsRowAction(c, p, n.Tags, a.applyTagFilter)
 			}
 
-			a.noteContent(c, p, n, width-padX*2-2)
+			if a.reciteMode && (noteText(n) != "" || noteHasImage(n)) {
+				if !a.revealedNotes[n.ID] {
+					occlude := ui.ButtonBase(c.Key("recite-detail-reveal")).FillWidth().MinHeight(104).
+						Radius(10).Center().Background(p.tint).Border(1, p.tintBorder).
+						Label("点击揭晓正文").OnClick(func() {
+						a.setNoteRevealed(n.ID, true)
+						hapticLight()
+					})
+					occlude.Children(func() {
+						ui.Column(c).Center().Gap(4).Children(func() {
+							ui.Text(c, "背诵模式：已隐藏正文与附图").FontSize(13).FontWeight(600).TextColor(p.accent)
+							ui.Text(c, "点击此处揭晓答案").FontSize(12).TextColor(p.secondary)
+						})
+					})
+				} else {
+					a.noteContent(c, p, n, width-padX*2-2)
+					pillButton(c, p, "重新遮盖", icBook, false, false, func() {
+						a.setNoteRevealed(n.ID, false)
+					}).Height(26)
+				}
+			} else {
+				a.noteContent(c, p, n, width-padX*2-2)
+			}
 
 			if len(n.Links) > 0 {
 				var linked []notebook.Note
@@ -765,18 +1054,21 @@ func (a *workspace) readerPanel(c *ui.Context, p palette, width, height float32,
 				}
 			}
 
-			children := a.tree.kids[a.selected]
-			if len(children) > 0 {
+			var visibleChildren []string
+			for _, id := range a.tree.kids[a.selected] {
+				child := a.tree.notes[id]
+				if child.Title != "" || hasNoteContent(child) || len(a.tree.kids[id]) > 0 {
+					visibleChildren = append(visibleChildren, id)
+				}
+			}
+			if len(visibleChildren) > 0 {
 				ui.Box(c).Height(4).Shrink(0)
 				horizontalRule(c, p)
 				ui.Column(c).FillWidth().Gap(5).Shrink(0).Children(func() {
-					ui.Text(c, fmt.Sprintf("下级节点 · %d", len(children))).FontSize(11).FontWeight(600).
+					ui.Text(c, fmt.Sprintf("下级笔记 · %d", len(visibleChildren))).FontSize(11).FontWeight(600).
 						FontFeatures("tnum").LetterSpacing(0.4).TextColor(p.quiet).Padding(4, 2, 4)
-					for _, id := range children {
-						child := a.tree.notes[id]
-						if child.Title != "" || hasNoteContent(child) || len(a.tree.kids[id]) > 0 {
-							a.childRow(c.Key(id), p, noteTitle(child), func() { a.openChildNote(id) })
-						}
+					for _, id := range visibleChildren {
+						a.childRow(c.Key(id), p, noteTitle(a.tree.notes[id]), func() { a.openChildNote(id) })
 					}
 				})
 			}
@@ -814,7 +1106,7 @@ func (a *workspace) childRow(c *ui.Context, p palette, label string, onClick fun
 		row.Background(p.shell).Border(1, p.rule)
 	}
 	row.Children(func() {
-		ui.Text(c, label).SingleLine().FontSize(13).FontWeight(550).LetterSpacing(-0.1).
+		ui.Text(c, label).SingleLine().Ellipsis("…").FontSize(13).FontWeight(550).LetterSpacing(-0.1).
 			TextColor(fg).Grow(1).MinWidth(0)
 		ui.Icon(c, icChevronRight).Size(13, 13).TextColor(p.quiet).Shrink(0)
 	})
@@ -890,14 +1182,85 @@ func (a *workspace) addImage(c *ui.Context, p palette, ref, label string, width 
 	return true
 }
 
+func (a *workspace) previewImagesList() []string {
+	var imgs []string
+	if n, ok := a.tree.notes[a.selected]; ok {
+		if n.Clip != "" {
+			imgs = append(imgs, n.Clip)
+		}
+		for _, blk := range n.Blocks {
+			if blk.Image != "" && !slices.Contains(imgs, blk.Image) {
+				imgs = append(imgs, blk.Image)
+			}
+		}
+	}
+	if a.preview != "" && !slices.Contains(imgs, a.preview) {
+		imgs = append([]string{a.preview}, imgs...)
+	}
+	return imgs
+}
+
+func (a *workspace) stepPreviewImage(delta int) {
+	imgs := a.previewImagesList()
+	if len(imgs) <= 1 {
+		return
+	}
+	idx := slices.Index(imgs, a.preview)
+	if idx < 0 {
+		idx = 0
+	} else {
+		idx = (idx + delta + len(imgs)) % len(imgs)
+	}
+	a.preview = imgs[idx]
+	a.previewZoom = 1
+}
+
 func (a *workspace) imageView(c *ui.Context, p palette, width, height float32) {
 	bitmap, ready := a.originalMedia(a.preview)
-	ui.Row(c).Height(52).FillWidth().PaddingX(16).AlignItems(ui.Center).Background(p.surface).Children(func() {
-		pillButton(c, p, "返回笔记", icArrowLeft, true, false, func() { a.preview = "" })
+	if a.previewZoom <= 0 {
+		a.previewZoom = 1
+	}
+	imgs := a.previewImagesList()
+	imgIdx := max(0, slices.Index(imgs, a.preview))
+	btnSz := float32(30)
+	if a.touchUI() {
+		btnSz = 36
+	}
+	closePreview := func() {
+		a.preview = ""
+		a.previewZoom = 1
+	}
+	ui.Row(c).Height(52).FillWidth().PaddingX(16).Gap(8).AlignItems(ui.Center).Background(p.surface).Children(func() {
+		pillButton(c, p, "返回", icArrowLeft, true, false, closePreview)
+		if len(imgs) > 1 {
+			designToolbarButton(c, p, icChevronLeft, "上一张", btnSz, false, false, func() { a.stepPreviewImage(-1) })
+			ui.Text(c, fmt.Sprintf("%d / %d", imgIdx+1, len(imgs))).FontSize(12.5).FontWeight(550).
+				FontFeatures("tnum").TextColor(p.secondary).SingleLine()
+			designToolbarButton(c, p, icChevronRight, "下一张", btnSz, false, false, func() { a.stepPreviewImage(1) })
+		}
+		ui.Box(c).Grow(1).MinWidth(0)
+		designToolbarButton(c, p, icMinus, "缩小图片", btnSz, false, a.previewZoom <= 0.5, func() {
+			a.previewZoom = clamp(a.previewZoom/1.25, 0.5, 4)
+		})
+		pctBtn := ui.ButtonBase(c.Key("img-zoom-reset")).Height(btnSz).MinWidth(46).PaddingX(6).Radius(7).Center().
+			Label("重置图片缩放").Tooltip("重置为适应尺寸").OnClick(func() { a.previewZoom = 1 })
+		if pctBtn.Pressed() {
+			pctBtn.Background(p.pressed)
+		} else if pctBtn.Hovered() {
+			pctBtn.Background(p.hover)
+		}
+		pctBtn.Children(func() {
+			ui.Text(c, fmt.Sprintf("%d%%", int(a.previewZoom*100+.5))).FontSize(12).FontWeight(600).
+				FontFeatures("tnum").TextColor(p.secondary).SingleLine()
+		})
+		designToolbarButton(c, p, icPlus, "放大图片", btnSz, false, a.previewZoom >= 4, func() {
+			a.previewZoom = clamp(a.previewZoom*1.25, 0.5, 4)
+		})
 	})
 	horizontalRule(c, p)
 	if bitmap == nil {
-		ui.Box(c).Grow(1).FillWidth().Center().Background(p.canvas).Children(func() {
+		ui.ButtonBase(c.Key("img-backdrop-loading")).Grow(1).FillWidth().Center().Background(p.canvas).
+			Label("关闭图片预览").OnClick(closePreview).Children(func() {
 			message := "正在加载原图…"
 			if ready {
 				message = "无法加载原图"
@@ -907,49 +1270,196 @@ func (a *workspace) imageView(c *ui.Context, p palette, width, height float32) {
 		return
 	}
 	w, h := bitmap.Size()
-	size := max(1, min(width-56, float32(w)))
-	ui.Scroll(c).Grow(1).FillWidth().Background(p.canvas).AlignItems(ui.Center).Padding(24).Children(func() {
-		ui.Box(c).MinHeight(min(120, height-96)).Padding(14).Radius(12).Background(ui.Hex("#ffffff")).
-			Border(1, p.rule).Shadow(0, 12, 32, -8, p.shadow).Children(func() {
-			ui.Image(c, bitmap).Size(size, size*float32(h)/float32(w)).Fit(ui.Contain).Label("笔记原图")
+	baseSize := max(1, min(width-56, float32(w)))
+	size := max(24, baseSize*a.previewZoom)
+	paperBg := ui.Hex("#ffffff")
+	if p.dark {
+		paperBg = ui.Hex("#e8eaef")
+	}
+	ui.Box(c.Key("img-preview-area")).Grow(1).FillWidth().Background(p.canvas).
+		HandleInput(func(ev ui.InputEvent) bool {
+			if ev.Kind == ui.InputScroll && ev.DY != 0 {
+				factor := float32(1.12)
+				if ev.DY > 0 {
+					factor = 1 / 1.12
+				}
+				a.previewZoom = clamp(a.previewZoom*factor, 0.5, 4)
+				return true
+			}
+			return false
+		}).Children(func() {
+		ui.Scroll(c).Fill().AlignItems(ui.Center).Children(func() {
+			ui.ButtonBase(c.Key("img-backdrop")).FillWidth().MinHeight(max(200, height-53)).
+				Center().Padding(24).Label("关闭图片预览").OnClick(closePreview).Children(func() {
+				ui.ButtonBase(c.Key("img-card-frame")).MinHeight(min(120, height-96)).Padding(14).Radius(12).
+					Background(paperBg).Border(1, p.rule).Shadow(0, 12, 32, -8, p.shadow).
+					Label("笔记原图").OnClick(func() {}).Children(func() {
+					ui.Image(c, bitmap).Size(size, size*float32(h)/float32(w)).Fit(ui.Contain).Label("笔记原图")
+				})
+			})
 		})
 	})
 }
 
 func (a *workspace) editor(c *ui.Context, p palette, availH float32) {
 	heading := "编辑笔记"
+	var parentTitle string
 	if a.editMode == editNewChild {
 		heading = "新建子笔记"
+		if a.selected != "" {
+			if parent, ok := a.tree.notes[a.selected]; ok {
+				parentTitle = noteTitle(parent)
+			}
+		}
 	}
 	pad := float32(24)
 	if a.touchUI() || availH < 420 {
 		pad = 16
 	}
-	bodyH := clamp(availH-220, 110, 260)
-	ui.Scroll(c.Key("editor")).Grow(1).MinHeight(0).FillWidth().Padding(pad).Gap(10).Children(func() {
-		ui.Text(c, heading).FontSize(19).FontWeight(700).LetterSpacing(-0.35).TextColor(p.ink)
-		ui.Column(c).FillWidth().Gap(5).Children(func() {
-			ui.Text(c, "标题").FontSize(12).FontWeight(600).TextColor(p.secondary)
-			ui.TextInput(c, &a.draftTitle).Label("标题").Placeholder("输入笔记标题…").
-				FillWidth().Height(40).Radius(8).PaddingX(10).FontSize(14).
-				Background(p.inputBg).Border(1, p.border).TextColor(p.ink)
+	bodyH := max(96, availH-2*pad-280)
+	ui.Column(c).FillWidth().Grow(1).MinHeight(0).Children(func() {
+		ui.Scroll(c.Key("editor")).Grow(1).MinHeight(0).FillWidth().Padding(pad, pad, 12).Gap(10).Children(func() {
+			ui.Column(c).FillWidth().Gap(3).Children(func() {
+				ui.Text(c, heading).FontSize(19).FontWeight(700).LetterSpacing(-0.35).TextColor(p.ink)
+				if parentTitle != "" {
+					ui.Text(c, "归属笔记：「"+parentTitle+"」").FontSize(12).TextColor(p.quiet).SingleLine().Ellipsis("…")
+				}
+			})
+			if a.discardPrompt {
+				ui.Row(c.Key("editor-discard-guard")).FillWidth().Padding(10, 12).Gap(8).Radius(10).
+					AlignItems(ui.Center).Background(p.dangerWash).Border(1, p.danger.Alpha(.3)).Children(func() {
+					ui.Icon(c, icAlert).Size(15, 15).TextColor(p.danger).Shrink(0)
+					ui.Text(c, "有未保存的修改，确定放弃吗？").FontSize(12.5).FontWeight(550).TextColor(p.danger).Grow(1).MinWidth(0)
+					pillButton(c, p, "继续编辑", nil, true, false, func() { a.discardPrompt = false }).Height(28)
+					pillButton(c, p, "放弃修改", nil, false, false, func() {
+						a.editMode = editNone
+						a.discardPrompt = false
+						a.flushImports()
+					}).Height(28)
+				})
+			}
+			ui.Column(c).FillWidth().Gap(5).Children(func() {
+				ui.Text(c, "标题").FontSize(12).FontWeight(600).TextColor(p.secondary)
+				ui.TextInput(c, &a.draftTitle).Label("标题").Placeholder("输入笔记标题（可留空）…").
+					FillWidth().Height(40).Radius(8).PaddingX(10).FontSize(14).
+					Background(p.inputBg).Border(1, p.border).TextColor(p.ink)
+			})
+			ui.Column(c).FillWidth().Gap(5).Children(func() {
+				ui.Text(c, "正文").FontSize(12).FontWeight(600).TextColor(p.secondary)
+				ui.TextArea(c, &a.draftBody).Label("正文").Placeholder("输入笔记正文…").
+					FillWidth().Height(bodyH).Radius(8).Padding(10).FontSize(14).LineHeight(1.55).
+					Background(p.inputBg).Border(1, p.border).TextColor(p.ink)
+			})
+			ui.Column(c).FillWidth().Gap(6).Children(func() {
+				ui.Text(c, "卡片颜色").FontSize(12).FontWeight(600).TextColor(p.secondary)
+				swatches := []int{0, 1, 2, 3, 4, 7, 8, 9}
+				if a.draftColorSet && !slices.Contains(swatches, a.draftColor) && a.draftColor >= 0 && a.draftColor < 16 {
+					swatches = append(swatches, a.draftColor)
+				}
+				ui.Row(c).FillWidth().Wrap().Gap(6).AlignItems(ui.Center).Children(func() {
+					noneBtn := ui.ButtonBase(c.Key("ed-col-none")).Height(26).PaddingX(10).Radius(99).
+						Center().Label("无色").OnClick(func() { a.draftColorSet, a.draftColor = false, 0 })
+					if !a.draftColorSet {
+						noneBtn.Background(p.tint).Border(1, p.tintBorder)
+					} else {
+						noneBtn.Background(p.inputBg).Border(1, p.border)
+					}
+					noneBtn.Children(func() { ui.Text(c, "无色").FontSize(11.5).TextColor(p.secondary) })
+					for _, ci := range swatches {
+						ci := ci
+						ct := mnCardLight[ci]
+						if p.dark {
+							ct = mnCardDark[ci]
+						}
+						sel := a.draftColorSet && a.draftColor == ci
+						btn := ui.ButtonBase(c.Key(fmt.Sprintf("ed-col-%d", ci))).Size(26, 26).Radius(99).
+							Center().Label(fmt.Sprintf("卡片颜色 %d", ci)).OnClick(func() {
+							a.draftColorSet, a.draftColor = true, ci
+						})
+						btn.Children(func() {
+							dot := ui.Box(c).Size(18, 18).Radius(99).Background(ct.accent)
+							if sel {
+								dot.Border(2.5, p.ink)
+							}
+						})
+					}
+				})
+			})
+			ui.Column(c).FillWidth().Gap(5).Children(func() {
+				ui.Text(c, "标签（空格或逗号分隔）").FontSize(12).FontWeight(600).TextColor(p.secondary)
+				ui.TextInput(c, &a.draftTags).Label("标签").Placeholder("例如：重点 错题…").
+					FillWidth().Height(36).Radius(8).PaddingX(10).FontSize(13).
+					Background(p.inputBg).Border(1, p.border).TextColor(p.ink)
+				if existing := a.bookUsedTags(); len(existing) > 0 {
+					ui.Row(c).FillWidth().Wrap().Gap(6).Children(func() {
+						current := parseTagsInput(a.draftTags)
+						for i, tag := range existing {
+							if i >= 8 {
+								break
+							}
+							tag := tag
+							has := slices.Contains(current, tag)
+							pill := ui.ButtonBase(c.Key("ed-tag-"+tag)).Height(22).Padding(0, 8).Radius(99).
+								Center().Label("切换标签 " + tag).OnClick(func() {
+								cur := parseTagsInput(a.draftTags)
+								if slices.Contains(cur, tag) {
+									cur = slices.DeleteFunc(cur, func(v string) bool { return v == tag })
+								} else {
+									cur = append(cur, tag)
+								}
+								a.draftTags = strings.Join(cur, " ")
+							})
+							fg := p.quiet
+							if has {
+								pill.Background(p.tint).Border(1, p.tintBorder)
+								fg = p.accent
+							} else {
+								pill.Background(p.shell).Border(1, p.rule)
+							}
+							pill.Children(func() { ui.Text(c, "#"+tag).FontSize(11).TextColor(fg).SingleLine() })
+						}
+					})
+				}
+			})
+			if a.editMode == editNote {
+				ui.Row(c).FillWidth().Gap(8).AlignItems(ui.Center).Children(func() {
+					ui.Text(c, "归属分组").FontSize(12).FontWeight(600).TextColor(p.secondary)
+					parentLabel := "顶层目录"
+					if a.draftParent != "" && a.draftParent != a.tree.root {
+						if pn, ok := a.tree.notes[a.draftParent]; ok {
+							parentLabel = noteTitle(pn)
+						}
+					}
+					moveBtn := ui.ButtonBase(c.Key("ed-move-parent")).Height(30).Padding(0, 10).Radius(8).
+						Background(p.inputBg).Border(1, p.border).Center().
+						Label("移动归属：" + parentLabel)
+					moveBtn.Children(func() {
+						ui.Row(c).Gap(5).AlignItems(ui.Center).Children(func() {
+							ui.Text(c, parentLabel).FontSize(12.5).TextColor(p.ink).SingleLine().Ellipsis("…").MaxWidth(220)
+							ui.Icon(c, icChevronDown).Size(12, 12).TextColor(p.quiet)
+						})
+					})
+					moveBtn.PopoverMenuButton(func(m *ui.Menu) {
+						if m.Item("顶层目录").ID("mv-root").Radio(a.draftParent == "" || a.draftParent == a.tree.root).Chosen() {
+							a.draftParent = ""
+						}
+						for _, cid := range a.validParentCandidates(a.selected) {
+							if m.Item(noteTitle(a.tree.notes[cid])).ID("mv-"+cid).Radio(a.draftParent == cid).Chosen() {
+								a.draftParent = cid
+							}
+						}
+					})
+				})
+			}
 		})
-		ui.Column(c).FillWidth().Gap(5).Children(func() {
-			ui.Text(c, "正文").FontSize(12).FontWeight(600).TextColor(p.secondary)
-			ui.TextArea(c, &a.draftBody).Label("正文").Placeholder("输入笔记正文…").
-				FillWidth().Height(bodyH).Radius(8).Padding(10).FontSize(14).LineHeight(1.55).
-				Background(p.inputBg).Border(1, p.border).TextColor(p.ink)
-		})
-		ui.Row(c).Gap(8).Padding(4, 0, 0).Children(func() {
+		horizontalRule(c, p)
+		ui.Row(c).FillWidth().Shrink(0).Padding(10, pad).Gap(8).AlignItems(ui.Center).Background(p.surface).Children(func() {
 			btnH := float32(34)
 			if a.touchUI() {
 				btnH = 38
 			}
-			primaryButton(c, p, "保存", nil, a.busy || strings.TrimSpace(a.draftTitle) == "", a.saveEditor).Height(btnH)
-			pillButton(c, p, "取消", nil, true, a.busy, func() {
-				a.editMode = editNone
-				a.flushImports()
-			}).Height(btnH)
+			primaryButton(c, p, "保存", nil, a.busy || !a.canSaveEditor(), a.saveEditor).Height(btnH)
+			pillButton(c, p, "取消", nil, true, a.busy, a.requestCancelEdit).Height(btnH)
 		})
 	})
 }

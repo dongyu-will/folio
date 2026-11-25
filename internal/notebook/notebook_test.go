@@ -8,6 +8,7 @@ import (
 	"database/sql"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"image"
 	"image/png"
 	"math"
@@ -443,22 +444,38 @@ func TestConnectNotesCycleAndZipValidationAndMarkdown(t *testing.T) {
 		}
 	}
 
-	// Zip validation: ignore __MACOSX and reject multiple .marginnotes entries.
+	// Multi-DB .marginpkg validation: ignore __MACOSX and import books from multiple .marginnotes entries.
 	tmp := t.TempDir()
-	badZip := filepath.Join(tmp, "multi.marginpkg")
-	f, err := os.Create(badZip)
+	dbOne := filepath.Join(tmp, "one.marginnotes")
+	dbTwo := filepath.Join(tmp, "two.marginnotes")
+	createTestMarginDB(t, dbOne, "T-MULTI-1", "合集一", []struct{ id, title, body, parent, links string }{
+		{id: "m1", title: "分库节点一", body: "内容一"},
+	}, nil)
+	createTestMarginDB(t, dbTwo, "T-MULTI-2", "合集二", []struct{ id, title, body, parent, links string }{
+		{id: "m2", title: "分库节点二", body: "内容二"},
+	}, nil)
+	rawOne, _ := os.ReadFile(dbOne)
+	rawTwo, _ := os.ReadFile(dbTwo)
+	multiPkg := filepath.Join(tmp, "multi.marginpkg")
+	f, err := os.Create(multiPkg)
 	if err != nil {
 		t.Fatal(err)
 	}
 	zw := zip.NewWriter(f)
-	for _, name := range []string{"__MACOSX/._a.marginnotes", "one.marginnotes", "two.marginnotes"} {
+	for name, data := range map[string][]byte{
+		"__MACOSX/._a.marginnotes": []byte("junk"),
+		"one.marginnotes":          rawOne,
+		"two.marginnotes":          rawTwo,
+	} {
 		w, _ := zw.Create(name)
-		_, _ = w.Write([]byte("dummy"))
+		_, _ = w.Write(data)
 	}
 	_ = zw.Close()
 	_ = f.Close()
-	if _, err := openPayload(badZip); err == nil || !strings.Contains(err.Error(), "多个笔记数据库") {
-		t.Fatalf("expected multi-db zip rejection, got %v", err)
+	multiStore := NewStore(filepath.Join(tmp, "multi-store"))
+	multiRes, err := multiStore.Import(multiPkg)
+	if err != nil || multiRes.Added != 2 || len(multiRes.Library.Books) != 2 {
+		t.Fatalf("expected 2 books imported from multi-db .marginpkg, got res=%+v err=%v", multiRes, err)
 	}
 }
 
@@ -628,5 +645,19 @@ func TestReimportSkipsExistingMediaFilesOnDisk(t *testing.T) {
 	saved, err := os.ReadFile(mediaPath)
 	if err != nil || !bytes.Equal(saved, img) {
 		t.Fatalf("existing media file content corrupted (err=%v)", err)
+	}
+}
+
+func TestImportContextCanceled(t *testing.T) {
+	tmp := t.TempDir()
+	dbPath := filepath.Join(tmp, "cancel.marginnotes")
+	createTestMarginDB(t, dbPath, "TOPIC-CANCEL", "取消测试", []struct{ id, title, body, parent, links string }{
+		{id: "n1", title: "节点一", body: "正文"},
+	}, nil)
+	store := NewStore(filepath.Join(tmp, "store"))
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := store.ImportWithOptions(dbPath, ImportOptions{Ctx: ctx}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context.Canceled, got %v", err)
 	}
 }

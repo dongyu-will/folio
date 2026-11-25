@@ -21,7 +21,11 @@ import java.io.IOException
 import java.nio.file.Files
 import java.util.Locale
 import java.util.concurrent.ConcurrentLinkedQueue
+import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
+import java.util.concurrent.ScheduledExecutorService
+import java.util.concurrent.ScheduledFuture
+import java.util.concurrent.TimeUnit
 import kotlin.math.roundToInt
 import org.json.JSONObject
 
@@ -31,6 +35,9 @@ class OpenNotesPlugin : MyGoPlugin {
     private val worker = Executors.newSingleThreadExecutor()
     private val pdfForeground = Executors.newSingleThreadExecutor()
     private val pdfBackground = Executors.newSingleThreadExecutor()
+    private val pdfIdleScheduler: ScheduledExecutorService = Executors.newSingleThreadScheduledExecutor()
+    private val fgPdfSlot = PdfRendererSlot(pdfForeground)
+    private val bgPdfSlot = PdfRendererSlot(pdfBackground)
     @Volatile
     private var deferredInstallPath: String? = null
 
@@ -38,6 +45,7 @@ class OpenNotesPlugin : MyGoPlugin {
         PluginHost.onIntent = ::open
         LaunchCover.install(PluginHost.context, PluginHost.activity)
         LaunchCover.setOnActivityResumedListener(::resumeDeferredInstall)
+        worker.execute { cleanupStaleTempDirs() }
     }
 
     override fun call(method: String, args: JSONObject, reply: PluginReply) {
@@ -56,14 +64,21 @@ class OpenNotesPlugin : MyGoPlugin {
                 reply.success(null)
             }
             "renderPDF" -> {
-                val renderer = if (args.optBoolean("background")) pdfBackground else pdfForeground
+                val background = args.optBoolean("background")
+                val renderer = if (background) pdfBackground else pdfForeground
+                val slot = if (background) bgPdfSlot else fgPdfSlot
                 renderer.execute {
                     try {
-                        reply.success(renderPDF(args))
+                        reply.success(renderPDF(args, slot))
                     } catch (err: Exception) {
                         reply.success(JSONObject().put("error", err.localizedMessage ?: "无法渲染 PDF"))
                     }
                 }
+            }
+            "closePDFCache" -> {
+                fgPdfSlot.closeAsync()
+                bgPdfSlot.closeAsync()
+                reply.success(null)
             }
             "updateCacheDir" -> {
                 try {
@@ -222,9 +237,12 @@ class OpenNotesPlugin : MyGoPlugin {
         val context = PluginHost.context
         if (!canInstallAPK(context)) {
             runCatching { launchUnknownSourcesSettings(activity, context) }
+            PluginHost.emit("mgnotedownloads", "installState", JSONObject().put("status", "permission_required"))
             return
         }
-        runCatching { launchAPKInstaller(activity, context, apkFile) }
+        if (runCatching { launchAPKInstaller(activity, context, apkFile) }.isSuccess) {
+            PluginHost.emit("mgnotedownloads", "installState", JSONObject().put("status", "launched"))
+        }
     }
 
     private fun launchUnknownSourcesSettings(activity: Activity, context: Context) {
@@ -258,21 +276,74 @@ class OpenNotesPlugin : MyGoPlugin {
         }
     }
 
-    private fun renderPDF(args: JSONObject): JSONObject {
+    private inner class PdfRendererSlot(private val executor: ExecutorService) {
+        private var cachedPath: String? = null
+        private var cachedModified: Long = -1L
+        private var cachedLength: Long = -1L
+        private var renderer: PdfRenderer? = null
+        private var idleFuture: ScheduledFuture<*>? = null
+
+        fun hasOpenRenderer(): Boolean = renderer != null
+
+        fun getOrOpen(source: File): PdfRenderer {
+            idleFuture?.cancel(false)
+            idleFuture = null
+            val canonical = runCatching { source.canonicalPath }.getOrElse { source.absolutePath }
+            val mtime = source.lastModified()
+            val len = source.length()
+            val existing = renderer
+            if (existing != null && cachedPath == canonical && cachedModified == mtime && cachedLength == len) {
+                scheduleIdleClose()
+                return existing
+            }
+            closeSync()
+            // Ownership of the seekable descriptor passes to PdfRenderer after construction.
+            val fd = ParcelFileDescriptor.open(source, ParcelFileDescriptor.MODE_READ_ONLY)
+            val opened = try {
+                PdfRenderer(fd)
+            } catch (err: Exception) {
+                runCatching { fd.close() }
+                throw err
+            }
+            cachedPath = canonical
+            cachedModified = mtime
+            cachedLength = len
+            renderer = opened
+            scheduleIdleClose()
+            return opened
+        }
+
+        fun closeSync() {
+            idleFuture?.cancel(false)
+            idleFuture = null
+            runCatching { renderer?.close() }
+            renderer = null
+            cachedPath = null
+            cachedModified = -1L
+            cachedLength = -1L
+        }
+
+        fun closeAsync() {
+            executor.execute { closeSync() }
+        }
+
+        private fun scheduleIdleClose() {
+            idleFuture?.cancel(false)
+            idleFuture = pdfIdleScheduler.schedule({
+                executor.execute { closeSync() }
+            }, 60L, TimeUnit.SECONDS)
+        }
+    }
+
+    private fun renderPDF(args: JSONObject, slot: PdfRendererSlot): JSONObject {
         val source = File(args.getString("path"))
         val target = File(args.getString("output"))
         val index = args.getInt("page")
         val maxSide = args.getInt("maxSide").coerceIn(256, 3000)
-        // Ownership of the seekable descriptor passes to PdfRenderer after construction.
-        val fd = ParcelFileDescriptor.open(source, ParcelFileDescriptor.MODE_READ_ONLY)
-        val renderer = try {
-            PdfRenderer(fd)
-        } catch (err: Exception) {
-            fd.close()
-            throw err
-        }
-        return renderer.use { pdf ->
-            pdf.openPage(index).use { page ->
+
+        fun renderOnce(): JSONObject {
+            val pdf = slot.getOrOpen(source)
+            return pdf.openPage(index).use { page ->
                 val scale = maxSide.toFloat() / maxOf(page.width, page.height)
                 val width = (page.width * scale).roundToInt().coerceAtLeast(1)
                 val height = (page.height * scale).roundToInt().coerceAtLeast(1)
@@ -292,6 +363,15 @@ class OpenNotesPlugin : MyGoPlugin {
                 JSONObject().put("count", pdf.pageCount)
                     .put("width", page.width).put("height", page.height)
             }
+        }
+
+        val hadCached = slot.hasOpenRenderer()
+        return try {
+            renderOnce()
+        } catch (err: Exception) {
+            slot.closeSync()
+            if (!hadCached) throw err
+            renderOnce()
         }
     }
 
@@ -337,17 +417,51 @@ class OpenNotesPlugin : MyGoPlugin {
         }
     }
 
+    private fun cleanupStaleTempDirs() {
+        val cacheDir = runCatching { PluginHost.context.cacheDir }.getOrNull() ?: return
+        val cutoff = System.currentTimeMillis() - TimeUnit.HOURS.toMillis(1)
+        cacheDir.listFiles()?.forEach { entry ->
+            if (entry.isDirectory && entry.name.startsWith("margin-open-") && entry.lastModified() <= cutoff) {
+                runCatching { entry.deleteRecursively() }
+            }
+        }
+    }
+
     private fun copyNote(uri: Uri): File {
         val context = PluginHost.context
         val resolver = context.contentResolver
-        val displayName = if (uri.scheme == ContentResolver.SCHEME_CONTENT) {
+        var displayName: String? = null
+        var totalSize = -1L
+        if (uri.scheme == ContentResolver.SCHEME_CONTENT) {
             runCatching {
-                resolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use {
-                    if (it.moveToFirst()) it.getString(0) else null
+                resolver.query(
+                    uri,
+                    arrayOf(OpenableColumns.DISPLAY_NAME, OpenableColumns.SIZE),
+                    null,
+                    null,
+                    null,
+                )?.use {
+                    if (it.moveToFirst()) {
+                        val nameIdx = it.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                        if (nameIdx >= 0 && !it.isNull(nameIdx)) {
+                            displayName = it.getString(nameIdx)
+                        }
+                        val sizeIdx = it.getColumnIndex(OpenableColumns.SIZE)
+                        if (sizeIdx >= 0 && !it.isNull(sizeIdx)) {
+                            totalSize = it.getLong(sizeIdx)
+                        }
+                    }
                 }
-            }.getOrNull()
-        } else {
-            null
+            }
+        } else if (uri.scheme == ContentResolver.SCHEME_FILE) {
+            uri.path?.let { p ->
+                val f = File(p)
+                if (f.isFile) totalSize = f.length()
+            }
+        }
+        val reserveBytes = 64L * 1024L * 1024L
+        if (totalSize > 0L && context.cacheDir.usableSpace < totalSize + reserveBytes) {
+            throw IOException("设备存储空间不足，无法导入该文件")
         }
         val rawName = (displayName ?: uri.lastPathSegment.orEmpty())
             .substringAfterLast('/')
@@ -359,11 +473,44 @@ class OpenNotesPlugin : MyGoPlugin {
         val tempFile = File(folder, "incoming.tmp")
         val header = ByteArray(16)
         var headerLen = 0
+        var emittedProgress = false
         try {
             val input = resolver.openInputStream(uri) ?: throw IOException("无法打开笔记文件")
+            if (totalSize >= 10L * 1024L * 1024L) {
+                emittedProgress = true
+                PluginHost.emit(
+                    "mgnotedownloads",
+                    "importProgress",
+                    JSONObject().put("copied", 0L).put("total", totalSize),
+                )
+            }
+            var lastEmitMs = System.currentTimeMillis()
+            val ext = rawName.substringAfterLast('.', "").lowercase()
+            val knownExt = ext == "marginpkg" || ext == "marginnotes" || ext == "pdf"
+            var headerChecked = false
+            fun resolveFormatFromHeader(): String {
+                return when {
+                    knownExt -> rawName
+                    headerLen >= 4 &&
+                        header[0] == 0x50.toByte() && header[1] == 0x4B.toByte() &&
+                        header[2] == 0x03.toByte() && header[3] == 0x04.toByte() -> {
+                        val base = rawName.ifEmpty { "imported" }
+                        "$base.marginpkg"
+                    }
+                    headerLen >= 16 && String(header, 0, 16, Charsets.US_ASCII) == "SQLite format 3\u0000" -> {
+                        val base = rawName.ifEmpty { "imported" }
+                        "$base.marginnotes"
+                    }
+                    headerLen >= 5 && String(header, 0, 5, Charsets.US_ASCII) == "%PDF-" -> {
+                        val base = rawName.ifEmpty { "imported" }
+                        "$base.pdf"
+                    }
+                    else -> throw IOException("请选择 .marginpkg、.marginnotes 或 .pdf 文件")
+                }
+            }
             input.use {
                 tempFile.outputStream().use { output ->
-                    val buffer = ByteArray(64 * 1024)
+                    val buffer = ByteArray(256 * 1024)
                     var size = 0L
                     while (true) {
                         val read = input.read(buffer)
@@ -373,32 +520,27 @@ class OpenNotesPlugin : MyGoPlugin {
                             System.arraycopy(buffer, 0, header, headerLen, take)
                             headerLen += take
                         }
+                        if (!headerChecked && !knownExt && headerLen >= header.size) {
+                            headerChecked = true
+                            resolveFormatFromHeader()
+                        }
                         size += read
-                        if (size > 512L * 1024 * 1024) throw IOException("笔记文件超过 512 MB")
                         output.write(buffer, 0, read)
+                        val now = System.currentTimeMillis()
+                        if (now - lastEmitMs >= 200L) {
+                            lastEmitMs = now
+                            emittedProgress = true
+                            PluginHost.emit(
+                                "mgnotedownloads",
+                                "importProgress",
+                                JSONObject().put("copied", size).put("total", totalSize),
+                            )
+                        }
                     }
                 }
             }
 
-            val ext = rawName.substringAfterLast('.', "").lowercase()
-            val finalName = when {
-                ext == "marginpkg" || ext == "marginnotes" || ext == "pdf" -> rawName
-                headerLen >= 4 &&
-                    header[0] == 0x50.toByte() && header[1] == 0x4B.toByte() &&
-                    header[2] == 0x03.toByte() && header[3] == 0x04.toByte() -> {
-                    val base = rawName.ifEmpty { "imported" }
-                    "$base.marginpkg"
-                }
-                headerLen >= 16 && String(header, 0, 16, Charsets.US_ASCII) == "SQLite format 3\u0000" -> {
-                    val base = rawName.ifEmpty { "imported" }
-                    "$base.marginnotes"
-                }
-                headerLen >= 5 && String(header, 0, 5, Charsets.US_ASCII) == "%PDF-" -> {
-                    val base = rawName.ifEmpty { "imported" }
-                    "$base.pdf"
-                }
-                else -> throw IOException("请选择 .marginpkg、.marginnotes 或 .pdf 文件")
-            }
+            val finalName = resolveFormatFromHeader()
 
             val target = File(folder, finalName)
             if (!tempFile.renameTo(target)) {
@@ -409,6 +551,10 @@ class OpenNotesPlugin : MyGoPlugin {
             tempFile.delete()
             folder.deleteRecursively()
             throw err
+        } finally {
+            if (emittedProgress) {
+                PluginHost.emit("mgnotedownloads", "importProgress", JSONObject().put("done", true))
+            }
         }
     }
 }

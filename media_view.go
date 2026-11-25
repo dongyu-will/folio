@@ -128,8 +128,20 @@ func (a *workspace) paintMediaThumbnail(p *ui.Painter, rect ui.Rect, ref string)
 	pixels := max(rect.W, rect.H) * p.Scale()
 	for i, side := range mediaThumbnailSizes {
 		if pixels <= float32(side) || i == len(mediaThumbnailSizes)-1 {
-			if bitmap := a.mediaThumbnail(ref, i); bitmap != nil {
+			bitmap, settled := a.mediaThumbnailState(ref, i)
+			if bitmap != nil {
 				p.Image(bitmap, rect, ui.Contain)
+				return
+			}
+			if settled {
+				p.Fill(rect, ui.RGBA(140, 140, 148, .12), 6)
+				pad := clamp(min(rect.W, rect.H)*.28, 6, 18)
+				cx, cy := rect.X+rect.W/2, rect.Y+rect.H/2
+				col := ui.RGBA(140, 140, 148, .42)
+				p.Line(cx-pad/2, cy-pad/2, cx+pad/2, cy+pad/2, 1.5, col)
+				p.Line(cx-pad/2, cy+pad/2, cx+pad/2, cy-pad/2, 1.5, col)
+			} else {
+				p.Fill(rect, ui.RGBA(128, 128, 136, .08), 6)
 			}
 			return
 		}
@@ -137,25 +149,30 @@ func (a *workspace) paintMediaThumbnail(p *ui.Painter, rect ui.Rect, ref string)
 }
 
 func (a *workspace) mediaThumbnail(ref string, tier int) *ui.Bitmap {
+	bitmap, _ := a.mediaThumbnailState(ref, tier)
+	return bitmap
+}
+
+func (a *workspace) mediaThumbnailState(ref string, tier int) (*ui.Bitmap, bool) {
 	m := &a.media
 	// A sharper cached thumbnail can also serve a smaller view.
 	for _, side := range mediaThumbnailSizes[tier:] {
 		if bitmap, ok := m.thumbnails.get(mediaThumbnailKey{ref, side}); ok {
-			return bitmap
+			return bitmap, true
 		}
 	}
 	key := mediaThumbnailKey{ref, mediaThumbnailSizes[tier]}
 	if !m.pending[key] && m.decoding < 2 && a.store != nil {
 		path := a.store.MediaPath(ref)
 		if path == "" {
-			return nil
+			return nil, true
 		}
 		win := a.window()
 		if win == nil {
 			bitmap := decodeMediaBitmap(path, key.side)
 			a.updateMediaOrientation(ref, bitmap)
 			m.thumbnails.put(key, bitmap, thumbnailBudget)
-			return bitmap
+			return bitmap, true
 		}
 		if m.pending == nil {
 			m.pending = make(map[mediaThumbnailKey]bool)
@@ -177,10 +194,11 @@ func (a *workspace) mediaThumbnail(ref string, tier int) *ui.Bitmap {
 	}
 	for i := tier - 1; i >= 0; i-- {
 		if bitmap, _ := m.thumbnails.get(mediaThumbnailKey{ref, mediaThumbnailSizes[i]}); bitmap != nil {
-			return bitmap
+			return bitmap, true
 		}
 	}
-	return nil
+	_, settled := m.thumbnails.get(key)
+	return nil, settled
 }
 
 func (a *workspace) updateMediaOrientation(ref string, bitmap *ui.Bitmap) {

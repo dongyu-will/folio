@@ -9,6 +9,9 @@
     "publicKey": "MikyswN2WzB++tVOTFMwJh1W+XSBMZ4vA3tqss9E9N4=",
     "github": "dongyu-will/folio"
   },
+  "android": {
+    "abis": ["arm64"]
+  },
   "fileAssociations": [
     { "ext": ["marginpkg"], "name": "MarginNote 笔记包", "role": "Viewer" },
     { "ext": ["marginnotes"], "name": "MarginNote 笔记数据库", "role": "Viewer" },

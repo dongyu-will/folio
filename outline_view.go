@@ -13,6 +13,31 @@ type outlineItem struct {
 }
 
 func (a *workspace) outlineItems() []outlineItem {
+	if a.hasActiveFilter() {
+		matched := a.searchNotes()
+		var allowed map[string]bool
+		if a.scope != "" {
+			allowed = make(map[string]bool)
+			var mark func(id string)
+			mark = func(id string) {
+				if allowed[id] {
+					return
+				}
+				allowed[id] = true
+				for _, cid := range a.tree.kids[id] {
+					mark(cid)
+				}
+			}
+			mark(a.scope)
+		}
+		var items []outlineItem
+		for _, id := range matched {
+			if allowed == nil || allowed[id] {
+				items = append(items, outlineItem{id: id, depth: 0})
+			}
+		}
+		return items
+	}
 	a.ensureExpanded(a.currentTrail())
 	rootID := a.tree.root
 	if a.scope != "" {
@@ -64,20 +89,27 @@ func (a *workspace) outlineView(c *ui.Context, p palette, width, height float32)
 	ui.Scroll(c.Key("outline-scroll")).Fill().Background(p.canvas).TrackScroll(&a.outlineScroll).
 		AlignItems(ui.Center).Padding(20, padX, 40).Gap(10).Children(func() {
 		ui.Row(c).Width(streamW).Shrink(0).AlignItems(ui.Center).Gap(8).Padding(0, 2, 6).Children(func() {
-			heading := a.tree.book.Title
-			if a.scope != "" {
-				heading = noteTitle(a.tree.notes[a.scope])
+			badgePill(c, p, fmt.Sprintf("%d 条笔记", len(items)))
+			ui.Box(c).Grow(1).MinWidth(0)
+			if a.hasExpandableBranches() {
+				if a.hasCollapsedBranches() {
+					pillButton(c, p, "全部展开", icLayers, false, a.editing(), func() { a.setAllExpanded(true) })
+				} else {
+					pillButton(c, p, "全部收起", icLayers, false, a.editing(), func() { a.setAllExpanded(false) })
+				}
 			}
-			ui.Text(c, heading).FontSize(17).FontWeight(700).LetterSpacing(-0.3).
-				TextColor(p.ink).SingleLine().Grow(1).MinWidth(0)
-			badgePill(c, p, fmt.Sprintf("%d 条卡片", len(items)))
-			pillButton(c, p, "全部展开", nil, false, a.editing(), func() { a.setAllExpanded(true) })
-			pillButton(c, p, "收起下级", nil, false, a.editing(), func() { a.setAllExpanded(false) })
 		})
 
 		if len(items) == 0 {
 			ui.Box(c).Width(streamW).Padding(28).Radius(12).Background(p.surface).Border(1, p.rule).Center().Children(func() {
-				ui.Text(c, "当前分组暂无笔记卡片").FontSize(13).TextColor(p.quiet)
+				if a.hasActiveFilter() {
+					ui.Column(c).Center().Gap(8).Children(func() {
+						ui.Text(c, "当前筛选条件下暂无笔记").FontSize(13).TextColor(p.quiet)
+						pillButton(c, p, "清空筛选", icClose, true, false, a.clearFilters).Height(28)
+					})
+				} else {
+					ui.Text(c, "当前分组暂无笔记").FontSize(13).TextColor(p.quiet)
+				}
 			})
 			return
 		}
@@ -149,7 +181,9 @@ func (a *workspace) outlineCard(c *ui.Context, p palette, item outlineItem, stre
 					foldBtn := ui.ButtonBase(c.Key("fold-"+item.id)).Size(foldSz, foldSz).Radius(6).Center().
 						Label("展开或折叠" + title).Disabled(a.editing()).
 						OnClick(func() { a.toggleBranch(item.id) })
-					if foldBtn.Hovered() {
+					if foldBtn.Pressed() {
+						foldBtn.Background(p.pressed)
+					} else if foldBtn.Hovered() {
 						foldBtn.Background(p.hover)
 					}
 					foldBtn.Children(func() {
@@ -204,10 +238,46 @@ func (a *workspace) outlineCard(c *ui.Context, p palette, item outlineItem, stre
 				if hasKids {
 					badgePill(c, p, fmt.Sprintf("%d 项", len(kids)))
 				}
+				if !a.editing() {
+					selectForAction := func() {
+						a.selected = item.id
+						a.activeTrail = a.tree.trail(item.id)
+					}
+					actSz := float32(26)
+					if a.touchUI() {
+						actSz = 32
+					}
+					designToolbarButton(c, p, icEdit, "编辑笔记", actSz, false, a.busy, func() {
+						selectForAction()
+						a.startEditNote()
+					})
+					designToolbarButton(c, p, icPlus, "新建子笔记", actSz, false, a.busy, func() {
+						selectForAction()
+						a.startAddChild()
+					})
+					if item.id != "" {
+						iconButton(c, p, icSettingDelete, "删除笔记", false, a.busy, func() {
+							selectForAction()
+							a.confirmDeleteNote()
+						})
+					}
+				}
 			})
 
 			if hasBody {
 				ui.Box(c).FillWidth().Height(1).Background(ct.border.Alpha(.45))
+				if a.reciteMode && !a.revealedNotes[item.id] {
+					occlude := ui.ButtonBase(c.Key("orec-"+item.id)).FillWidth().Padding(14).
+						Center().Background(p.tint.Alpha(.7)).Label("点击揭晓内容").
+						OnClick(func() {
+							a.setNoteRevealed(item.id, true)
+							hapticLight()
+						})
+					occlude.Children(func() {
+						ui.Text(c, "点击揭晓内容").FontSize(12.5).FontWeight(600).TextColor(p.accent)
+					})
+					return
+				}
 				imgMaxW := max(140, cardW-44)
 				ui.Column(c).FillWidth().Padding(12, 16, 14).Gap(10).Children(func() {
 					renderOutlineImg := func(ref string) bool {
@@ -224,7 +294,9 @@ func (a *workspace) outlineCard(c *ui.Context, p palette, item outlineItem, stre
 						imgBtn := ui.ButtonBase(c.Key("oimg-"+ref)).AlignSelf(ui.Start).Radius(8).
 							Padding(8).Background(ui.Hex("#ffffff")).Border(1, ct.border.Alpha(.5)).
 							Label("放大"+title+"的附图").OnClick(func() { a.preview = ref })
-						if imgBtn.Hovered() {
+						if imgBtn.Pressed() {
+							imgBtn.Border(1, p.accent)
+						} else if imgBtn.Hovered() {
 							imgBtn.Border(1, p.accent.Alpha(.65))
 						}
 						imgBtn.Children(func() {
@@ -269,7 +341,7 @@ func (a *workspace) outlineCard(c *ui.Context, p palette, item outlineItem, stre
 						renderedBlocks++
 					}
 					if len(n.Tags) > 0 {
-						tagPillsRow(c, p, n.Tags)
+						tagPillsRowAction(c, p, n.Tags, a.applyTagFilter)
 					}
 				})
 			}
@@ -278,22 +350,33 @@ func (a *workspace) outlineCard(c *ui.Context, p palette, item outlineItem, stre
 }
 
 func tagPillsRow(c *ui.Context, p palette, tags []string) {
+	tagPillsRowAction(c, p, tags, nil)
+}
+
+func tagPillsRowAction(c *ui.Context, p palette, tags []string, onTag func(string)) {
 	if len(tags) == 0 {
 		return
 	}
 	ui.Row(c).FillWidth().Wrap().Gap(6).Shrink(0).Children(func() {
 		for i, raw := range tags {
-			tag := strings.TrimSpace(raw)
-			if tag == "" {
+			clean := strings.TrimSpace(strings.TrimLeft(strings.TrimSpace(raw), "#"))
+			if clean == "" {
 				continue
 			}
-			if !strings.HasPrefix(tag, "#") {
-				tag = "#" + tag
+			label := "#" + clean
+			if onTag != nil {
+				btn := ui.ButtonBase(c.Key(fmt.Sprintf("tag-%d", i))).Height(21).Padding(0, 8).Radius(99).
+					Center().Shrink(0).Background(p.tint).Border(1, p.tintBorder.Alpha(.7)).
+					Label(label).Tooltip("按标签筛选").OnClick(func() { onTag(clean) })
+				btn.Children(func() {
+					ui.Text(c, label).FontSize(11).FontWeight(550).TextColor(p.accent).SingleLine()
+				})
+			} else {
+				ui.Row(c.Key(fmt.Sprintf("tag-%d", i))).Height(21).Padding(0, 8).Radius(99).
+					Center().Shrink(0).Background(p.tint).Border(1, p.tintBorder.Alpha(.7)).Children(func() {
+					ui.Text(c, label).FontSize(11).FontWeight(550).TextColor(p.accent).SingleLine()
+				})
 			}
-			ui.Row(c.Key(fmt.Sprintf("tag-%d", i))).Height(21).Padding(0, 8).Radius(99).
-				Center().Shrink(0).Background(p.tint).Border(1, p.tintBorder.Alpha(.7)).Children(func() {
-				ui.Text(c, tag).FontSize(11).FontWeight(550).TextColor(p.accent).SingleLine()
-			})
 		}
 	})
 }

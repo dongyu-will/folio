@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -26,11 +27,68 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const maxImportSize = 512 << 20
-
 // sqliteReadTimeout bounds pure SQLite reads during import; media rendering and
 // compositing run strictly after the database and all cursors are closed.
 var sqliteReadTimeout = 60 * time.Second
+
+func sqliteTimeoutForSize(dbSize int64) time.Duration {
+	if sqliteReadTimeout < 60*time.Second {
+		return sqliteReadTimeout
+	}
+	if dbSize <= 0 {
+		return sqliteReadTimeout
+	}
+	extra := time.Duration(dbSize/(100<<20)) * 30 * time.Second
+	return min(15*time.Minute, sqliteReadTimeout+extra)
+}
+
+type ImportStage uint8
+
+const (
+	ImportStageExtractDB ImportStage = iota
+	ImportStageLoadAttachments
+	ImportStageImportPDF
+)
+
+type ImportProgress struct {
+	Stage ImportStage
+	Done  int64
+	Total int64
+	Index int
+	Count int
+}
+
+type ImportOptions struct {
+	Ctx           context.Context
+	Preview       func(ImportResult)
+	OnProgress    func(ImportProgress)
+	CanMoveSource bool
+}
+
+type contextReader struct {
+	ctx context.Context
+	r   io.Reader
+}
+
+func withContextReader(ctx context.Context, r io.Reader) io.Reader {
+	if ctx == nil {
+		return r
+	}
+	return &contextReader{ctx: ctx, r: r}
+}
+
+func (c *contextReader) Read(p []byte) (int, error) {
+	if err := c.ctx.Err(); err != nil {
+		return 0, err
+	}
+	n, err := c.r.Read(p)
+	if n > 0 {
+		if ctxErr := c.ctx.Err(); ctxErr != nil {
+			return n, ctxErr
+		}
+	}
+	return n, err
+}
 
 var backupSuffix = regexp.MustCompile(`\s*\(\d{4}-\d\d-\d\d-\d\d-\d\d-\d\d\)$`)
 
@@ -71,6 +129,7 @@ type Note struct {
 	Links          []string        `json:"links,omitempty"`
 	TitleEdited    bool            `json:"titleEdited,omitempty"`
 	BodyEdited     bool            `json:"bodyEdited,omitempty"`
+	MetaEdited     bool            `json:"metaEdited,omitempty"`
 	PendingMedia   bool            `json:"-"` // Used only by the temporary import preview.
 }
 
@@ -89,97 +148,208 @@ type sourceTopic struct {
 }
 
 type rawSourceNote struct {
-	note      sourceNote
-	rawClip   []byte
-	rawBlocks []byte
-	clip      map[string]any
-	blocks    []any
+	note       sourceNote
+	rawClip    []byte
+	rawBlocks  []byte
+	clip       map[string]any
+	blocks     []any
+	sourceKeys []string
 }
 
 func readMarginNote(path, ink string) ([]Book, map[string][]byte, *bookConfigIndex, error) {
-	return readMarginNoteWithSink(path, ink, nil, nil)
+	return readMarginNoteWithCtx(context.Background(), path, ink, nil, nil, nil)
 }
 
-func readMarginNoteWithSink(path, ink string, sink mediaSink, preview func([]Book)) ([]Book, map[string][]byte, *bookConfigIndex, error) {
+func readMarginNoteWithSink(path, ink string, sink mediaSink, preview func([]Book), onProgress func(ImportProgress)) ([]Book, map[string][]byte, *bookConfigIndex, error) {
+	return readMarginNoteWithCtx(context.Background(), path, ink, sink, preview, onProgress)
+}
+
+func readMarginNoteWithCtx(ctx context.Context, path, ink string, sink mediaSink, preview func([]Book), onProgress func(ImportProgress)) ([]Book, map[string][]byte, *bookConfigIndex, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, nil, nil, err
+	}
 	info, err := os.Stat(path)
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	if !info.Mode().IsRegular() || info.Size() > maxImportSize {
-		return nil, nil, nil, errors.New("请选择小于 512 MB 的 MarginNote 笔记文件")
+	if !info.Mode().IsRegular() {
+		return nil, nil, nil, errors.New("请选择有效的 MarginNote 笔记文件")
 	}
 
-	read, err := openPayload(path)
-	if err != nil {
-		return nil, nil, nil, err
-	}
+	source := filepath.Base(path)
+	format := detectImportFormat(path)
 
-	temp, err := os.CreateTemp("", "mgnote-import-*.sqlite")
-	if err != nil {
-		read.Close()
-		return nil, nil, nil, err
-	}
-	tempPath := temp.Name()
-	defer os.Remove(tempPath)
-	hash := sha256.New()
-	n, copyErr := io.Copy(io.MultiWriter(temp, hash), io.LimitReader(read, maxImportSize+1))
-	closeErr := errors.Join(temp.Close(), read.Close())
-	if err := errors.Join(copyErr, closeErr); err != nil {
-		return nil, nil, nil, err
-	}
-	if n > maxImportSize {
-		return nil, nil, nil, errors.New("解压后的笔记数据库超过 512 MB")
-	}
-
-	digest, source := hex.EncodeToString(hash.Sum(nil)), filepath.Base(path)
-	var showText func([]sourceTopic, []rawSourceNote)
-	if preview != nil {
-		showText = func(topics []sourceTopic, rawNotes []rawSourceNote) {
-			preview(previewBooks(topics, rawNotes, digest, source))
+	loadSingleDB := func(dbPath string, dbSize int64, digest string, prevBooks []Book) ([]Book, map[string][]byte, *bookConfigIndex, error) {
+		var showText func([]sourceTopic, []rawSourceNote)
+		if preview != nil {
+			showText = func(topics []sourceTopic, rawNotes []rawSourceNote) {
+				combined := append(slices.Clone(prevBooks), previewBooks(topics, rawNotes, digest, source)...)
+				preview(combined)
+			}
 		}
-	}
-	media := newMediaImport(ink, sink)
-	topics, rawNotes, configs, err := loadMarginSQLite(tempPath, media, showText)
-	// Remove the extracted SQLite temp file immediately after closing the DB
-	// so peak flash usage drops before ink rendering and PDF extraction.
-	_ = os.Remove(tempPath)
-	if err != nil {
+		media := newMediaImport(ink, sink)
+		topics, rawNotes, configs, err := loadMarginSQLite(ctx, dbPath, dbSize, media, showText)
+		if format != ".marginnotes" {
+			_ = os.Remove(dbPath)
+		}
+		if err != nil {
+			media.releaseTransient()
+			return nil, nil, nil, err
+		}
+		if err := ctx.Err(); err != nil {
+			media.releaseTransient()
+			return nil, nil, nil, err
+		}
+		if onProgress != nil {
+			onProgress(ImportProgress{Stage: ImportStageLoadAttachments})
+		}
+		media.countInkRefs(rawNotes)
+		media.countSourceRefs(rawNotes)
+		attachNotesParallel(rawNotes, media)
+		attachErr := media.err()
 		media.releaseTransient()
-		return nil, nil, nil, err
+		if attachErr != nil {
+			return nil, nil, nil, fmt.Errorf("无法保存笔记附件：%w", attachErr)
+		}
+		if err := ctx.Err(); err != nil {
+			return nil, nil, nil, err
+		}
+		books := assembleBooks(topics, rawNotes, digest, source, mediaVersion(media.ink))
+		if len(books) == 0 {
+			return nil, nil, configs, nil
+		}
+		return books, pruneUnusedMedia(books, media.files), configs, nil
 	}
 
-	media.countInkRefs(rawNotes)
-	attachNotesParallel(rawNotes, media)
-	attachErr := media.err()
-	media.releaseTransient()
-	if attachErr != nil {
-		return nil, nil, nil, fmt.Errorf("无法保存笔记附件：%w", attachErr)
+	if format == ".marginnotes" {
+		// Standalone .marginnotes can be hashed in a single streaming pass and opened
+		// directly read-only without duplicating hundreds of MB into a temp file.
+		f, err := os.Open(path)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		hash := sha256.New()
+		var progressFn func(done, total int64)
+		if onProgress != nil && info.Size() >= 8<<20 {
+			progressFn = func(done, total int64) {
+				onProgress(ImportProgress{Stage: ImportStageExtractDB, Done: done, Total: total})
+			}
+		}
+		buf := make([]byte, copyBufferSize)
+		_, copyErr := io.CopyBuffer(hash, newProgressReader(withContextReader(ctx, f), info.Size(), progressFn), buf)
+		closeErr := f.Close()
+		if err := errors.Join(copyErr, closeErr); err != nil {
+			return nil, nil, nil, err
+		}
+		digest := hex.EncodeToString(hash.Sum(nil))
+		books, files, configs, err := loadSingleDB(path, info.Size(), digest, nil)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		if len(books) == 0 {
+			return nil, nil, nil, errors.New("文件里没有可导入的笔记")
+		}
+		return books, files, configs, nil
 	}
 
-	books := assembleBooks(topics, rawNotes, digest, source, mediaVersion(media.ink))
-	if len(books) == 0 {
+	if format != ".marginpkg" {
+		return nil, nil, nil, errors.New("请选择 .marginpkg、.marginnotes 或 .pdf 文件")
+	}
+
+	archive, err := zip.OpenReader(path)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("无法打开 MarginNote 压缩包：%w", err)
+	}
+	defer archive.Close()
+
+	dbEntries := listPackageDBEntries(&archive.Reader)
+	if len(dbEntries) == 0 {
+		return nil, nil, nil, errors.New("压缩包缺少可用的 .marginnotes 数据库")
+	}
+
+	var allBooks []Book
+	var allFiles map[string][]byte
+	mergedConfigs := &bookConfigIndex{
+		byKey:   make(map[string]bookConfig),
+		byTitle: make(map[string]bookConfig),
+	}
+
+	for _, entry := range dbEntries {
+		if err := ctx.Err(); err != nil {
+			return nil, nil, nil, err
+		}
+		uncompressedSize := entryUncompressedSize(entry)
+		if err := checkAvailableSpace(os.TempDir(), uncompressedSize); err != nil {
+			return nil, nil, nil, err
+		}
+		read, err := entry.Open()
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		temp, err := os.CreateTemp("", "mgnote-import-*.sqlite")
+		if err != nil {
+			_ = read.Close()
+			return nil, nil, nil, mapDiskSpaceError(err)
+		}
+		tempPath := temp.Name()
+		hash := sha256.New()
+		var progressFn func(done, total int64)
+		if onProgress != nil {
+			progressFn = func(done, total int64) {
+				onProgress(ImportProgress{Stage: ImportStageExtractDB, Done: done, Total: total})
+			}
+		}
+		buf := make([]byte, copyBufferSize)
+		n, copyErr := io.CopyBuffer(io.MultiWriter(temp, hash), newProgressReader(withContextReader(ctx, read), uncompressedSize, progressFn), buf)
+		closeErr := errors.Join(temp.Close(), read.Close())
+		if err := mapDiskSpaceError(errors.Join(copyErr, closeErr)); err != nil {
+			_ = os.Remove(tempPath)
+			return nil, nil, nil, err
+		}
+		digest := hex.EncodeToString(hash.Sum(nil))
+		books, files, configs, err := loadSingleDB(tempPath, n, digest, allBooks)
+		_ = os.Remove(tempPath)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		allBooks = append(allBooks, books...)
+		if len(files) > 0 {
+			if allFiles == nil {
+				allFiles = make(map[string][]byte, len(files))
+			}
+			for k, v := range files {
+				allFiles[k] = v
+			}
+		}
+		mergeBookConfigs(mergedConfigs, configs)
+	}
+	if len(allBooks) == 0 {
 		return nil, nil, nil, errors.New("文件里没有可导入的笔记")
 	}
-	return books, pruneUnusedMedia(books, media.files), configs, nil
+	return allBooks, allFiles, mergedConfigs, nil
 }
 
-func loadMarginSQLite(tempPath string, media *mediaImport, showText func([]sourceTopic, []rawSourceNote)) ([]sourceTopic, []rawSourceNote, *bookConfigIndex, error) {
-	uri := (&url.URL{Scheme: "file", Path: filepath.ToSlash(tempPath)}).String()
+func loadMarginSQLite(parentCtx context.Context, dbPath string, dbSize int64, media *mediaImport, showText func([]sourceTopic, []rawSourceNote)) ([]sourceTopic, []rawSourceNote, *bookConfigIndex, error) {
+	uri := (&url.URL{Scheme: "file", Path: filepath.ToSlash(dbPath)}).String()
 	db, err := sql.Open("sqlite", uri+"?mode=ro&immutable=1&_pragma=trusted_schema(OFF)")
 	if err != nil {
 		return nil, nil, nil, err
 	}
 	defer db.Close()
 
-	ctx, cancel := context.WithTimeout(context.Background(), sqliteReadTimeout)
-	defer cancel()
-
+	timeout := sqliteTimeoutForSize(dbSize)
+	ctx, cancel := context.WithTimeout(parentCtx, timeout)
 	configs := readBookConfigs(ctx, db)
 	topics, err := readTopics(ctx, db)
 	if err != nil {
+		cancel()
 		return nil, nil, nil, fmt.Errorf("无法读取 MarginNote 笔记数据库：%w", err)
 	}
 	rawNotes, err := readRawNotes(ctx, db, configs)
+	cancel()
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("无法读取 MarginNote 笔记数据库：%w", err)
 	}
@@ -188,6 +358,9 @@ func loadMarginSQLite(tempPath string, media *mediaImport, showText func([]sourc
 	// load only referenced ZMEDIA rows and skip unreferenced PDF-page JSON blobs.
 	plan := newMediaRefPlan()
 	for i := range rawNotes {
+		if err := parentCtx.Err(); err != nil {
+			return nil, nil, nil, err
+		}
 		if len(rawNotes[i].rawClip) > 0 {
 			rawNotes[i].clip, _ = unarchive(rawNotes[i].rawClip).(map[string]any)
 			rawNotes[i].rawClip = nil
@@ -202,7 +375,9 @@ func loadMarginSQLite(tempPath string, media *mediaImport, showText func([]sourc
 	if showText != nil {
 		showText(topics, rawNotes)
 	}
-	if err := readMediaFiltered(ctx, db, media, plan); err != nil {
+	mediaCtx, mediaCancel := context.WithTimeout(parentCtx, timeout)
+	defer mediaCancel()
+	if err := readMediaFiltered(mediaCtx, db, media, plan); err != nil {
 		return nil, nil, nil, fmt.Errorf("无法读取笔记附件：%w", err)
 	}
 	return topics, rawNotes, configs, nil
@@ -262,8 +437,10 @@ func attachNotesParallel(rawNotes []rawSourceNote, media *mediaImport) {
 				break
 			}
 			rawNotes[i].note.sketchOrDummyOnly = media.attachParsed(&rawNotes[i].note.Note, rawNotes[i].clip, rawNotes[i].blocks)
+			media.releaseNoteSources(rawNotes[i].sourceKeys)
 			rawNotes[i].clip = nil
 			rawNotes[i].blocks = nil
+			rawNotes[i].sourceKeys = nil
 		}
 		return
 	}
@@ -282,8 +459,10 @@ func attachNotesParallel(rawNotes []rawSourceNote, media *mediaImport) {
 					return
 				}
 				rawNotes[idx].note.sketchOrDummyOnly = media.attachParsed(&rawNotes[idx].note.Note, rawNotes[idx].clip, rawNotes[idx].blocks)
+				media.releaseNoteSources(rawNotes[idx].sourceKeys)
 				rawNotes[idx].clip = nil
 				rawNotes[idx].blocks = nil
+				rawNotes[idx].sourceKeys = nil
 			}
 		}()
 	}
@@ -350,39 +529,72 @@ func detectImportFormat(path string) string {
 	return ""
 }
 
-func openPayload(path string) (io.ReadCloser, error) {
+func listPackageDBEntries(archive *zip.Reader) []*zip.File {
+	var out []*zip.File
+	for _, entry := range archive.File {
+		if !entry.Mode().IsRegular() || strings.ToLower(filepath.Ext(entry.Name)) != ".marginnotes" ||
+			strings.HasPrefix(entry.Name, "__MACOSX/") || strings.HasPrefix(filepath.Base(entry.Name), "._") {
+			continue
+		}
+		out = append(out, entry)
+	}
+	return out
+}
+
+func entryUncompressedSize(entry *zip.File) int64 {
+	if entry == nil || entry.UncompressedSize64 == 0 {
+		return -1
+	}
+	if entry.UncompressedSize64 > math.MaxInt64 {
+		return math.MaxInt64
+	}
+	return int64(entry.UncompressedSize64)
+}
+
+func mergeBookConfigs(dst, src *bookConfigIndex) {
+	if dst == nil || src == nil {
+		return
+	}
+	dst.all = append(dst.all, src.all...)
+	for k, v := range src.byKey {
+		dst.byKey[k] = v
+	}
+	for k, v := range src.byTitle {
+		dst.byTitle[k] = v
+	}
+}
+
+func openPayload(path string) (io.ReadCloser, int64, error) {
 	switch detectImportFormat(path) {
 	case ".marginnotes":
-		return os.Open(path)
+		f, err := os.Open(path)
+		if err != nil {
+			return nil, -1, err
+		}
+		var size int64 = -1
+		if info, err := f.Stat(); err == nil && info.Size() >= 0 {
+			size = info.Size()
+		}
+		return f, size, nil
 	case ".marginpkg":
 		archive, err := zip.OpenReader(path)
 		if err != nil {
-			return nil, fmt.Errorf("无法打开 MarginNote 压缩包：%w", err)
+			return nil, -1, fmt.Errorf("无法打开 MarginNote 压缩包：%w", err)
 		}
-		var payload *zip.File
-		for _, entry := range archive.File {
-			if !entry.Mode().IsRegular() || strings.ToLower(filepath.Ext(entry.Name)) != ".marginnotes" ||
-				strings.HasPrefix(entry.Name, "__MACOSX/") || strings.HasPrefix(filepath.Base(entry.Name), "._") {
-				continue
-			}
-			if payload != nil {
-				archive.Close()
-				return nil, errors.New("压缩包里有多个笔记数据库，请解压后逐个导入 .marginnotes")
-			}
-			payload = entry
-		}
-		if payload == nil || payload.UncompressedSize64 > maxImportSize {
+		entries := listPackageDBEntries(&archive.Reader)
+		if len(entries) == 0 {
 			archive.Close()
-			return nil, errors.New("压缩包缺少可用的 .marginnotes 数据库")
+			return nil, -1, errors.New("压缩包缺少可用的 .marginnotes 数据库")
 		}
+		payload := entries[0]
 		r, err := payload.Open()
 		if err != nil {
 			archive.Close()
-			return nil, err
+			return nil, -1, err
 		}
-		return zipPayload{r, archive}, nil
+		return zipPayload{r, archive}, entryUncompressedSize(payload), nil
 	default:
-		return nil, errors.New("请选择 .marginpkg、.marginnotes 或 .pdf 文件")
+		return nil, -1, errors.New("请选择 .marginpkg、.marginnotes 或 .pdf 文件")
 	}
 }
 
@@ -775,9 +987,6 @@ func readRawNotes(ctx context.Context, db *sql.DB, configs *bookConfigIndex) ([]
 	defer rows.Close()
 	var out []rawSourceNote
 	for rows.Next() {
-		if len(out) >= 20000 {
-			return nil, errors.New("单次最多导入 20,000 条笔记")
-		}
 		var n sourceNote
 		var links, highlightStyle, recognizeText, bookMD5 string
 		var collapsed int

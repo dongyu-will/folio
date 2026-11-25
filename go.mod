@@ -3,7 +3,7 @@ module github.com/dongyu-will/folio
 go 1.27.3
 
 require (
-	github.com/egoist/mygo v0.10.0
+	github.com/egoist/mygo v0.10.1-0.20261125034202-2995654147f4
 	github.com/google/uuid v1.6.0
 	golang.org/x/net v0.59.0
 	howett.net/plist v1.0.1

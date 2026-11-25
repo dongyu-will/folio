@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
 
 	"github.com/dongyu-will/folio/internal/androidopen"
 	"github.com/dongyu-will/folio/internal/notebook"
@@ -50,12 +51,13 @@ func main() {
 			}
 		}
 	}
-	if os.Getenv("MYGO_GENERATE") == "" && runtime.GOOS != "android" {
-		if downloads, err := mygo.App.Path(mygo.PathDownloads); err == nil {
-			if err := store.RecoverMedia(downloads); err != nil {
-				log.Print(err)
+	if os.Getenv("MYGO_GENERATE") == "" {
+		go func() {
+			store.CleanupStaleTempFiles(time.Hour)
+			if runtime.GOOS == "android" {
+				cleanupStaleAndroidPicked(androidCacheDirs(), time.Hour)
 			}
-		}
+		}()
 	}
 	app := &workspace{store: store}
 	for _, path := range os.Args[1:] {
@@ -65,36 +67,48 @@ func main() {
 	}
 
 	mygo.App.OnQuit(func() {
+		app.flushPendingPDFPageSave()
+		closePDFRendererCache()
 		if err := app.drawingWrites.flush(store); err != nil {
 			log.Print(err)
 		}
 	})
+	var startupErr error
 	settings, err := store.ReadSettings()
 	if err != nil {
-		app.showError(err)
+		startupErr = err
 	}
 	app.settings = settings
 	library, err := store.Read()
-	if err != nil {
-		app.showError(err)
+	if err != nil && startupErr == nil {
+		startupErr = err
 	}
-	app.setLibrary(library, "")
+	app.setLibrary(library, settings.LastBookID)
 	if runtime.GOOS == "android" {
 		app.androidFramePending.Store(true)
 		mygo.Native(androidopen.PluginID).On("stylus", app.onAndroidStylus)
 		mygo.Native(androidopen.PluginID).On("ready", func([]byte) {
 			app.notifyDownloadsReady()
 		})
+		mygo.Native(androidopen.PluginID).On("importProgress", app.onAndroidImportProgress)
+		mygo.Native(androidopen.PluginID).On("installState", app.onAndroidInstallState)
 		mygo.Native(androidopen.PluginID).On("surfaceResumed", app.onAndroidSurfaceResumed)
 	}
 	mygo.App.OnOpenFile(func(path string) {
 		app.enqueueImport(path)
 	})
+	mygo.App.OnSaveState(app.marshalSessionState)
 	mygo.App.WhenReady(func() {
+		if restored := mygo.App.RestoredState(); len(restored) > 0 {
+			app.restoreSessionState(restored)
+		}
 		// Sync theme inside WhenReady (after App.Run initialized the backend)
 		// because mygo.Theme.SetSource calls onMain/backend() which would
 		// prematurely construct mobile.Backend if invoked before App.Run.
 		syncAppTheme(app.settings.Appearance)
+		mygo.App.OnMemoryWarning(func() {
+			app.releaseMemoryCaches()
+		})
 		winOpts := mygo.WindowOptions{
 			Title: "Folio", Content: ui.View(app.view),
 			Width: 1280, Height: 800, MinWidth: 560, MinHeight: 480,
@@ -105,9 +119,30 @@ func main() {
 		}
 		win := mygo.NewWindow(winOpts)
 		app.setWindow(win)
+		if startupErr != nil {
+			err := startupErr
+			win.Update(func() { app.showError(err) })
+		}
 		win.OnFileDrop(func(e *mygo.FileDropEvent) {
 			app.enqueueImport(e.Paths...)
 		})
+		if os.Getenv("MYGO_GENERATE") == "" && runtime.GOOS != "android" {
+			if downloads, err := mygo.App.Path(mygo.PathDownloads); err == nil {
+				go func() {
+					if err := store.RecoverMedia(downloads); err != nil {
+						log.Print(err)
+						return
+					}
+					if updated, readErr := store.Read(); readErr == nil {
+						app.updateUI(func() {
+							if !app.busy && !app.editing() {
+								app.setLibrary(updated, app.bookID)
+							}
+						})
+					}
+				}()
+			}
+		}
 		if runtime.GOOS == "android" {
 			app.notifyDownloadsReady()
 		} else {

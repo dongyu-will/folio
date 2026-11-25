@@ -608,9 +608,9 @@ func TestMergedLinkNoteAndPicNoteBlocks(t *testing.T) {
 		return data
 	}
 	m := &mediaImport{
-		sources: map[string][]byte{
-			"pic-md5":    pngBytes,
-			"merged-md5": pngBytes,
+		sources: map[string]*sourceBlob{
+			"pic-md5":    {data: pngBytes},
+			"merged-md5": {data: pngBytes},
 		},
 		files: map[string][]byte{},
 	}
@@ -1032,8 +1032,8 @@ func TestDirectRGBACompositingOverBaseClip(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			m := newMediaImport("", nil)
-			m.sources["clip"] = baseBuf.Bytes()
-			m.sources["draw"] = pk
+			m.sources["clip"] = &sourceBlob{data: baseBuf.Bytes()}
+			m.sources["draw"] = &sourceBlob{data: pk}
 			m.inkCounts = tc.counts
 
 			out := m.picture(map[string]any{"paint": "clip", "drawing": "draw"})
@@ -1190,4 +1190,119 @@ func (s *Store) update(change func(*Library) (bool, error)) (Library, error) {
 		}
 	}
 	return library, nil
+}
+
+func TestReadMediaFilteredTwoPhaseAndWithoutRowID(t *testing.T) {
+	archive := func(objects ...any) []byte {
+		t.Helper()
+		data, err := plist.Marshal(map[string]any{
+			"$archiver": "NSKeyedArchiver", "$top": map[string]any{"root": plist.UID(1)},
+			"$objects": append([]any{"$null"}, objects...),
+		}, plist.BinaryFormat)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return data
+	}
+
+	for _, withoutRowID := range []bool{false, true} {
+		name := "with_rowid"
+		ddl := "CREATE TABLE ZMEDIA (ZMD5 TEXT PRIMARY KEY, ZDATA BLOB)"
+		if withoutRowID {
+			name = "without_rowid"
+			ddl = "CREATE TABLE ZMEDIA (ZMD5 TEXT PRIMARY KEY, ZDATA BLOB) WITHOUT ROWID"
+		}
+		t.Run(name, func(t *testing.T) {
+			tmp := t.TempDir()
+			dbPath := filepath.Join(tmp, "test.marginnotes")
+			db, err := sql.Open("sqlite", dbPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.Close()
+			if _, err := db.Exec(ddl); err != nil {
+				t.Fatal(err)
+			}
+			png := makePNG(t, 8, 8, 2)
+			pk := buildSyntheticPKDrawing(t, false)
+			wrap := archive(
+				map[string]any{"NS.keys": []any{plist.UID(2)}, "NS.objects": []any{plist.UID(3)}},
+				"drawing2", "nested-draw",
+			)
+			rows := []struct {
+				k string
+				v []byte
+			}{
+				{"unreferenced-blob", []byte("should-not-be-loaded")},
+				{"nested-draw", archive(map[string]any{"NS.data": pk})},
+				{"img-direct", archive(map[string]any{"NS.data": png})},
+				{"wrap-draw", wrap},
+			}
+			for _, row := range rows {
+				if _, err := db.Exec("INSERT INTO ZMEDIA VALUES (?, ?)", row.k, row.v); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			plan := newMediaRefPlan()
+			plan.needed["img-direct"] = true
+			plan.needed["wrap-draw"] = true
+			plan.needRaw["wrap-draw"] = true
+
+			store := NewStore(filepath.Join(tmp, "store"))
+			sink := store.newMediaSink()
+			defer sink.cleanup()
+			media := newMediaImport("", sink)
+			if err := readMediaFiltered(context.Background(), db, media, plan); err != nil {
+				t.Fatal(err)
+			}
+			if _, loadedUnref := media.sources["unreferenced-blob"]; loadedUnref {
+				t.Fatal("unreferenced ZMEDIA row should have been skipped")
+			}
+			if _, savedUnref := media.savedKeys["unreferenced-blob"]; savedUnref {
+				t.Fatal("unreferenced ZMEDIA row should not appear in savedKeys")
+			}
+			if media.savedKeys["img-direct"] == "" {
+				t.Fatal("expected img-direct to stream directly to disk sink")
+			}
+			if len(media.source("nested-draw")) == 0 || len(media.source("wrap-draw")) == 0 {
+				t.Fatal("expected wrapped drawing and nested drawing2 key to load")
+			}
+		})
+	}
+}
+
+func TestSourceRefCountingAndDynamicTimeout(t *testing.T) {
+	if got := sqliteTimeoutForSize(0); got != 60*time.Second {
+		t.Fatalf("unexpected base timeout: %v", got)
+	}
+	if got := sqliteTimeoutForSize(600 << 20); got != 240*time.Second {
+		t.Fatalf("unexpected 600MB timeout: %v", got)
+	}
+	if got := sqliteTimeoutForSize(10 << 30); got != 15*time.Minute {
+		t.Fatalf("expected capped 15m timeout, got %v", got)
+	}
+
+	media := newMediaImport("", nil)
+	media.sources["shared-img"] = &sourceBlob{data: makePNG(t, 8, 8, 3)}
+	media.sources["unique-img"] = &sourceBlob{data: makePNG(t, 8, 8, 4)}
+	notes := []rawSourceNote{
+		{note: sourceNote{Note: Note{ID: "n1"}}, clip: map[string]any{"paint": "shared-img"}},
+		{note: sourceNote{Note: Note{ID: "n2"}}, clip: map[string]any{"paint": "shared-img"}},
+		{note: sourceNote{Note: Note{ID: "n3"}}, clip: map[string]any{"paint": "unique-img"}},
+	}
+	media.countSourceRefs(notes)
+	if media.sources["shared-img"].rem.Load() != 2 || media.sources["unique-img"].rem.Load() != 1 {
+		t.Fatalf("unexpected refcounts: shared=%d unique=%d", media.sources["shared-img"].rem.Load(), media.sources["unique-img"].rem.Load())
+	}
+	attachNotesParallel(notes, media)
+	if media.err() != nil {
+		t.Fatal(media.err())
+	}
+	if media.sources["shared-img"].data != nil || media.sources["unique-img"].data != nil {
+		t.Fatal("expected consumed source blobs to be released after attachNotesParallel")
+	}
+	if notes[0].note.Clip == "" || notes[0].note.Clip != notes[1].note.Clip {
+		t.Fatalf("expected shared media attached identically to both notes: %q vs %q", notes[0].note.Clip, notes[1].note.Clip)
+	}
 }

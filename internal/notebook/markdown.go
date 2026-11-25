@@ -42,7 +42,7 @@ func (book Book) markdown(imageLink func(string) string) []byte {
 		note := book.Notes[i]
 		title := note.Title
 		if title == "" {
-			title = "未命名节点"
+			title = "未命名笔记"
 		}
 		fmt.Fprintf(&text, "<a id=\"note-%d\"></a>\n\n## %s\n\n", i+1, title)
 		if note.Excerpt != "" && note.Body != note.Excerpt {
@@ -70,7 +70,7 @@ func (book Book) markdown(imageLink func(string) string) []byte {
 				if j, ok := indices[child]; ok {
 					label := book.Notes[j].Title
 					if label == "" {
-						label = "未命名节点"
+						label = "未命名笔记"
 					}
 					label = strings.NewReplacer("[", "\\[", "]", "\\]", "\n", " ").Replace(label)
 					fmt.Fprintf(&text, "- [%s](#note-%d)\n", label, j+1)
@@ -85,56 +85,77 @@ func (book Book) markdown(imageLink func(string) string) []byte {
 	return []byte(text.String())
 }
 
+func SanitizeName(title string) string {
+	replacer := strings.NewReplacer("/", "_", "\\", "_", ":", "_", "*", "_", "?", "_", "\"", "_", "<", "_", ">", "_", "|", "_")
+	name := strings.TrimSpace(replacer.Replace(title))
+	if strings.Trim(name, "._ ") == "" {
+		return "Folio"
+	}
+	return name
+}
+
 func (s *Store) ExportMarkdownZIP(bookID string, out io.Writer) error {
+	_, err := s.ExportMarkdownZIPWithStats(bookID, out)
+	return err
+}
+
+func (s *Store) ExportMarkdownZIPWithStats(bookID string, out io.Writer) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	library, err := s.read()
 	if err != nil {
-		return err
+		return 0, err
 	}
 	i := indexBook(&library, bookID)
 	if i < 0 {
-		return errors.New("找不到此笔记本")
+		return 0, errors.New("找不到此笔记本")
 	}
 	archive := zip.NewWriter(out)
-	err = s.writeMarkdownZIP(archive, library.Books[i])
-	return errors.Join(err, archive.Close())
+	missing, err := s.writeMarkdownZIP(archive, library.Books[i])
+	return missing, errors.Join(err, archive.Close())
 }
 
-func (s *Store) writeMarkdownZIP(archive *zip.Writer, book Book) error {
+func (s *Store) writeMarkdownZIP(archive *zip.Writer, book Book) (int, error) {
 	images := make(map[string]bool)
 	markdown := book.markdown(func(ref string) string {
 		images[ref] = true
 		return "images/" + ref
 	})
-	page, err := archive.Create("README.md")
+	base := SanitizeName(book.Title)
+	page, err := archive.Create(base + "/" + base + ".md")
 	if err != nil {
-		return err
+		return 0, err
 	}
 	if _, err := page.Write(markdown); err != nil {
-		return err
+		return 0, err
 	}
 	var names []string
 	for name := range images {
 		names = append(names, name)
 	}
 	slices.Sort(names)
+	missing := 0
 	for _, name := range names {
 		path := s.MediaPath(name)
 		if path == "" {
-			return fmt.Errorf("无效的图片名称：%s", name)
+			missing++
+			continue
 		}
 		file, err := os.Open(path)
 		if err != nil {
-			return fmt.Errorf("无法读取导出图片 %s：%w", name, err)
+			if errors.Is(err, os.ErrNotExist) {
+				missing++
+				continue
+			}
+			return missing, fmt.Errorf("无法读取导出图片 %s：%w", name, err)
 		}
-		entry, err := archive.CreateHeader(&zip.FileHeader{Name: "images/" + name, Method: zip.Store})
+		entry, err := archive.CreateHeader(&zip.FileHeader{Name: base + "/images/" + name, Method: zip.Store})
 		if err == nil {
 			_, err = io.Copy(entry, file)
 		}
 		if err := errors.Join(err, file.Close()); err != nil {
-			return err
+			return missing, err
 		}
 	}
-	return nil
+	return missing, nil
 }

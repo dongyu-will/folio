@@ -201,25 +201,29 @@ func (s *Store) writeAllShards(library Library, dirty map[string]bool) error {
 }
 
 func (s *Store) Import(path string) (ImportResult, error) {
-	return s.ImportWithPreview(path, nil)
+	return s.ImportWithOptions(path, ImportOptions{})
 }
 
 // ImportWithPreview publishes a read-only library snapshot for a new notebook
 // before loading its attachments. Only the completed import is saved.
 func (s *Store) ImportWithPreview(path string, preview func(ImportResult)) (ImportResult, error) {
-	if detectImportFormat(path) == ".pdf" {
-		return s.importPDF(path)
-	}
-	return s.importFile(path, false, preview)
+	return s.ImportWithOptions(path, ImportOptions{Preview: preview})
 }
 
-func (s *Store) importFile(path string, existingOnly bool, preview func(ImportResult)) (ImportResult, error) {
+func (s *Store) ImportWithOptions(path string, opts ImportOptions) (ImportResult, error) {
+	if detectImportFormat(path) == ".pdf" {
+		return s.importPDF(path, opts)
+	}
+	return s.importFile(path, false, opts)
+}
+
+func (s *Store) importFile(path string, existingOnly bool, opts ImportOptions) (ImportResult, error) {
 	format := detectImportFormat(path)
 	sink := s.newMediaSink()
 	defer sink.cleanup()
 
 	var showText func([]Book)
-	if preview != nil {
+	if opts.Preview != nil {
 		showText = func(books []Book) {
 			if len(books) == 0 {
 				return
@@ -239,13 +243,40 @@ func (s *Store) importFile(path string, existingOnly bool, preview func(ImportRe
 					library.Books = append(library.Books, book)
 				}
 			}
-			preview(ImportResult{Library: library, BookID: books[0].ID})
+			opts.Preview(ImportResult{Library: library, BookID: books[0].ID})
 		}
 	}
-	books, files, configs, err := readMarginNoteWithSink(path, s.inkRenderer, sink, showText)
+	books, files, configs, err := readMarginNoteWithCtx(opts.Ctx, path, s.inkRenderer, sink, showText, opts.OnProgress)
 	if err != nil {
 		return ImportResult{}, err
 	}
+
+	needPDFs := false
+	if format == ".marginpkg" {
+		if !existingOnly {
+			needPDFs = true
+		} else if snapshot, snapErr := s.Read(); snapErr == nil {
+			needPDFs = slices.ContainsFunc(books, func(b Book) bool {
+				return indexBook(&snapshot, b.ID) >= 0
+			})
+		}
+	}
+	if needPDFs {
+		documents, err := s.importPackagePDFs(opts.Ctx, path, configs, opts.OnProgress)
+		if err != nil {
+			s.mu.Lock()
+			if lib, readErr := s.read(); readErr == nil {
+				s.gcDocuments(lib.Books)
+			}
+			s.mu.Unlock()
+			return ImportResult{}, err
+		}
+		for i := range books {
+			books[i].Documents = documents
+			books[i].PDFsScanned = true
+		}
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -254,19 +285,6 @@ func (s *Store) importFile(path string, existingOnly bool, preview func(ImportRe
 		return ImportResult{}, err
 	}
 	result := ImportResult{BookID: books[0].ID}
-	if format == ".marginpkg" && (!existingOnly || slices.ContainsFunc(books, func(b Book) bool {
-		return indexBook(&library, b.ID) >= 0
-	})) {
-		documents, err := s.importPackagePDFs(path, configs)
-		if err != nil {
-			s.gcDocuments(library.Books)
-			return ImportResult{}, err
-		}
-		for i := range books {
-			books[i].Documents = documents
-			books[i].PDFsScanned = true
-		}
-	}
 	dirty := make(map[string]bool)
 	var staleBookFiles []string
 	changed := false
@@ -340,6 +358,9 @@ func (s *Store) importFile(path string, existingOnly bool, preview func(ImportRe
 		}
 	} else {
 		sink.finalize(nil)
+		if needPDFs {
+			s.gcDocuments(library.Books)
+		}
 	}
 	result.Library = library
 	return result, nil
@@ -372,7 +393,7 @@ func mergeMedia(book *Book, source Book) {
 			continue
 		}
 		n.Clip, n.Blocks = original.Clip, original.Blocks
-		n.Color, n.Style, n.Collapsed = original.Color, original.Style, original.Collapsed
+		n.Style, n.Collapsed = original.Style, original.Collapsed
 		n.LayoutMode = original.LayoutMode
 		n.HighlightRects = original.HighlightRects
 		n.MaskRects = original.MaskRects
@@ -381,10 +402,13 @@ func mergeMedia(book *Book, source Book) {
 		if original.CreatedAt > 0 && n.CreatedAt == 0 {
 			n.CreatedAt = original.CreatedAt
 		}
-		if !(n.TitleEdited || n.BodyEdited) || original.UpdatedAt > n.UpdatedAt {
+		if !(n.TitleEdited || n.BodyEdited || n.MetaEdited) || original.UpdatedAt > n.UpdatedAt {
 			n.UpdatedAt = original.UpdatedAt
 		}
-		n.Tags = original.Tags
+		if !n.MetaEdited {
+			n.Color = original.Color
+			n.Tags = original.Tags
+		}
 		n.Links = original.Links
 		if original.Page != nil {
 			p := *original.Page
@@ -601,7 +625,7 @@ func (s *Store) RecoverMedia(downloads string) error {
 			continue
 		}
 		seen[source] = true
-		if _, readErr := s.importFile(filepath.Join(downloads, source), true, nil); !errors.Is(readErr, os.ErrNotExist) {
+		if _, readErr := s.importFile(filepath.Join(downloads, source), true, ImportOptions{}); !errors.Is(readErr, os.ErrNotExist) {
 			err = errors.Join(err, readErr)
 		}
 	}
@@ -636,8 +660,8 @@ func mergeDocuments(previous, incoming []Document) ([]Document, bool) {
 
 func validateNoteInput(title, body string) (string, error) {
 	title = strings.TrimSpace(title)
-	if title == "" {
-		return "", errors.New("请填写笔记标题")
+	if title == "" && strings.TrimSpace(body) == "" {
+		return "", errors.New("请填写标题或正文")
 	}
 	if len(title) > 1000 || len(body) > 1<<20 {
 		return "", errors.New("标题或正文太长")
@@ -645,8 +669,111 @@ func validateNoteInput(title, body string) (string, error) {
 	return title, nil
 }
 
+// SaveDocumentPage persists the last viewed page (1-based) for a single document.
+func (s *Store) SaveDocumentPage(bookID, docID string, lastPage int) error {
+	if bookID == "" || docID == "" || lastPage < 1 {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	idx, _, err := s.readIndex()
+	if err != nil {
+		return err
+	}
+	pos := slices.IndexFunc(idx.Books, func(e bookEntry) bool { return e.ID == bookID })
+	if pos < 0 {
+		return nil
+	}
+	book, err := s.readBookFile(idx.Books[pos].File)
+	if err != nil {
+		return err
+	}
+	changed := false
+	for i := range book.Documents {
+		if book.Documents[i].ID == docID {
+			if book.Documents[i].LastPage != lastPage {
+				book.Documents[i].LastPage = lastPage
+				changed = true
+			}
+			break
+		}
+	}
+	if !changed {
+		return nil
+	}
+	return s.writeBook(book)
+}
+
+// NormalizeTags cleans, strips leading #, deduplicates, and preserves order.
+func NormalizeTags(tags []string) []string {
+	if len(tags) == 0 {
+		return nil
+	}
+	seen := make(map[string]bool, len(tags))
+	var out []string
+	for _, raw := range tags {
+		tag := strings.TrimSpace(raw)
+		tag = strings.TrimLeft(tag, "#")
+		tag = strings.TrimSpace(tag)
+		if tag == "" || seen[tag] {
+			continue
+		}
+		seen[tag] = true
+		out = append(out, tag)
+	}
+	return out
+}
+
+func cloneColorPtr(c *int) *int {
+	if c == nil {
+		return nil
+	}
+	v := *c
+	return &v
+}
+
+func isDescendantNote(book Book, rootID, candidateID string) bool {
+	if rootID == candidateID {
+		return true
+	}
+	byID := make(map[string]int, len(book.Notes))
+	for i, n := range book.Notes {
+		byID[n.ID] = i
+	}
+	seen := map[string]bool{rootID: true}
+	stack := []string{rootID}
+	for len(stack) > 0 {
+		cur := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		idx, ok := byID[cur]
+		if !ok {
+			continue
+		}
+		for _, cid := range book.Notes[idx].Children {
+			if cid == candidateID {
+				return true
+			}
+			if !seen[cid] {
+				seen[cid] = true
+				stack = append(stack, cid)
+			}
+		}
+	}
+	return false
+}
+
 // SaveNote persists edits by rewriting only the single target book shard.
 func (s *Store) SaveNote(bookID, noteID, title, body string) (Library, error) {
+	return s.saveNote(bookID, noteID, title, body, false, nil, nil, nil)
+}
+
+// SaveNoteWithMeta persists title/body plus optional color, tags, and parent move.
+func (s *Store) SaveNoteWithMeta(bookID, noteID, title, body string, color *int, tags []string, newParentID *string) (Library, error) {
+	return s.saveNote(bookID, noteID, title, body, true, color, tags, newParentID)
+}
+
+func (s *Store) saveNote(bookID, noteID, title, body string, updateMeta bool, color *int, tags []string, newParentID *string) (Library, error) {
 	title, err := validateNoteInput(title, body)
 	if err != nil {
 		return Library{}, err
@@ -670,10 +797,38 @@ func (s *Store) SaveNote(bookID, noteID, title, body string) (Library, error) {
 	if j < 0 {
 		return Library{}, errors.New("找不到这条笔记")
 	}
+	if newParentID != nil {
+		target := *newParentID
+		if target != "" {
+			if indexNote(&book, target) < 0 {
+				return Library{}, errors.New("找不到目标归属笔记")
+			}
+			if isDescendantNote(book, noteID, target) {
+				return Library{}, errors.New("不能把笔记移动到自己或下级笔记中")
+			}
+		}
+		book.Roots = slices.DeleteFunc(book.Roots, func(id string) bool { return id == noteID })
+		for k := range book.Notes {
+			book.Notes[k].Children = slices.DeleteFunc(book.Notes[k].Children, func(id string) bool { return id == noteID })
+		}
+		if target == "" {
+			book.Roots = append(book.Roots, noteID)
+		} else {
+			p := indexNote(&book, target)
+			if p >= 0 && !slices.Contains(book.Notes[p].Children, noteID) {
+				book.Notes[p].Children = append(book.Notes[p].Children, noteID)
+			}
+		}
+	}
 	n := &book.Notes[j]
 	n.TitleEdited = n.TitleEdited || n.Title != title
 	n.BodyEdited = n.BodyEdited || n.Body != body
 	n.Title, n.Body = title, body
+	if updateMeta {
+		n.Color = cloneColorPtr(color)
+		n.Tags = NormalizeTags(tags)
+		n.MetaEdited = true
+	}
 	n.UpdatedAt = time.Now().Unix()
 	if err := s.writeBook(book); err != nil {
 		return Library{}, err
@@ -684,6 +839,11 @@ func (s *Store) SaveNote(bookID, noteID, title, body string) (Library, error) {
 // AddNote appends a new child note under parentID (or root if empty) and
 // rewrites only that book's shard file.
 func (s *Store) AddNote(bookID, parentID, title, body string) (Library, string, error) {
+	return s.AddNoteWithMeta(bookID, parentID, title, body, nil, nil)
+}
+
+// AddNoteWithMeta appends a new child note with optional color and tags.
+func (s *Store) AddNoteWithMeta(bookID, parentID, title, body string, color *int, tags []string) (Library, string, error) {
 	title, err := validateNoteInput(title, body)
 	if err != nil {
 		return Library{}, "", err
@@ -709,10 +869,13 @@ func (s *Store) AddNote(bookID, parentID, title, body string) (Library, string, 
 		ID:          noteID,
 		Title:       title,
 		Body:        body,
+		Color:       cloneColorPtr(color),
+		Tags:        NormalizeTags(tags),
 		CreatedAt:   now,
 		UpdatedAt:   now,
 		TitleEdited: true,
 		BodyEdited:  true,
+		MetaEdited:  true,
 	})
 	if parentID != "" {
 		if p := indexNote(&book, parentID); p >= 0 {
@@ -988,4 +1151,49 @@ func WriteFile(path string, data []byte) error {
 		return err
 	}
 	return os.Rename(f.Name(), path)
+}
+
+// CleanupStaleTempFiles removes leftover temporary files created by aborted
+// imports or atomic writes older than maxAge.
+func (s *Store) CleanupStaleTempFiles(maxAge time.Duration) {
+	if s == nil || s.dir == "" {
+		return
+	}
+	cutoff := time.Now().Add(-maxAge)
+	dirs := []string{
+		s.dir,
+		s.booksDir(),
+		s.mediaDir(),
+		filepath.Join(s.dir, "documents"),
+	}
+	prefixes := []string{".pdf-", ".mgnote-", ".mgnote-media-"}
+	for _, dir := range dirs {
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			continue
+		}
+		for _, entry := range entries {
+			if entry.IsDir() {
+				continue
+			}
+			name := entry.Name()
+			matched := false
+			for _, prefix := range prefixes {
+				if strings.HasPrefix(name, prefix) {
+					matched = true
+					break
+				}
+			}
+			if !matched {
+				continue
+			}
+			info, err := entry.Info()
+			if err != nil || !info.Mode().IsRegular() {
+				continue
+			}
+			if !info.ModTime().After(cutoff) {
+				_ = os.Remove(filepath.Join(dir, name))
+			}
+		}
+	}
 }

@@ -147,8 +147,13 @@ func (p *mediaRefPlan) addParsedNote(clip map[string]any, blocks []any) {
 	}
 }
 
+type sourceBlob struct {
+	data []byte
+	rem  atomic.Int32
+}
+
 type mediaImport struct {
-	sources   map[string][]byte
+	sources   map[string]*sourceBlob
 	savedKeys map[string]string
 	ink       string
 	sink      mediaSink
@@ -174,7 +179,7 @@ func newMediaImport(ink string, sink mediaSink) *mediaImport {
 		largeCap = 1
 	}
 	m := &mediaImport{
-		sources:        make(map[string][]byte),
+		sources:        make(map[string]*sourceBlob),
 		savedKeys:      make(map[string]string),
 		ink:            ink,
 		sink:           sink,
@@ -239,10 +244,10 @@ func readMediaFiltered(ctx context.Context, db *sql.DB, m *mediaImport, plan *me
 		}
 		unarchived := unarchive(data)
 		if unpacked, ok := unarchived.([]byte); ok {
-			m.sources[key] = unpacked
+			m.sources[key] = &sourceBlob{data: unpacked}
 			return
 		}
-		m.sources[key] = data
+		m.sources[key] = &sourceBlob{data: data}
 		if wrapped, ok := unarchived.(map[string]any); ok {
 			for _, field := range []string{"drawing2", "drawing1"} {
 				if nested, ok := wrapped[field].(string); ok && nested != "" {
@@ -252,51 +257,119 @@ func readMediaFiltered(ctx context.Context, db *sql.DB, m *mediaImport, plan *me
 		}
 	}
 
-	if err := func() error {
-		rows, err := db.QueryContext(ctx, "SELECT ZMD5, ZDATA FROM ZMEDIA WHERE ZMD5 IS NOT NULL AND ZDATA IS NOT NULL")
-		if err != nil {
-			return err
+	processRow := func(key string, data []byte) error {
+		if plan != nil && !plan.needed[key] && !nestedKeys[key] {
+			return nil
 		}
-		defer rows.Close()
-		for rows.Next() {
-			var key string
-			var data []byte
-			if err := rows.Scan(&key, &data); err != nil {
+		needRaw := plan == nil || plan.needRaw[key] || nestedKeys[key]
+		if !needRaw && m.sink != nil {
+			if _, seen := m.savedKeys[key]; seen {
+				return nil
+			}
+			if unpacked, ok := unarchive(data).([]byte); ok {
+				data = unpacked
+			}
+			_, ext, ok := imageConfig(data)
+			if !ok {
+				m.savedKeys[key] = ""
+				return nil
+			}
+			name := fmt.Sprintf("%x.%s", sha256.Sum256(data), ext)
+			if err := m.sink.save(name, data); err != nil {
 				return err
 			}
-			if plan != nil && !plan.needed[key] && !nestedKeys[key] {
-				continue
+			m.savedKeys[key] = name
+			return nil
+		}
+		storeRaw(key, data)
+		return nil
+	}
+
+	const batchSize = 500
+	fullScan := plan == nil
+	if !fullScan {
+		var matchedRowIDs []int64
+		err := func() error {
+			rows, err := db.QueryContext(ctx, "SELECT rowid, ZMD5 FROM ZMEDIA WHERE ZMD5 IS NOT NULL AND ZDATA IS NOT NULL")
+			if err != nil {
+				return err
 			}
-			needRaw := plan == nil || plan.needRaw[key] || nestedKeys[key]
-			if !needRaw && m.sink != nil {
-				if _, seen := m.savedKeys[key]; seen {
-					continue
-				}
-				if unpacked, ok := unarchive(data).([]byte); ok {
-					data = unpacked
-				}
-				_, ext, ok := imageConfig(data)
-				if !ok {
-					m.savedKeys[key] = ""
-					continue
-				}
-				name := fmt.Sprintf("%x.%s", sha256.Sum256(data), ext)
-				if err := m.sink.save(name, data); err != nil {
+			defer rows.Close()
+			for rows.Next() {
+				var rowID int64
+				var key string
+				if err := rows.Scan(&rowID, &key); err != nil {
 					return err
 				}
-				m.savedKeys[key] = name
-				continue
+				if plan.needed[key] {
+					matchedRowIDs = append(matchedRowIDs, rowID)
+				}
 			}
-			storeRaw(key, data)
+			return rows.Err()
+		}()
+		if err != nil {
+			if ctx.Err() != nil {
+				return err
+			}
+			// Fall back to a single-pass scan on tables created WITHOUT ROWID.
+			fullScan = true
+		} else {
+			for start := 0; start < len(matchedRowIDs); start += batchSize {
+				batch := matchedRowIDs[start:min(start+batchSize, len(matchedRowIDs))]
+				if err := func() error {
+					placeholders := strings.TrimSuffix(strings.Repeat("?,", len(batch)), ",")
+					args := make([]any, len(batch))
+					for i, id := range batch {
+						args[i] = id
+					}
+					rows, err := db.QueryContext(ctx, "SELECT ZMD5, ZDATA FROM ZMEDIA WHERE rowid IN ("+placeholders+") AND ZDATA IS NOT NULL", args...)
+					if err != nil {
+						return err
+					}
+					defer rows.Close()
+					for rows.Next() {
+						var key string
+						var data []byte
+						if err := rows.Scan(&key, &data); err != nil {
+							return err
+						}
+						if err := processRow(key, data); err != nil {
+							return err
+						}
+					}
+					return rows.Err()
+				}(); err != nil {
+					return err
+				}
+			}
 		}
-		return rows.Err()
-	}(); err != nil {
-		return err
+	}
+
+	if fullScan {
+		if err := func() error {
+			rows, err := db.QueryContext(ctx, "SELECT ZMD5, ZDATA FROM ZMEDIA WHERE ZMD5 IS NOT NULL AND ZDATA IS NOT NULL")
+			if err != nil {
+				return err
+			}
+			defer rows.Close()
+			for rows.Next() {
+				var key string
+				var data []byte
+				if err := rows.Scan(&key, &data); err != nil {
+					return err
+				}
+				if err := processRow(key, data); err != nil {
+					return err
+				}
+			}
+			return rows.Err()
+		}(); err != nil {
+			return err
+		}
 	}
 
 	// Fetch any nested drawing1/drawing2 keys referenced by wrapped bplist
 	// entries that appeared earlier in ZMEDIA than their wrapper row.
-	const batchSize = 500
 	for depth := 0; depth < 3 && len(nestedKeys) > 0; depth++ {
 		var missing []string
 		for k := range nestedKeys {
@@ -395,6 +468,75 @@ func (m *mediaImport) countInkRefs(notes []rawSourceNote) {
 		}
 	}
 	m.inkCounts = counts
+}
+
+func (m *mediaImport) countSourceRefs(notes []rawSourceNote) {
+	if len(m.sources) == 0 || len(notes) == 0 {
+		return
+	}
+	for i := range notes {
+		var set map[string]struct{}
+		addKey := func(val any) {
+			k, ok := val.(string)
+			if !ok || k == "" || m.sources[k] == nil {
+				return
+			}
+			if set == nil {
+				set = make(map[string]struct{})
+			}
+			set[k] = struct{}{}
+		}
+		visitPic := func(pic map[string]any) {
+			if pic == nil {
+				return
+			}
+			for _, field := range []string{"drawing", "paint", "img", "pic"} {
+				addKey(pic[field])
+			}
+			if dk, ok := pic["drawing"].(string); ok && dk != "" {
+				if raw := m.source(dk); len(raw) > 0 {
+					if wrapped, ok := unarchive(raw).(map[string]any); ok {
+						addKey(wrapped["drawing2"])
+						addKey(wrapped["drawing1"])
+					}
+				}
+			}
+		}
+		visitPic(notes[i].clip)
+		for _, value := range notes[i].blocks {
+			block, ok := value.(map[string]any)
+			if !ok {
+				continue
+			}
+			switch block["type"] {
+			case "LinkNote":
+				if qpic, ok := block["q_hpic"].(map[string]any); ok {
+					visitPic(qpic)
+				}
+			case "PaintNote", "PicNote", "ImageNote", "MergedImageNote", "SketchNote":
+				visitPic(block)
+			}
+		}
+		if len(set) == 0 {
+			continue
+		}
+		keys := make([]string, 0, len(set))
+		for k := range set {
+			keys = append(keys, k)
+			m.sources[k].rem.Add(1)
+		}
+		notes[i].sourceKeys = keys
+	}
+}
+
+func (m *mediaImport) releaseNoteSources(keys []string) {
+	for _, k := range keys {
+		if slot := m.sources[k]; slot != nil {
+			if slot.rem.Add(-1) == 0 {
+				slot.data = nil
+			}
+		}
+	}
 }
 
 // The property list can contain Foundation object references. Interpret only
@@ -1340,7 +1482,7 @@ func (m *mediaImport) savePicture(block map[string]any) string {
 				if name, saved := m.savedKeys[key]; saved {
 					return name
 				}
-				if raw := m.sources[key]; len(raw) > 0 {
+				if raw := m.source(key); len(raw) > 0 {
 					return m.saveImage(raw)
 				}
 				continue
@@ -1472,7 +1614,9 @@ func (m *mediaImport) picture(block map[string]any) []byte {
 func (m *mediaImport) source(value any) []byte {
 	switch v := value.(type) {
 	case string:
-		return m.sources[v]
+		if slot := m.sources[v]; slot != nil {
+			return slot.data
+		}
 	case []byte:
 		return v
 	}

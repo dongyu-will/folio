@@ -2,7 +2,9 @@ package main
 
 import (
 	"fmt"
+	"runtime"
 	"strings"
+	"time"
 
 	"github.com/dongyu-will/folio/internal/notebook"
 	"github.com/egoist/mygo/ui"
@@ -42,6 +44,14 @@ func (a *workspace) toggleSidebar() {
 func (a *workspace) openPreferences() {
 	a.preferencesOpen = true
 	a.settingsScroll = ui.ScrollState{}
+	a.loadWebDAVDraft()
+	a.refreshStorageBytes()
+}
+
+func (a *workspace) openPreferencesAtUpdate() {
+	a.preferencesOpen = true
+	a.settingsScroll = ui.ScrollState{Y: 1e6}
+	a.loadWebDAVDraft()
 	a.refreshStorageBytes()
 }
 
@@ -55,15 +65,21 @@ func (a *workspace) refreshStorageBytes() {
 }
 
 func designToolbarButton(c *ui.Context, p palette, icon *ui.SVG, label string, size float32, framed, disabled bool, action func()) {
-	b := ui.ButtonBase(c).Size(size, size).Shrink(0).Center().Radius(8).Label(label).
+	b := ui.ButtonBase(c).Size(size, size).Shrink(0).Center().Radius(8).Label(label).Tooltip(label).
 		Disabled(disabled).FocusRingColor(p.accent).OnClick(action)
 	fg := p.quiet
 	if framed {
 		b.Background(p.elevated).Border(1, p.border).Shadow(0, 1, 2, 0, p.shadowSoft)
 		fg = p.secondary
 	}
-	if b.Hovered() && !disabled {
+	if disabled {
+		fg = p.quiet.Alpha(.4)
+	} else if b.Pressed() {
+		b.Background(p.pressed)
+		fg = p.ink
+	} else if b.Hovered() {
 		b.Background(p.hover)
+		fg = p.ink
 	}
 	b.Children(func() { ui.Icon(c, icon).Size(15, 15).TextColor(fg) })
 }
@@ -73,17 +89,26 @@ func (a *workspace) transferButton(c *ui.Context, p palette) {
 	if a.touchUI() {
 		sz = 34
 	}
-	b := ui.ButtonBase(c).Label("导入 / 导出").Size(sz, sz).Center().Radius(7).Shrink(0).
-		Disabled(a.editing() || a.busy).FocusRingColor(p.accent)
-	if b.Hovered() {
+	disabled := a.editing() || a.busy
+	b := ui.ButtonBase(c).Label("导入 / 导出").Tooltip("导入或导出").Size(sz, sz).Center().Radius(7).Shrink(0).
+		Disabled(disabled).FocusRingColor(p.accent)
+	fg := p.quiet
+	if disabled {
+		fg = p.quiet.Alpha(.4)
+	} else if b.Pressed() {
+		b.Background(p.pressed)
+		fg = p.ink
+	} else if b.Hovered() {
 		b.Background(p.hover)
+		fg = p.ink
 	}
-	b.Children(func() { ui.Icon(c, icTransfer).Size(15, 15).TextColor(p.quiet) })
+	b.Children(func() { ui.Icon(c, icTransfer).Size(15, 15).TextColor(fg) })
+	canExport := a.bookID != "" && len(a.tree.book.Notes) > 0
 	b.PopoverMenuButton(func(m *ui.Menu) {
 		if m.Item("导入笔记或 PDF…").Chosen() {
 			a.chooseImport()
 		}
-		if m.Item("导出 Markdown 和图片（.zip）…").Disabled(a.bookID == "").Chosen() {
+		if m.Item("导出 Markdown（.zip）…").Disabled(!canExport).Chosen() {
 			a.exportMarkdown()
 		}
 	})
@@ -95,20 +120,31 @@ type segment[T comparable] struct {
 }
 
 func segments[T comparable](c *ui.Context, p palette, options []segment[T], selected T, change func(T)) {
-	ui.Row(c).Height(31).Shrink(0).Padding(3).Gap(2).Radius(8).
+	segmentsSized(c, p, false, options, selected, change)
+}
+
+func segmentsSized[T comparable](c *ui.Context, p palette, touch bool, options []segment[T], selected T, change func(T)) {
+	outerH, btnH, padX, fontSize := float32(31), float32(24), float32(10), float32(12)
+	if touch {
+		outerH, btnH, padX, fontSize = 38, 31, 12, 12.5
+	}
+	ui.Row(c).Height(outerH).Shrink(0).Padding(3).Gap(2).Radius(8).
 		AlignItems(ui.Center).Background(p.inputBg).Border(1, p.rule).Children(func() {
 		for _, opt := range options {
 			active := opt.value == selected
-			b := ui.ButtonBase(c.Key(opt.title)).Height(24).PaddingX(10).Radius(5).Center().
+			b := ui.ButtonBase(c.Key(opt.title)).Height(btnH).PaddingX(padX).Radius(5).Center().
 				Shrink(0).Label(opt.title).Selected(active).OnClick(func() { change(opt.value) })
 			fg := p.quiet
 			if active {
 				b.Background(p.elevated).Border(1, p.border).Shadow(0, 1, 2, 0, p.shadowSoft)
 				fg = p.ink
+			} else if b.Pressed() {
+				b.Background(p.pressed)
+				fg = p.ink
 			} else if b.Hovered() {
 				b.Background(p.hover)
 			}
-			b.Children(func() { ui.Text(c, opt.title).FontSize(12).TextColor(fg).SingleLine() })
+			b.Children(func() { ui.Text(c, opt.title).FontSize(fontSize).TextColor(fg).SingleLine() })
 		}
 	})
 }
@@ -147,8 +183,8 @@ func settingRow(c *ui.Context, p palette, compact bool, title, hint string, cont
 	}
 	ui.Row(c).MinHeight(57).FillWidth().Shrink(0).Padding(8, 16).Gap(12).AlignItems(ui.Center).Children(func() {
 		ui.Column(c).Grow(1).MinWidth(0).Gap(3).Children(func() {
-			ui.Text(c, title).FontSize(13).FontWeight(550).TextColor(p.ink).SingleLine()
-			ui.Text(c, hint).FontSize(11.5).TextColor(p.quiet).SingleLine()
+			ui.Text(c, title).FontSize(13).FontWeight(550).TextColor(p.ink).SingleLine().Ellipsis("…")
+			ui.Text(c, hint).FontSize(11.5).LineHeight(1.4).TextColor(p.quiet)
 		})
 		control()
 	})
@@ -175,6 +211,12 @@ func settingButtonWithHeight(c *ui.Context, p palette, h float32, title string, 
 		Label(title).Disabled(disabled).FocusRingColor(p.accent).OnClick(action)
 	if disabled {
 		fg = p.quiet
+	} else if button.Pressed() {
+		if danger {
+			button.Background(p.danger.Alpha(.18))
+		} else {
+			button.Background(p.pressed)
+		}
 	} else if button.Hovered() && !danger {
 		button.Background(p.hover)
 	}
@@ -259,17 +301,26 @@ func (a *workspace) settingsCard(c *ui.Context, p palette, width, height float32
 				Padding(18, 24).Gap(16).Children(func() {
 				compact := cardW < 540
 				a.displaySettings(c, p, compact)
-				a.stylusSettings(c, p, compact)
+				if a.touchUI() {
+					a.stylusSettings(c, p, compact)
+				}
 				a.storageSettings(c, p, compact)
-				a.bookSettings(c, p, compact)
+				a.webdavSettings(c, p, compact)
+				if a.bookID != "" {
+					a.bookSettings(c, p, compact)
+				}
 				a.aboutSettings(c, p, compact)
 			})
 			horizontalRule(c, p)
 			ui.Row(c).Height(40).Shrink(0).FillWidth().PaddingX(24).AlignItems(ui.Center).Background(p.canvas).Children(func() {
-				ui.Text(c, fmt.Sprintf("Folio v%s · 本地离线优先存储", currentAppVersion())).FontSize(11.5).TextColor(p.quiet).Grow(1)
+				ui.Text(c, fmt.Sprintf("Folio v%s · 所有笔记仅保存在本地", currentAppVersion())).FontSize(11.5).TextColor(p.quiet).Grow(1)
 				closeHint := "Esc 关闭"
 				if a.touchUI() {
-					closeHint = "返回键关闭"
+					if runtime.GOOS == "android" {
+						closeHint = "返回键关闭"
+					} else {
+						closeHint = "点击空白处关闭"
+					}
 				}
 				ui.Text(c, closeHint).FontSize(11.5).TextColor(p.quiet)
 			})
@@ -278,51 +329,54 @@ func (a *workspace) settingsCard(c *ui.Context, p palette, width, height float32
 }
 
 func (a *workspace) displaySettings(c *ui.Context, p palette, compact bool) {
+	touch := a.touchUI()
+	layoutMode := a.settings.LayoutMode()
 	settingGroup(c, p, "外观与显示", func() {
 		settingRow(c, p, compact, "外观主题", "切换浅色、深色或跟随系统", func() {
-			segments(c, p, []segment[string]{{"浅色", "light"}, {"深色", "dark"}, {"跟随系统", ""}}, a.settings.Appearance, func(value string) {
+			segmentsSized(c, p, touch, []segment[string]{{"浅色", "light"}, {"深色", "dark"}, {"跟随系统", ""}}, a.settings.Appearance, func(value string) {
 				next := a.settings
 				next.Appearance = value
 				a.saveSettings(next)
 			})
 		})
 		horizontalRule(c, p)
-		settingRow(c, p, compact, "脑图视图形态", "切换富卡片树、专题框架、大纲流或精简树", func() {
-			segments(c, p, []segment[string]{
+		settingRow(c, p, compact, "视图样式", "选择笔记的浏览排布方式", func() {
+			segmentsSized(c, p, touch, []segment[string]{
 				{"卡片树", notebook.LayoutCards},
 				{"专题框架", notebook.LayoutBoard},
 				{"大纲流", notebook.LayoutOutline},
 				{"精简树", notebook.LayoutCompact},
-			}, a.settings.LayoutMode(), func(value string) {
+			}, layoutMode, func(value string) {
 				next := a.settings
 				next.GraphLayout = value
 				if a.saveSettings(next) {
-					a.scale = float32(next.GraphZoom) / 100
 					a.canvasReady = false
-					a.recenter = true
+					a.focusSelected = true
 					a.cardMenuOpen = false
 					a.outlineScroll = ui.ScrollState{}
 				}
 			})
 		})
-		horizontalRule(c, p)
-		settingRow(c, p, compact, "脑图默认缩放", "打开笔记本时的初始视图比例", func() {
-			segments(c, p, []segment[int]{{"自适应", 0}, {"90%", 90}, {"100%", 100}, {"110%", 110}}, a.settings.GraphZoom, func(value int) {
-				next := a.settings
-				next.GraphZoom = value
-				if a.saveSettings(next) {
-					a.zoom(float32(value) / 100)
-				}
+		if layoutMode != notebook.LayoutOutline {
+			horizontalRule(c, p)
+			settingRow(c, p, compact, "画布默认缩放", "打开笔记本时的初始视图比例", func() {
+				segmentsSized(c, p, touch, []segment[int]{{"自适应", 0}, {"90%", 90}, {"100%", 100}, {"110%", 110}}, a.settings.GraphZoom, func(value int) {
+					next := a.settings
+					next.GraphZoom = value
+					if a.saveSettings(next) {
+						a.zoom(float32(value) / 100)
+					}
+				})
 			})
-		})
-		horizontalRule(c, p)
-		settingRow(c, p, compact, "画布点阵背景", "在画布上显示参考点阵", func() {
-			settingSwitch(c, p, "画布点阵背景", !a.settings.HideGrid, func() {
-				next := a.settings
-				next.HideGrid = !next.HideGrid
-				a.saveSettings(next)
+			horizontalRule(c, p)
+			settingRow(c, p, compact, "画布点阵背景", "在画布上显示参考点阵", func() {
+				settingSwitch(c, p, "画布点阵背景", !a.settings.HideGrid, func() {
+					next := a.settings
+					next.HideGrid = !next.HideGrid
+					a.saveSettings(next)
+				})
 			})
-		})
+		}
 		horizontalRule(c, p)
 		settingRow(c, p, compact, "PDF 夜间智能反色", "深色模式下自动反色 PDF 底纸，保留彩色批注", func() {
 			settingSwitch(c, p, "PDF 夜间智能反色", a.settings.PDFNight, func() {
@@ -355,20 +409,75 @@ func (a *workspace) storageSettings(c *ui.Context, p palette, compact bool) {
 	}
 	usage := fmt.Sprintf("%d 本笔记本 · %d 条笔记", len(a.books), count)
 	if a.storageBytes > 0 {
-		usage += fmt.Sprintf(" · %.1f MB", float64(a.storageBytes)/1e6)
+		usage += " · 已占用 " + formatByteSize(a.storageBytes)
 	}
+	canExport := a.bookID != "" && len(a.tree.book.Notes) > 0
 	settingGroup(c, p, "存储与数据", func() {
-		settingRow(c, p, compact, "导入与导出", "MarginNote、PDF 或带图 Markdown", func() {
+		settingRow(c, p, compact, "导入与导出", "导入 MarginNote 或 PDF；导出当前笔记本为带图 Markdown", func() {
 			ui.Row(c).Gap(8).Shrink(0).Children(func() {
-				a.settingButton(c, p, "导入笔记", icSettingImport, false, a.busy, a.chooseImport)
-				a.settingButton(c, p, "导出 MD", icSettingExport, false, a.busy || a.bookID == "", a.exportMarkdown)
+				a.settingButton(c, p, "导入笔记或 PDF", icSettingImport, false, a.busy, a.chooseImport)
+				if canExport {
+					a.settingButton(c, p, "导出 Markdown", icSettingExport, false, a.busy, a.exportMarkdown)
+				}
 			})
 		})
 		horizontalRule(c, p)
-		settingRow(c, p, compact, "本地存储与缓存", usage, func() {
+		settingRow(c, p, compact, "整库备份与恢复", "打包全部笔记本、手写批注、PDF 与设置；恢复将覆盖本地数据", func() {
+			ui.Row(c).Gap(8).Shrink(0).Children(func() {
+				a.settingButton(c, p, "导出整库备份", icSettingExport, false, a.busy, a.exportBackup)
+				a.settingButton(c, p, "从备份恢复", icSettingImport, true, a.busy, a.restoreBackup)
+			})
+		})
+		horizontalRule(c, p)
+		settingRow(c, p, compact, "本地数据与缓存", usage+"（清理仅释放内存与临时文件）", func() {
 			a.settingButton(c, p, "清理缓存", nil, false, false, a.clearRenderCache)
 		})
 	})
+}
+
+func (a *workspace) webdavSettings(c *ui.Context, p palette, compact bool) {
+	statusText := "将笔记本、手写批注与 PDF 同步至兼容 WebDAV 的网盘（如坚果云、Nextcloud）"
+	if a.webdavStatus != "" {
+		statusText = a.webdavStatus
+	} else if a.settings.WebDAVLastSyncUnix > 0 {
+		statusText = "上次同步：" + formatSyncTime(a.settings.WebDAVLastSyncUnix)
+	}
+	settingGroup(c, p, "云端同步（WebDAV）", func() {
+		settingRow(c, p, compact, "服务器地址", "例如 https://dav.jianguoyun.com/dav/", func() {
+			ui.TextInput(c.Key("webdav-url"), &a.webdavURL).
+				Width(240).Height(settingButtonHeight(a.touchUI())).PaddingX(10).Radius(8).
+				FontSize(12).Background(p.inputBg).Border(1, p.border).TextColor(p.ink).
+				Placeholder("https://dav.example.com/dav/").Label("WebDAV 服务器地址")
+		})
+		horizontalRule(c, p)
+		settingRow(c, p, compact, "账户名", "用于基础身份认证的用户名或邮箱", func() {
+			ui.TextInput(c.Key("webdav-user"), &a.webdavUser).
+				Width(240).Height(settingButtonHeight(a.touchUI())).PaddingX(10).Radius(8).
+				FontSize(12).Background(p.inputBg).Border(1, p.border).TextColor(p.ink).
+				Placeholder("用户名").Label("WebDAV 用户名")
+		})
+		horizontalRule(c, p)
+		settingRow(c, p, compact, "应用密码", "密码加密保存在系统凭据库，不会明文写入设置文件", func() {
+			ui.TextInput(c.Key("webdav-password"), &a.webdavPassword).Password().
+				Width(240).Height(settingButtonHeight(a.touchUI())).PaddingX(10).Radius(8).
+				FontSize(12).Background(p.inputBg).Border(1, p.border).TextColor(p.ink).
+				Placeholder("应用授权密码").Label("WebDAV 密码")
+		})
+		horizontalRule(c, p)
+		settingRow(c, p, compact, "连接与同步", statusText, func() {
+			ui.Row(c).Gap(8).Shrink(0).Children(func() {
+				a.settingButton(c, p, "测试连接", nil, false, a.webdavBusy || a.busy, a.testWebDAVConnection)
+				a.settingPrimaryButton(c, p, "立即同步", icUpdateRefresh, a.webdavBusy || a.busy, a.syncWebDAV)
+			})
+		})
+	})
+}
+
+func formatSyncTime(unixSec int64) string {
+	if unixSec <= 0 {
+		return "尚未同步"
+	}
+	return time.Unix(unixSec, 0).Format("2006-01-02 15:04")
 }
 
 func (a *workspace) bookSettings(c *ui.Context, p palette, compact bool) {
@@ -383,7 +492,7 @@ func (a *workspace) bookSettings(c *ui.Context, p palette, compact bool) {
 					if ui.TextInput(c.Key("book-name"), &a.bookName).Grow(1).MinWidth(0).Height(settingButtonHeight(a.touchUI())).Label("笔记本名称").Submitted() {
 						a.renameBook()
 					}
-					a.settingButton(c, p, "保存", nil, false, a.busy || strings.TrimSpace(a.bookName) == "", a.renameBook)
+					a.settingPrimaryButton(c, p, "保存", nil, a.busy || strings.TrimSpace(a.bookName) == "", a.renameBook)
 					a.settingButton(c, p, "取消", nil, false, a.busy, func() { a.renameOpen = false })
 				})
 				return
@@ -448,11 +557,9 @@ func (a *workspace) aboutSettings(c *ui.Context, p palette, compact bool) {
 		case updateAvailable:
 			controlsRow(func() {
 				if st.info != nil && st.info.canDirectInstall() {
-					label := "下载并安装"
+					label := "下载更新"
 					if st.info.PendingPath != "" {
-						label = "安装更新"
-					} else if st.info.UsingMyGo {
-						label = "下载并更新"
+						label = "立即安装"
 					}
 					a.settingPrimaryButton(c, p, label, icImport, false, func() {
 						a.installUpdate(services)
@@ -473,7 +580,7 @@ func (a *workspace) aboutSettings(c *ui.Context, p palette, compact bool) {
 			a.settingPrimaryButton(c, p, "立即重启", icUpdateRefresh, false, a.relaunchApp)
 		case updatePermissionRequired:
 			controlsRow(func() {
-				a.settingPrimaryButton(c, p, "安装更新", icImport, false, func() {
+				a.settingPrimaryButton(c, p, "立即安装", icImport, false, func() {
 					a.installUpdate(services)
 				})
 				a.settingButton(c, p, "前往发布页", icExternalLink, false, false, func() {
@@ -483,7 +590,7 @@ func (a *workspace) aboutSettings(c *ui.Context, p palette, compact bool) {
 		case updateDeferredForeground:
 			controlsRow(func() {
 				if st.info != nil && st.info.canDirectInstall() {
-					a.settingPrimaryButton(c, p, "安装更新", icImport, false, func() {
+					a.settingPrimaryButton(c, p, "立即安装", icImport, false, func() {
 						a.installUpdate(services)
 					})
 				}
@@ -494,7 +601,7 @@ func (a *workspace) aboutSettings(c *ui.Context, p palette, compact bool) {
 		case updateInstallerLaunched:
 			controlsRow(func() {
 				if st.info != nil && st.info.canDirectInstall() {
-					a.settingButton(c, p, "安装更新", icImport, false, false, func() {
+					a.settingButton(c, p, "立即安装", icImport, false, false, func() {
 						a.installUpdate(services)
 					})
 				}
@@ -506,7 +613,11 @@ func (a *workspace) aboutSettings(c *ui.Context, p palette, compact bool) {
 			if st.info != nil {
 				controlsRow(func() {
 					if st.info.canDirectInstall() {
-						a.settingPrimaryButton(c, p, "重试下载", icImport, false, func() {
+						retryLabel := "重试下载"
+						if st.info.PendingPath != "" {
+							retryLabel = "重试安装"
+						}
+						a.settingPrimaryButton(c, p, retryLabel, icImport, false, func() {
 							a.installUpdate(services)
 						})
 					} else {
@@ -582,7 +693,7 @@ func (a *workspace) openExternalURL(c *ui.Context, rawURL string) {
 	}
 	c.OpenURLThen(target, func(err error) {
 		if err != nil {
-			a.showMessage("无法打开链接："+err.Error(), true)
+			a.showMessage("无法打开外部链接，请检查默认浏览器设置", true)
 		}
 	})
 }
@@ -594,7 +705,7 @@ func updateStatusPresentation(p palette, st updateUIState, curVer string) (strin
 	case updateUpToDate:
 		return "已是最新版本", p.quiet
 	case updateNoRelease:
-		return "暂无已发布版本", p.quiet
+		return "暂未发现可用更新", p.quiet
 	case updateAvailable:
 		if st.info != nil && st.info.PendingPath != "" {
 			if st.info.Version != "" {
@@ -603,6 +714,9 @@ func updateStatusPresentation(p palette, st updateUIState, curVer string) (strin
 			return "更新安装包已下载完成，点击即可安装", p.accent
 		}
 		if st.info != nil && st.info.Version != "" {
+			if st.info.APKSize > 0 {
+				return fmt.Sprintf("发现新版本 v%s（%s）", st.info.Version, formatByteSize(st.info.APKSize)), p.accent
+			}
 			return fmt.Sprintf("发现新版本 v%s", st.info.Version), p.accent
 		}
 		return "发现新版本", p.accent
@@ -611,7 +725,7 @@ func updateStatusPresentation(p palette, st updateUIState, curVer string) (strin
 	case updateRelaunchRequired:
 		return "更新已就绪，重启后生效", p.accent
 	case updatePermissionRequired:
-		return "请在系统设置中允许 Folio 安装未知来源应用，授权后再次点击「安装更新」", p.secondary
+		return "请在系统设置中允许 Folio 安装未知来源应用，授权后再次点击「立即安装」", p.secondary
 	case updateDeferredForeground:
 		return "下载已完成，返回应用将自动打开安装器", p.accent
 	case updateInstallerLaunched:
@@ -622,7 +736,7 @@ func updateStatusPresentation(p palette, st updateUIState, curVer string) (strin
 		}
 		return "检查更新失败，请稍后重试", p.danger
 	default:
-		return fmt.Sprintf("当前版本 v%s", curVer), p.quiet
+		return "已开启自动检查更新", p.quiet
 	}
 }
 

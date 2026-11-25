@@ -72,6 +72,41 @@ func syncAndroidAppearance(appearance string) {
 	}()
 }
 
+func barStyleForAppearance(appearance string) mygo.BarStyle {
+	switch appearance {
+	case "light":
+		return mygo.BarStyleDark
+	case "dark":
+		return mygo.BarStyleLight
+	default:
+		return mygo.BarStyleAuto
+	}
+}
+
+func hapticSelection() {
+	if mygo.App.IsReady() {
+		mygo.Haptics.Selection()
+	}
+}
+
+func hapticLight() {
+	if mygo.App.IsReady() {
+		mygo.Haptics.Light()
+	}
+}
+
+func hapticSuccess() {
+	if mygo.App.IsReady() {
+		mygo.Haptics.Success()
+	}
+}
+
+func hapticWarning() {
+	if mygo.App.IsReady() {
+		mygo.Haptics.Warning()
+	}
+}
+
 // syncAppTheme aligns the platform theme source and Android's launch cover
 // cache with Folio's saved appearance. It is a no-op before App.Run becomes
 // ready (including headless unit tests) so backend() is never initialized early.
@@ -80,6 +115,7 @@ func syncAppTheme(appearance string) {
 		return
 	}
 	mygo.Theme.SetSource(themeSourceForAppearance(appearance))
+	mygo.SystemBars.SetStyle(barStyleForAppearance(appearance))
 	if runtime.GOOS == "android" {
 		syncAndroidAppearance(appearance)
 	}
@@ -89,6 +125,17 @@ func (a *workspace) onAndroidSurfaceResumed([]byte) {
 	a.androidFramePending.Store(true)
 	if win := a.window(); win != nil {
 		win.Invalidate()
+	}
+	if runtime.GOOS == "android" && a.updateSnapshot().phase == updatePermissionRequired {
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			if ok, err := androidCanInstallAPK(ctx); err == nil && ok {
+				a.updateUI(func() {
+					a.installUpdate(ui.Services{})
+				})
+			}
+		}()
 	}
 }
 
@@ -168,11 +215,15 @@ func (a *workspace) dockBottomReserve() float32 {
 	return 96
 }
 
+func (a *workspace) penZonesBlocked() bool {
+	return a.bookID == "" || a.editing() || a.page != browse || a.preferencesOpen || a.preview != "" || a.pdfTOCOpen || a.cardMenuOpen
+}
+
 func (a *workspace) disablePenZones() {
 	if runtime.GOOS != "android" {
 		return
 	}
-	blocked := a.bookID == "" || a.editing() || a.page != browse || a.preferencesOpen || a.preview != "" || a.pdfTOCOpen
+	blocked := a.penZonesBlocked()
 	if blocked || a.mode == pdfMode || a.settings.LayoutMode() == notebook.LayoutOutline || !a.stylusDrawsOnCanvas() {
 		a.androidInk.canvas = penZone{}
 	}
@@ -183,10 +234,10 @@ func (a *workspace) disablePenZones() {
 }
 
 func (a *workspace) canvasPenZone(rect ui.Rect, ox, oy, scale float32) {
-	if runtime.GOOS != "android" || a.page != browse || a.preferencesOpen || a.preview != "" {
+	if runtime.GOOS != "android" {
 		return
 	}
-	if !a.stylusDrawsOnCanvas() {
+	if a.penZonesBlocked() || a.mode == pdfMode || a.settings.LayoutMode() == notebook.LayoutOutline || !a.stylusDrawsOnCanvas() {
 		a.androidInk.canvas = penZone{}
 		a.publishPenZones()
 		return
@@ -198,16 +249,16 @@ func (a *workspace) canvasPenZone(rect ui.Rect, ox, oy, scale float32) {
 }
 
 func (a *workspace) pdfPenZone(key string, clip ui.Rect, ox, oy, scale, viewBottom float32) {
-	if runtime.GOOS != "android" || a.page != browse || a.preferencesOpen || a.preview != "" {
+	if runtime.GOOS != "android" {
 		return
 	}
-	if !a.stylusDrawsOnPDF() {
+	if a.penZonesBlocked() || a.mode == canvasMode || !a.stylusDrawsOnPDF() {
 		a.androidInk.pdf = penZone{}
 		a.publishPenZones()
 		return
 	}
-	if a.mode == pdfMode && viewBottom > 0 {
-		// In fullscreen PDF mode the ink dock floats at the bottom; keep it stylus-clickable.
+	if viewBottom > 0 && (a.mode == pdfMode || (a.mode == splitMode && a.settings.LayoutMode() == notebook.LayoutOutline)) {
+		// Keep the bottom ink dock clickable by stylus when hosted over the PDF pane.
 		if maxY := viewBottom - a.dockBottomReserve(); clip.Y+clip.H > maxY {
 			clip.H = max(0, maxY-clip.Y)
 		}
@@ -283,7 +334,8 @@ func (a *workspace) onAndroidStylus(raw []byte) {
 			for _, sample := range event.Samples {
 				point := inkPoint{X: (sample[0] - zone.origin.X) / zone.scale,
 					Y: (sample[1] - zone.origin.Y) / zone.scale, Pressure: clamp(sample[2], 0, 1)}
-				a.inkInput(ev, zone.key, point, zone.scale, true)
+				accept := zone.name != "pdf" || a.drawing.tool != excerptTool || (point.X >= 0 && point.X <= 1)
+				a.inkInput(ev, zone.key, point, zone.scale, accept)
 			}
 		})
 	}

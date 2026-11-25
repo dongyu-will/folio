@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
+	_ "embed"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -29,12 +30,26 @@ import (
 	"github.com/egoist/mygo/netproxy"
 )
 
+//go:embed mygo.json
+var embeddedManifestJSON []byte
+
+var folioFallbackVersion = func() string {
+	var cfg struct {
+		Version string `json:"version"`
+	}
+	if json.Unmarshal(embeddedManifestJSON, &cfg) == nil {
+		if v := normalizeVersion(cfg.Version); v != "" {
+			return v
+		}
+	}
+	return "0.2.4"
+}()
+
 const (
 	folioRepoURL            = "https://github.com/dongyu-will/folio"
 	folioReleasesURL        = "https://github.com/dongyu-will/folio/releases"
 	folioReleasesAPI        = "https://api.github.com/repos/dongyu-will/folio/releases/latest"
 	folioAndroidManifestURL = "https://github.com/dongyu-will/folio/releases/latest/download/update-android.json"
-	folioFallbackVersion    = "0.2.3"
 
 	androidConscryptCADir = "/apex/com.android.conscrypt/cacerts"
 	androidSSLCertDir     = "/apex/com.android.conscrypt/cacerts:/system/etc/security/cacerts:/data/misc/keychain/certs-added"
