@@ -141,50 +141,52 @@ func (a *workspace) paintMediaThumbnail(p *ui.Painter, rect ui.Rect, ref string)
 		return
 	}
 	pixels := max(rect.W, rect.H) * p.Scale()
-	for i, side := range mediaThumbnailSizes {
-		if pixels <= float32(side) || i == len(mediaThumbnailSizes)-1 {
-			bitmap, decodedAt, settled := a.mediaThumbnailState(ref, i)
-			if bitmap != nil {
-				if !decodedAt.IsZero() {
-					fadeDur := animFade.Duration
-					elapsed := p.Now().Sub(decodedAt)
-					if elapsed >= 0 && elapsed < fadeDur {
-						alpha := ui.EaseOut(clamp(float32(elapsed)/float32(fadeDur), 0, 1))
-						if alpha < 1 {
-							p.AnimationFrame()
-							bw, bh := bitmap.Size()
-							if bw > 0 && bh > 0 {
-								scale := min(rect.W/float32(bw), rect.H/float32(bh))
-								dw, dh := float32(bw)*scale, float32(bh)*scale
-								dst := ui.Rect{X: rect.X + (rect.W-dw)/2, Y: rect.Y + (rect.H-dh)/2, W: dw, H: dh}
-								p.ImageRegion(bitmap, ui.Rect{}, dst, ui.ImageOptions{Tint: ui.RGBA(255, 255, 255, alpha)})
-								return
-							}
-						}
+	tier := len(mediaThumbnailSizes) - 1
+	for i, side := range mediaThumbnailSizes[:len(mediaThumbnailSizes)-1] {
+		if pixels <= float32(side) {
+			tier = i
+			break
+		}
+	}
+	bitmap, decodedAt, settled := a.mediaThumbnailState(ref, tier)
+	if bitmap != nil {
+		if !decodedAt.IsZero() {
+			fadeDur := animFade.Duration
+			elapsed := p.Now().Sub(decodedAt)
+			if elapsed >= 0 && elapsed < fadeDur {
+				alpha := ui.EaseOut(clamp(float32(elapsed)/float32(fadeDur), 0, 1))
+				if alpha < 1 {
+					p.AnimationFrame()
+					bw, bh := bitmap.Size()
+					if bw > 0 && bh > 0 {
+						scale := min(rect.W/float32(bw), rect.H/float32(bh))
+						dw, dh := float32(bw)*scale, float32(bh)*scale
+						dst := ui.Rect{X: rect.X + (rect.W-dw)/2, Y: rect.Y + (rect.H-dh)/2, W: dw, H: dh}
+						p.ImageRegion(bitmap, ui.Rect{}, dst, ui.ImageOptions{Tint: ui.RGBA(255, 255, 255, alpha)})
+						return
 					}
 				}
-				p.Image(bitmap, rect, ui.Contain)
-				return
 			}
-			if settled {
-				p.Fill(rect, ui.RGBA(140, 140, 148, .12), 6)
-				pad := clamp(min(rect.W, rect.H)*.28, 6, 18)
-				cx, cy := rect.X+rect.W/2, rect.Y+rect.H/2
-				col := ui.RGBA(140, 140, 148, .42)
-				p.Line(cx-pad/2, cy-pad/2, cx+pad/2, cy+pad/2, 1.5, col)
-				p.Line(cx-pad/2, cy+pad/2, cx+pad/2, cy-pad/2, 1.5, col)
-			} else {
-				alpha := float32(0.08)
-				if !p.Preferences().ReduceMotion {
-					sec := float64(p.Now().UnixNano()) / 1e9
-					wave := 0.5 - 0.5*math.Cos(sec*(2*math.Pi/1.4))
-					alpha = float32(0.06 + 0.05*wave)
-					p.AnimationFrame()
-				}
-				p.Fill(rect, ui.RGBA(128, 128, 136, alpha), 6)
-			}
-			return
 		}
+		p.Image(bitmap, rect, ui.Contain)
+		return
+	}
+	if settled {
+		p.Fill(rect, ui.RGBA(140, 140, 148, .12), 6)
+		pad := clamp(min(rect.W, rect.H)*.28, 6, 18)
+		cx, cy := rect.X+rect.W/2, rect.Y+rect.H/2
+		col := ui.RGBA(140, 140, 148, .42)
+		p.Line(cx-pad/2, cy-pad/2, cx+pad/2, cy+pad/2, 1.5, col)
+		p.Line(cx-pad/2, cy+pad/2, cx+pad/2, cy-pad/2, 1.5, col)
+	} else {
+		alpha := float32(0.08)
+		if !p.Preferences().ReduceMotion {
+			sec := float64(p.Now().UnixNano()) / 1e9
+			wave := 0.5 - 0.5*math.Cos(sec*(2*math.Pi/1.4))
+			alpha = float32(0.06 + 0.05*wave)
+			p.AnimationFrame()
+		}
+		p.Fill(rect, ui.RGBA(128, 128, 136, alpha), 6)
 	}
 }
 
@@ -237,8 +239,7 @@ func (a *workspace) mediaThumbnailState(ref string, tier int) (*ui.Bitmap, time.
 			return entry.bitmap, entry.decodedAt, true
 		}
 	}
-	_, settled := m.thumbnails.get(key)
-	return nil, time.Time{}, settled
+	return nil, time.Time{}, false
 }
 
 func (a *workspace) updateMediaOrientation(ref string, bitmap *ui.Bitmap) {
