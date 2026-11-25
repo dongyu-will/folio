@@ -66,7 +66,8 @@ func (a *workspace) refreshStorageBytes() {
 
 func designToolbarButton(c *ui.Context, p palette, icon *ui.SVG, label string, size float32, framed, disabled bool, action func()) {
 	b := ui.ButtonBase(c).Size(size, size).Shrink(0).Center().Radius(8).Label(label).Tooltip(label).
-		Disabled(disabled).FocusRingColor(p.accent).OnClick(action)
+		Disabled(disabled).FocusRingColor(p.accent).Transition(trColorMicro).OnClick(action)
+	applyPressPose(b, b.Pressed(), disabled)
 	fg := p.quiet
 	if framed {
 		b.Background(p.elevated).Border(1, p.border).Shadow(0, 1, 2, 0, p.shadowSoft)
@@ -91,7 +92,8 @@ func (a *workspace) transferButton(c *ui.Context, p palette) {
 	}
 	disabled := a.editing() || a.busy
 	b := ui.ButtonBase(c).Label("导入 / 导出").Tooltip("导入或导出").Size(sz, sz).Center().Radius(7).Shrink(0).
-		Disabled(disabled).FocusRingColor(p.accent)
+		Disabled(disabled).FocusRingColor(p.accent).Transition(trColorMicro)
+	applyPressPose(b, b.Pressed(), disabled)
 	fg := p.quiet
 	if disabled {
 		fg = p.quiet.Alpha(.4)
@@ -128,15 +130,24 @@ func segmentsSized[T comparable](c *ui.Context, p palette, touch bool, options [
 	if touch {
 		outerH, btnH, padX, fontSize = 38, 31, 12, 12.5
 	}
+	var kb strings.Builder
+	for i, opt := range options {
+		if i > 0 {
+			kb.WriteByte('|')
+		}
+		kb.WriteString(opt.title)
+	}
+	groupKey := kb.String()
+	pillTr := trSegmentPill(groupKey)
 	ui.Row(c).Height(outerH).Shrink(0).Padding(3).Gap(2).Radius(8).
 		AlignItems(ui.Center).Background(p.inputBg).Border(1, p.rule).Children(func() {
 		for _, opt := range options {
 			active := opt.value == selected
 			b := ui.ButtonBase(c.Key(opt.title)).Height(btnH).PaddingX(padX).Radius(5).Center().
-				Shrink(0).Label(opt.title).Selected(active).OnClick(func() { change(opt.value) })
+				Shrink(0).Label(opt.title).Selected(active).Transition(trColorMicro).OnClick(func() { change(opt.value) })
+			applyPressPose(b, b.Pressed(), false)
 			fg := p.quiet
 			if active {
-				b.Background(p.elevated).Border(1, p.border).Shadow(0, 1, 2, 0, p.shadowSoft)
 				fg = p.ink
 			} else if b.Pressed() {
 				b.Background(p.pressed)
@@ -144,22 +155,56 @@ func segmentsSized[T comparable](c *ui.Context, p palette, touch bool, options [
 			} else if b.Hovered() {
 				b.Background(p.hover)
 			}
-			b.Children(func() { ui.Text(c, opt.title).FontSize(fontSize).TextColor(fg).SingleLine() })
+			b.Children(func() {
+				if active {
+					ui.Box(c.Key("seg-pill-"+groupKey)).Absolute().Fill().Radius(5).
+						Background(p.elevated).Border(1, p.border).Shadow(0, 1, 2, 0, p.shadowSoft).
+						Transition(pillTr)
+				}
+				ui.Text(c, opt.title).FontSize(fontSize).TextColor(fg).SingleLine()
+			})
 		}
 	})
 }
 
 func settingSwitch(c *ui.Context, p palette, label string, active bool, change func()) {
-	icon := toggleOff
+	btn := ui.ButtonBase(c).Size(44, 34).Center().Shrink(0).Label(label).Role(ui.RoleSwitch).Checked(active).
+		Background(ui.Transparent).FocusRingColor(p.accent).OnClick(change)
+	posTarget := float32(0)
 	if active {
-		icon = toggleOn
-		if p.dark {
-			icon = toggleOnDark
-		}
+		posTarget = 1
 	}
-	ui.ButtonBase(c).Size(44, 34).Center().Shrink(0).Label(label).Role(ui.RoleSwitch).Checked(active).Background(ui.Transparent).
-		FocusRingColor(p.accent).OnClick(change).Children(func() {
-		ui.Image(c, icon).Size(39, 24)
+	pos := btn.AnimateTo("sw-pos", posTarget, animControl)
+	offTrack := p.border.Mix(p.ink, 0.16)
+	if p.dark {
+		offTrack = p.border.Mix(p.ink, 0.12)
+	}
+	targetTrack := offTrack
+	if active {
+		targetTrack = p.accent
+	}
+	trackCol := btn.AnimateColor("sw-track", targetTrack, animMicro)
+	stretchTarget := float32(0)
+	if btn.Pressed() {
+		stretchTarget = 2
+	}
+	stretch := btn.AnimateTo("sw-stretch", stretchTarget, animPress)
+	btn.Draw(func(paint *ui.Painter, rect ui.Rect) {
+		const (
+			trackW = float32(39)
+			trackH = float32(24)
+			inset  = float32(2)
+			knobD  = trackH - 2*inset
+		)
+		tx := rect.X + (rect.W-trackW)/2
+		ty := rect.Y + (rect.H-trackH)/2
+		paint.Fill(ui.Rect{X: tx, Y: ty, W: trackW, H: trackH}, trackCol, trackH/2)
+		knobW := knobD + max(0, stretch)
+		travel := trackW - 2*inset - knobW
+		kx := tx + inset + pos*travel
+		knobRect := ui.Rect{X: kx, Y: ty + inset, W: knobW, H: knobD}
+		paint.Shadow(knobRect, knobD/2, 0, 1, 3, 0, ui.RGBA(0, 0, 0, 0.22))
+		paint.Fill(knobRect, ui.RGB(255, 255, 255), knobD/2)
 	})
 }
 
@@ -170,12 +215,12 @@ func settingGroup(c *ui.Context, p palette, title string, content func()) {
 	})
 }
 
-func settingRow(c *ui.Context, p palette, compact bool, title, hint string, control func()) {
+func settingRowWithHint(c *ui.Context, p palette, compact bool, title string, hintBlock func(), control func()) {
 	if compact {
 		ui.Column(c).FillWidth().Shrink(0).Padding(12, 16).Gap(8).Children(func() {
 			ui.Column(c).FillWidth().Gap(2).Children(func() {
 				ui.Text(c, title).FontSize(13).FontWeight(550).TextColor(p.ink).SingleLine()
-				ui.Text(c, hint).FontSize(11.5).TextColor(p.quiet)
+				hintBlock()
 			})
 			ui.Row(c).FillWidth().AlignItems(ui.Center).Children(control)
 		})
@@ -184,10 +229,19 @@ func settingRow(c *ui.Context, p palette, compact bool, title, hint string, cont
 	ui.Row(c).MinHeight(57).FillWidth().Shrink(0).Padding(8, 16).Gap(12).AlignItems(ui.Center).Children(func() {
 		ui.Column(c).Grow(1).MinWidth(0).Gap(3).Children(func() {
 			ui.Text(c, title).FontSize(13).FontWeight(550).TextColor(p.ink).SingleLine().Ellipsis("…")
-			ui.Text(c, hint).FontSize(11.5).LineHeight(1.4).TextColor(p.quiet)
+			hintBlock()
 		})
 		control()
 	})
+}
+
+func settingRow(c *ui.Context, p palette, compact bool, title, hint string, control func()) {
+	settingRowWithHint(c, p, compact, title, func() {
+		el := ui.Text(c, hint).FontSize(11.5).TextColor(p.quiet)
+		if !compact {
+			el.LineHeight(1.4)
+		}
+	}, control)
 }
 
 func settingButtonHeight(touch bool) float32 {
@@ -208,7 +262,8 @@ func settingButtonWithHeight(c *ui.Context, p palette, h float32, title string, 
 	}
 	button := ui.ButtonBase(c).Height(h).PaddingX(padX).Gap(6).Center().Radius(8).Shrink(0).
 		Background(bg).Border(1, border).Shadow(0, 1, 2, 0, p.shadowSoft).
-		Label(title).Disabled(disabled).FocusRingColor(p.accent).OnClick(action)
+		Label(title).Disabled(disabled).FocusRingColor(p.accent).Transition(trColorMicro).OnClick(action)
+	applyPressPose(button, button.Pressed(), disabled)
 	if disabled {
 		fg = p.quiet
 	} else if button.Pressed() {
@@ -248,7 +303,8 @@ func settingPrimaryButtonWithHeight(c *ui.Context, p palette, h float32, title s
 		padX = 13
 	}
 	button := ui.ButtonBase(c).Height(h).PaddingX(padX).Gap(6).Center().Radius(8).Shrink(0).
-		Label(title).Disabled(disabled).FocusRingColor(p.accent).OnClick(action)
+		Label(title).Disabled(disabled).FocusRingColor(p.accent).Transition(trColorMicro).OnClick(action)
+	applyPressPose(button, button.Pressed(), disabled)
 	if disabled {
 		button.Background(p.accent.Alpha(.45))
 	} else {
@@ -285,45 +341,44 @@ func (a *workspace) settingsCard(c *ui.Context, p palette, width, height float32
 	closeCard := func() {
 		a.renameOpen, a.preferencesOpen = false, false
 	}
-	ui.Box(c.Key("settings-layer")).Absolute().Left(0).Right(0).Top(0).Bottom(0).ZIndex(20).Center().Children(func() {
-		ui.ButtonBase(c).Absolute().Left(0).Right(0).Top(0).Bottom(0).
-			Background(p.scrim).Label("关闭设置").OnClick(closeCard)
-		ui.Column(c.Key("settings-card")).Width(cardW).Height(cardH).ZIndex(21).Radius(16).Clip().
-			Background(p.surface).Border(1, p.border).Shadow(0, 24, 60, -14, p.modalShadow).Children(func() {
-			ui.Row(c).Height(52).Shrink(0).FillWidth().Padding(0, 14, 0, 20).
-				Gap(8).AlignItems(ui.Center).Children(func() {
-				ui.Icon(c, icSettings).Size(15, 15).TextColor(p.secondary)
-				ui.Text(c, "设置").Grow(1).FontSize(15).FontWeight(700).TextColor(p.ink)
-				designToolbarButton(c, p, icClose, "关闭设置", 30, false, false, closeCard)
-			})
-			horizontalRule(c, p)
-			ui.Scroll(c.Key("settings-body")).Grow(1).MinHeight(0).FillWidth().TrackScroll(&a.settingsScroll).
-				Padding(18, 24).Gap(16).Children(func() {
-				compact := cardW < 540
-				a.displaySettings(c, p, compact)
-				if a.touchUI() {
-					a.stylusSettings(c, p, compact)
+	ui.ButtonBase(c.Key("settings-scrim")).Absolute().Left(0).Right(0).Top(0).Bottom(0).ZIndex(20).
+		Background(p.scrim).Label("关闭设置").OnClick(closeCard).Transition(trScrim)
+	ui.Column(c.Key("settings-card")).Absolute().Left(0).Right(0).Top(0).Bottom(0).Margin(ui.Auto).
+		Width(cardW).Height(cardH).ZIndex(21).Radius(16).Clip().
+		Background(p.surface).Border(1, p.border).Shadow(0, 24, 60, -14, p.modalShadow).Transition(trModalCard).Children(func() {
+		ui.Row(c).Height(52).Shrink(0).FillWidth().Padding(0, 14, 0, 20).
+			Gap(8).AlignItems(ui.Center).Children(func() {
+			ui.Icon(c, icSettings).Size(15, 15).TextColor(p.secondary)
+			ui.Text(c, "设置").Grow(1).FontSize(15).FontWeight(700).TextColor(p.ink)
+			designToolbarButton(c, p, icClose, "关闭设置", 30, false, false, closeCard)
+		})
+		horizontalRule(c, p)
+		ui.Scroll(c.Key("settings-body")).Grow(1).MinHeight(0).FillWidth().TrackScroll(&a.settingsScroll).
+			Padding(18, 24).Gap(16).Children(func() {
+			compact := cardW < 540
+			a.displaySettings(c, p, compact)
+			if a.touchUI() {
+				a.stylusSettings(c, p, compact)
+			}
+			a.storageSettings(c, p, compact)
+			a.webdavSettings(c, p, compact)
+			if a.bookID != "" {
+				a.bookSettings(c, p, compact)
+			}
+			a.aboutSettings(c, p, compact)
+		})
+		horizontalRule(c, p)
+		ui.Row(c).Height(40).Shrink(0).FillWidth().PaddingX(24).AlignItems(ui.Center).Background(p.canvas).Children(func() {
+			ui.Text(c, fmt.Sprintf("Folio v%s · 所有笔记仅保存在本地", currentAppVersion())).FontSize(11.5).TextColor(p.quiet).Grow(1)
+			closeHint := "Esc 关闭"
+			if a.touchUI() {
+				if runtime.GOOS == "android" {
+					closeHint = "返回键关闭"
+				} else {
+					closeHint = "点击空白处关闭"
 				}
-				a.storageSettings(c, p, compact)
-				a.webdavSettings(c, p, compact)
-				if a.bookID != "" {
-					a.bookSettings(c, p, compact)
-				}
-				a.aboutSettings(c, p, compact)
-			})
-			horizontalRule(c, p)
-			ui.Row(c).Height(40).Shrink(0).FillWidth().PaddingX(24).AlignItems(ui.Center).Background(p.canvas).Children(func() {
-				ui.Text(c, fmt.Sprintf("Folio v%s · 所有笔记仅保存在本地", currentAppVersion())).FontSize(11.5).TextColor(p.quiet).Grow(1)
-				closeHint := "Esc 关闭"
-				if a.touchUI() {
-					if runtime.GOOS == "android" {
-						closeHint = "返回键关闭"
-					} else {
-						closeHint = "点击空白处关闭"
-					}
-				}
-				ui.Text(c, closeHint).FontSize(11.5).TextColor(p.quiet)
-			})
+			}
+			ui.Text(c, closeHint).FontSize(11.5).TextColor(p.quiet)
 		})
 	})
 }
@@ -358,22 +413,24 @@ func (a *workspace) displaySettings(c *ui.Context, p palette, compact bool) {
 			})
 		})
 		if layoutMode != notebook.LayoutOutline {
-			horizontalRule(c, p)
-			settingRow(c, p, compact, "画布默认缩放", "打开笔记本时的初始视图比例", func() {
-				segmentsSized(c, p, touch, []segment[int]{{"自适应", 0}, {"90%", 90}, {"100%", 100}, {"110%", 110}}, a.settings.GraphZoom, func(value int) {
-					next := a.settings
-					next.GraphZoom = value
-					if a.saveSettings(next) {
-						a.zoom(float32(value) / 100)
-					}
+			ui.Column(c.Key("canvas-display-opts")).FillWidth().Transition(trPanelSlideV).Children(func() {
+				horizontalRule(c, p)
+				settingRow(c, p, compact, "画布默认缩放", "打开笔记本时的初始视图比例", func() {
+					segmentsSized(c, p, touch, []segment[int]{{"自适应", 0}, {"90%", 90}, {"100%", 100}, {"110%", 110}}, a.settings.GraphZoom, func(value int) {
+						next := a.settings
+						next.GraphZoom = value
+						if a.saveSettings(next) {
+							a.zoom(float32(value) / 100)
+						}
+					})
 				})
-			})
-			horizontalRule(c, p)
-			settingRow(c, p, compact, "画布点阵背景", "在画布上显示参考点阵", func() {
-				settingSwitch(c, p, "画布点阵背景", !a.settings.HideGrid, func() {
-					next := a.settings
-					next.HideGrid = !next.HideGrid
-					a.saveSettings(next)
+				horizontalRule(c, p)
+				settingRow(c, p, compact, "画布点阵背景", "在画布上显示参考点阵", func() {
+					settingSwitch(c, p, "画布点阵背景", !a.settings.HideGrid, func() {
+						next := a.settings
+						next.HideGrid = !next.HideGrid
+						a.saveSettings(next)
+					})
 				})
 			})
 		}
@@ -464,7 +521,25 @@ func (a *workspace) webdavSettings(c *ui.Context, p palette, compact bool) {
 				Placeholder("应用授权密码").Label("WebDAV 密码")
 		})
 		horizontalRule(c, p)
-		settingRow(c, p, compact, "连接与同步", statusText, func() {
+		settingRowWithHint(c, p, compact, "连接与同步", func() {
+			statusEl := func() {
+				el := ui.Text(c, statusText).FontSize(11.5).TextColor(p.quiet).ContentTransition(ctText)
+				if !compact {
+					el.LineHeight(1.4)
+				}
+				if a.webdavBusy {
+					el.Grow(1).MinWidth(0)
+				}
+			}
+			if a.webdavBusy {
+				ui.Row(c).FillWidth().Gap(6).AlignItems(ui.Center).Children(func() {
+					ui.Spinner(c).Size(13, 13).TextColor(p.accent)
+					statusEl()
+				})
+				return
+			}
+			statusEl()
+		}, func() {
 			ui.Row(c).Gap(8).Shrink(0).Children(func() {
 				a.settingButton(c, p, "测试连接", nil, false, a.webdavBusy || a.busy, a.testWebDAVConnection)
 				a.settingPrimaryButton(c, p, "立即同步", icUpdateRefresh, a.webdavBusy || a.busy, a.syncWebDAV)
@@ -488,7 +563,7 @@ func (a *workspace) bookSettings(c *ui.Context, p palette, compact bool) {
 		}
 		settingRow(c, p, compact, "重命名当前笔记本", title, func() {
 			if a.renameOpen {
-				ui.Row(c).AlignItems(ui.Center).Gap(6).Width(245).Shrink(0).Children(func() {
+				ui.Row(c.Key("book-rename-edit")).AlignItems(ui.Center).Gap(6).Width(245).Shrink(0).Transition(trCrossfade).Children(func() {
 					if ui.TextInput(c.Key("book-name"), &a.bookName).Grow(1).MinWidth(0).Height(settingButtonHeight(a.touchUI())).Label("笔记本名称").Submitted() {
 						a.renameBook()
 					}
@@ -497,8 +572,10 @@ func (a *workspace) bookSettings(c *ui.Context, p palette, compact bool) {
 				})
 				return
 			}
-			a.settingButton(c, p, "重命名", nil, false, a.busy || a.bookID == "", func() {
-				a.renameOpen, a.bookName = true, a.tree.book.Title
+			ui.Box(c.Key("book-rename-btn")).Shrink(0).Transition(trCrossfade).Children(func() {
+				a.settingButton(c, p, "重命名", nil, false, a.busy || a.bookID == "", func() {
+					a.renameOpen, a.bookName = true, a.tree.book.Title
+				})
 			})
 		})
 		horizontalRule(c, p)
@@ -648,8 +725,16 @@ func (a *workspace) aboutSettings(c *ui.Context, p palette, compact bool) {
 					ui.Row(c).Gap(6).AlignItems(ui.Center).Children(func() {
 						ui.Text(c, "版本与更新").FontSize(13).FontWeight(550).TextColor(p.ink).SingleLine()
 						badgePill(c, p, "v"+curVer)
+						if st.phase == updateChecking || st.phase == updateDownloading {
+							ui.Spinner(c).Size(13, 13).TextColor(p.accent)
+						}
 					})
-					ui.Text(c, hint).FontSize(11.5).LineHeight(1.45).TextColor(hintColor)
+					hintEl := ui.Text(c, hint).FontSize(11.5).LineHeight(1.45).TextColor(hintColor)
+					if st.phase == updateDownloading {
+						hintEl.ContentTransition(ctNumeric(false))
+					} else {
+						hintEl.ContentTransition(ctText)
+					}
 				})
 			}
 			if compact {
@@ -663,14 +748,17 @@ func (a *workspace) aboutSettings(c *ui.Context, p palette, compact bool) {
 			}
 			if st.phase == updateDownloading && st.total > 0 {
 				ratio := clamp(float32(st.downloaded)/float32(st.total), 0, 1)
-				ui.Box(c).FillWidth().Height(4).Radius(99).Clip().Background(p.inputBg).Children(func() {
-					ui.Box(c).FillHeight().WidthPercent(ratio * 100).Radius(99).Background(p.accent)
+				bar := ui.Box(c.Key("about-dl-bar")).FillWidth().Height(4).Radius(99).Clip().
+					Background(p.inputBg).Transition(trPanelSlideV)
+				pct := bar.AnimateTo("update-dl-pct", ratio*100, animControl)
+				bar.Children(func() {
+					ui.Box(c).FillHeight().WidthPercent(clamp(pct, 0, 100)).Radius(99).Background(p.accent)
 				})
 			}
 			if st.info != nil && (st.phase == updateAvailable || st.phase == updateRelaunchRequired || st.phase == updatePermissionRequired || st.phase == updateDeferredForeground) {
 				if notes := formatReleaseNotesPreview(st.info.Notes); notes != "" {
-					ui.Column(c).FillWidth().Padding(8, 10).Radius(8).
-						Background(p.inputBg).Border(1, p.rule).Children(func() {
+					ui.Column(c.Key("about-release-notes")).FillWidth().Padding(8, 10).Radius(8).
+						Background(p.inputBg).Border(1, p.rule).Transition(trPanelSlideV).Children(func() {
 						ui.Text(c, notes).FillWidth().FontSize(11.5).LineHeight(1.45).TextColor(p.secondary)
 					})
 				}
