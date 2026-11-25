@@ -42,7 +42,7 @@ var folioFallbackVersion = func() string {
 			return v
 		}
 	}
-	return "0.2.4"
+	return "0.3.0"
 }()
 
 const (
