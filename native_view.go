@@ -87,7 +87,10 @@ func (a *workspace) view(c *ui.Context) {
 		c.OnShortcut(0, ui.KeyBack, closeTOC)
 		c.OnShortcut(0, ui.KeyEscape, closeTOC)
 	} else if a.page != browse {
-		back := func() { a.page = browse }
+		back := func() {
+			a.pageDir = -1
+			a.page = browse
+		}
 		c.OnShortcut(0, ui.KeyBack, back)
 		c.OnShortcut(0, ui.KeyEscape, back)
 	} else if len(a.drawing.selected) > 0 || len(a.drawing.lasso) > 0 {
@@ -107,6 +110,7 @@ func (a *workspace) view(c *ui.Context) {
 		c.OnShortcut(ui.Cmd, ui.KeyF, func() {
 			a.sidebarHiddenForSplit = false
 			if !wide {
+				a.pageDir = 1
 				a.page = libraryScreen
 			} else if a.settings.SidebarCollapsed {
 				next := a.settings
@@ -151,11 +155,7 @@ func (a *workspace) view(c *ui.Context) {
 			}
 		}
 	}).Children(func() {
-		ui.Column(c).Fill().Children(func() {
-			if a.preview != "" {
-				a.imageView(c, p, width, height)
-				return
-			}
+		ui.Column(c.Key("main-shell-col")).Fill().Children(func() {
 			availableH := height
 			if !wide || a.bookID == "" {
 				a.mobileHeader(c, p, wide)
@@ -168,57 +168,108 @@ func (a *workspace) view(c *ui.Context) {
 				a.emptyState(c, p)
 				return
 			}
-			if !wide && a.page == libraryScreen {
-				a.sidebar(c, p, width, false)
-				return
-			}
-			if !wide && a.page == detail {
-				a.readerPanel(c, p, width, availableH, false, false)
+			if !wide {
+				stage := ui.Box(c.Key("mobile-stage")).Grow(1).FillWidth().MinHeight(0).Clip()
+				lastPage := ui.Local(stage, "last-page", func() screen { return a.page })
+				if *lastPage != a.page {
+					if pageRank(a.page) > pageRank(*lastPage) {
+						a.pageDir = 1
+					} else {
+						a.pageDir = -1
+					}
+					*lastPage = a.page
+				}
+				dir := float32(a.pageDir)
+				stage.ChildExit(childExitSlide(dir)).Children(func() {
+					switch a.page {
+					case libraryScreen:
+						ui.Box(c.Key("mob-library")).Absolute().Fill().Transition(trPageSlide(dir)).Children(func() {
+							a.sidebar(c, p, width, false)
+						})
+					case detail:
+						ui.Box(c.Key("mob-detail")).Absolute().Fill().Transition(trPageSlide(dir)).Children(func() {
+							a.readerPanel(c, p, width, availableH, false, false)
+						})
+					default:
+						ui.Box(c.Key("mob-workspace")).Absolute().Fill().Transition(trPageSlide(dir)).Children(func() {
+							surface := ui.Box(c.Key("main-surface")).Fill().Clip().Background(p.surface)
+							surface.Children(func() {
+								a.documentWorkspace(c, p, width, max(1, availableH))
+							})
+						})
+					}
+				})
 				return
 			}
 
-			ui.Row(c).Grow(1).MinHeight(0).FillWidth().Children(func() {
+			ui.Row(c.Key("desktop-row")).Grow(1).MinHeight(0).FillWidth().Children(func() {
 				var sideWidth float32
 				if side {
 					sideWidth = 240
-					a.sidebar(c, p, sideWidth, true)
+					ui.Box(c.Key("desktop-sidebar")).Shrink(0).FillHeight().ZIndex(2).
+						Transition(trPanelSlideH).Children(func() {
+						a.sidebar(c, p, sideWidth, true)
+					})
 				}
-				inset := float32(0)
-				if wide {
-					inset = 8
-				}
+				inset := float32(8)
 				leftInset := inset
 				if side {
 					leftInset = 0
 				}
 				paneW := width - sideWidth - inset - leftInset
-				pane := ui.Box(c).Grow(1).FillHeight().MinWidth(0).Padding(inset, inset, inset, leftInset)
+				pane := ui.Box(c.Key("main-pane")).Grow(1).FillHeight().MinWidth(0).
+					Padding(inset, inset, inset, leftInset)
 				pane.Children(func() {
-					surface := ui.Box(c).Fill().Clip().Background(p.surface)
-					if wide {
-						surface.Radius(12).Border(1, p.rule).Shadow(0, 2, 10, -2, p.shadow)
-					}
+					surface := ui.Box(c.Key("main-surface")).Fill().Clip().Background(p.surface).
+						Radius(12).Border(1, p.rule).Shadow(0, 2, 10, -2, p.shadow)
 					surface.Children(func() {
 						a.documentWorkspace(c, p, paneW, max(1, availableH-2*inset))
-						if a.page == detail {
-							a.noteModal(c, p, paneW, max(1, availableH-2*inset))
-						}
-						if a.reviewOpen {
-							a.reviewModal(c, p, paneW, max(1, availableH-2*inset))
-						}
-						if wide && a.preferencesOpen {
-							a.settingsCard(c, p, paneW, max(1, availableH-2*inset))
-						}
+						ui.Box(c.Key("note-modal-host")).Absolute().Fill().ZIndex(10).
+							IgnoreInput(a.page != detail).Center().Children(func() {
+							if a.page == detail {
+								a.noteModal(c, p, paneW, max(1, availableH-2*inset))
+							}
+						})
+						ui.Box(c.Key("review-modal-host")).Absolute().Fill().ZIndex(15).
+							IgnoreInput(!a.reviewOpen).Center().Children(func() {
+							if a.reviewOpen {
+								a.reviewModal(c, p, paneW, max(1, availableH-2*inset))
+							}
+						})
+						ui.Box(c.Key("settings-modal-host")).Absolute().Fill().ZIndex(20).
+							IgnoreInput(!a.preferencesOpen).Center().Children(func() {
+							if a.preferencesOpen {
+								a.settingsCard(c, p, paneW, max(1, availableH-2*inset))
+							}
+						})
 					})
 				})
 			})
 		})
-		if a.reviewOpen && !wide && a.preview == "" && a.bookID != "" {
-			a.reviewModal(c, p, width, height)
+		showNarrowReview := a.reviewOpen && !wide && a.bookID != ""
+		if !wide {
+			ui.Box(c.Key("review-modal-host")).Absolute().Fill().ZIndex(15).
+				IgnoreInput(!showNarrowReview).Center().Children(func() {
+				if showNarrowReview {
+					a.reviewModal(c, p, width, height)
+				}
+			})
 		}
-		if a.preferencesOpen && a.preview == "" && (!wide || a.bookID == "") {
-			a.settingsCard(c, p, width, height)
+		showRootSettings := a.preferencesOpen && (!wide || a.bookID == "")
+		if !wide || a.bookID == "" {
+			ui.Box(c.Key("settings-modal-host")).Absolute().Fill().ZIndex(20).
+				IgnoreInput(!showRootSettings).Center().Children(func() {
+				if showRootSettings {
+					a.settingsCard(c, p, width, height)
+				}
+			})
 		}
+		ui.Box(c.Key("image-modal-host")).Absolute().Fill().ZIndex(25).
+			IgnoreInput(a.preview == "").Children(func() {
+			if a.preview != "" {
+				a.imageView(c, p, width, height)
+			}
+		})
 		a.statusToast(c, p, width, !wide || a.bookID == "")
 	})
 	if w > 0 && h > 0 {
@@ -226,34 +277,56 @@ func (a *workspace) view(c *ui.Context) {
 	}
 }
 
-func (a *workspace) statusToast(c *ui.Context, p palette, width float32, hasMobileHeader bool) {
-	if a.message == "" {
-		return
+func pageRank(p screen) int {
+	switch p {
+	case browse:
+		return 0
+	case libraryScreen:
+		return 1
+	case detail:
+		return 2
+	default:
+		return 0
 	}
+}
+
+func (a *workspace) statusToast(c *ui.Context, p palette, width float32, hasMobileHeader bool) {
+	visible := a.message != ""
 	var left time.Duration
-	if !a.messagePending && !a.messageError {
+	if visible && !a.messagePending && !a.messageError {
 		left = time.Until(a.messageUntil)
 		if left <= 0 {
-			return
+			visible = false
 		}
-	}
-	fg, bg, borderCol, ic := p.accent, p.elevated, p.tintBorder, icCheck
-	if a.messageError {
-		fg, bg, borderCol, ic = p.danger, p.dangerWash, p.danger.Alpha(.35), icAlert
-	} else if a.messagePending {
-		fg, bg, borderCol, ic = p.accent, p.tint, p.tintBorder, icImport
 	}
 	topOffset := float32(14)
 	if hasMobileHeader {
 		topOffset = 62
 	}
 	maxW := max(220, min(540, width-24))
-	ui.Row(c.Key("status-toast")).Absolute().Top(topOffset).Left(0).Right(0).ZIndex(30).Center().Children(func() {
+	ui.Row(c.Key("status-toast")).Absolute().Top(topOffset).Left(0).Right(0).ZIndex(30).Center().
+		IgnoreInput(!visible).Children(func() {
+		if !visible {
+			return
+		}
+		fg, bg, borderCol, ic := p.accent, p.elevated, p.tintBorder, icCheck
+		if a.messageError {
+			fg, bg, borderCol, ic = p.danger, p.dangerWash, p.danger.Alpha(.35), icAlert
+		} else if a.messagePending {
+			fg, bg, borderCol, ic = p.accent, p.tint, p.tintBorder, icImport
+		}
 		pill := ui.Row(c.Key("status-banner")).MaxWidth(maxW).Padding(8, 14).Gap(8).Radius(12).
 			AlignItems(ui.Center).Background(bg).Border(1, borderCol).
-			Shadow(0, 8, 22, -4, p.shadow)
+			Shadow(0, 8, 22, -4, p.shadow).Transition(trToast)
+		if a.messageError {
+			applyErrorShake(pill, a.toastShakeRun)
+		}
 		pill.Children(func() {
-			ui.Icon(c, ic).Size(15, 15).TextColor(fg).Shrink(0)
+			if a.messagePending {
+				ui.Spinner(c).Size(14, 14).TextColor(fg).Shrink(0)
+			} else {
+				ui.Icon(c, ic).Size(15, 15).TextColor(fg).Shrink(0).ContentTransition(ctIcon)
+			}
 			txt := ui.Text(c, a.message).FontSize(12.5).FontWeight(550).TextColor(fg).Shrink(1).MinWidth(0)
 			if !a.messageError {
 				txt.SingleLine().Ellipsis("…")
@@ -264,10 +337,12 @@ func (a *workspace) statusToast(c *ui.Context, p palette, width float32, hasMobi
 				fn := a.toastActionFn
 				act := ui.ButtonBase(c.Key("toast-action")).Height(24).PaddingX(8).Radius(6).Center().Shrink(0).
 					Background(p.accent).Label(a.toastActionLabel).FocusRingColor(p.accent).
+					Transition(trColorMicro).
 					OnClick(func() {
 						a.dismissMessage()
 						fn()
 					})
+				applyPressPose(act, act.Pressed(), false)
 				act.Children(func() {
 					ui.Text(c, a.toastActionLabel).FontSize(11.5).FontWeight(600).TextColor(p.onAccent).SingleLine()
 				})
@@ -277,7 +352,7 @@ func (a *workspace) statusToast(c *ui.Context, p palette, width float32, hasMobi
 			}
 		})
 	})
-	if !a.messagePending && !a.messageError {
+	if visible && !a.messagePending && !a.messageError {
 		c.After(left)
 	}
 }
@@ -354,35 +429,39 @@ func (a *workspace) updateBanner(c *ui.Context, p palette) bool {
 		btnH = 32
 		padX = 12
 	}
-	ui.Row(c.Key("update-banner")).Height(barH).FillWidth().Shrink(0).Padding(0, padX).Gap(8).
-		AlignItems(ui.Center).Background(p.tint).Children(func() {
-		ui.Icon(c, icon).Size(14, 14).TextColor(p.accent).Shrink(0)
-		ui.Text(c, bannerText).FontSize(12.5).FontWeight(550).TextColor(p.accent).
-			Grow(1).MinWidth(0).SingleLine().Ellipsis("…")
-		act := ui.ButtonBase(c.Key("update-banner-action")).Height(btnH).PaddingX(10).Radius(6).Center().Shrink(0).
-			Label(primaryLabel).Disabled(a.editing()).FocusRingColor(p.accent).OnClick(primaryFn)
-		if a.editing() {
-			act.Background(p.accent.Alpha(.45))
-		} else if act.Pressed() {
-			act.Background(p.accentBot)
-		} else {
-			act.Background(p.accent)
-		}
-		act.Children(func() {
-			ui.Text(c, primaryLabel).FontSize(11.5).FontWeight(600).TextColor(p.onAccent).SingleLine()
+	ui.Column(c.Key("update-banner-wrap")).FillWidth().Shrink(0).Transition(trPanelSlideV).Children(func() {
+		ui.Row(c.Key("update-banner")).Height(barH).FillWidth().Shrink(0).Padding(0, padX).Gap(8).
+			AlignItems(ui.Center).Background(p.tint).Children(func() {
+			ui.Icon(c, icon).Size(14, 14).TextColor(p.accent).Shrink(0).ContentTransition(ctIcon)
+			ui.Text(c, bannerText).FontSize(12.5).FontWeight(550).TextColor(p.accent).
+				Grow(1).MinWidth(0).SingleLine().Ellipsis("…")
+			act := ui.ButtonBase(c.Key("update-banner-action")).Height(btnH).PaddingX(10).Radius(6).Center().Shrink(0).
+				Label(primaryLabel).Disabled(a.editing()).FocusRingColor(p.accent).Transition(trColorMicro).OnClick(primaryFn)
+			if a.editing() {
+				act.Background(p.accent.Alpha(.45))
+			} else if act.Pressed() {
+				act.Background(p.accentBot)
+			} else {
+				act.Background(p.accent)
+			}
+			applyPressPose(act, act.Pressed(), a.editing())
+			act.Children(func() {
+				ui.Text(c, primaryLabel).FontSize(11.5).FontWeight(600).TextColor(p.onAccent).SingleLine()
+			})
+			later := ui.ButtonBase(c.Key("update-banner-dismiss")).Height(btnH).PaddingX(8).Radius(6).Center().Shrink(0).
+				Label("稍后").FocusRingColor(p.accent).Transition(trColorMicro).OnClick(a.dismissUpdateBanner)
+			if later.Pressed() {
+				later.Background(p.pressed)
+			} else if later.Hovered() {
+				later.Background(p.hover)
+			}
+			applyPressPose(later, later.Pressed(), false)
+			later.Children(func() {
+				ui.Text(c, "稍后").FontSize(11.5).FontWeight(550).TextColor(p.secondary).SingleLine()
+			})
 		})
-		later := ui.ButtonBase(c.Key("update-banner-dismiss")).Height(btnH).PaddingX(8).Radius(6).Center().Shrink(0).
-			Label("稍后").FocusRingColor(p.accent).OnClick(a.dismissUpdateBanner)
-		if later.Pressed() {
-			later.Background(p.pressed)
-		} else if later.Hovered() {
-			later.Background(p.hover)
-		}
-		later.Children(func() {
-			ui.Text(c, "稍后").FontSize(11.5).FontWeight(550).TextColor(p.secondary).SingleLine()
-		})
+		horizontalRule(c, p)
 	})
-	horizontalRule(c, p)
 	return true
 }
 
@@ -410,15 +489,24 @@ func (a *workspace) mobileHeader(c *ui.Context, p palette, side bool) {
 		if a.bookID != "" && !side {
 			switch a.page {
 			case libraryScreen:
-				pillButton(c, p, "返回", icArrowLeft, false, a.editing(), func() { a.page = browse })
+				pillButton(c, p, "返回", icArrowLeft, false, a.editing(), func() {
+					a.pageDir = -1
+					a.page = browse
+				})
 			case detail:
 				target := browse
 				if a.prevPage == libraryScreen {
 					target = libraryScreen
 				}
-				pillButton(c, p, "返回", icArrowLeft, false, a.editing(), func() { a.page = target })
+				pillButton(c, p, "返回", icArrowLeft, false, a.editing(), func() {
+					a.pageDir = -1
+					a.page = target
+				})
 			default:
-				pillButton(c, p, "笔记库", icSidebar, false, a.editing(), func() { a.page = libraryScreen }).Label("笔记本与搜索")
+				pillButton(c, p, "笔记库", icSidebar, false, a.editing(), func() {
+					a.pageDir = 1
+					a.page = libraryScreen
+				}).Label("笔记本与搜索")
 			}
 		}
 		ui.Row(c).AlignItems(ui.Center).Gap(8).Grow(1).MinWidth(0).Children(func() {
@@ -434,7 +522,7 @@ func (a *workspace) mobileHeader(c *ui.Context, p palette, side bool) {
 func (a *workspace) mobileSettingsButton(c *ui.Context, p palette) {
 	disabled := a.editing()
 	b := ui.ButtonBase(c).Label("设置").Size(34, 34).Radius(8).Center().Shrink(0).
-		Disabled(disabled).FocusRingColor(p.accent).OnClick(a.openPreferences)
+		Disabled(disabled).FocusRingColor(p.accent).Transition(trColorMicro).OnClick(a.openPreferences)
 	fg := p.quiet
 	if !disabled {
 		if b.Pressed() {
@@ -447,6 +535,7 @@ func (a *workspace) mobileSettingsButton(c *ui.Context, p palette) {
 	} else {
 		fg = p.quiet.Alpha(.4)
 	}
+	applyPressPose(b, b.Pressed(), disabled)
 	b.Children(func() {
 		ui.Icon(c, icSettings).Size(15, 15).TextColor(fg)
 		if a.hasUpdateBadge() {
@@ -480,15 +569,17 @@ func (a *workspace) sidebar(c *ui.Context, p palette, width float32, showBrandBa
 				Background(p.elevated).Border(1, p.border).
 				InsetShadow(0, 1, 0, 0, p.specular).
 				Shadow(0, 1, 2, 0, p.shadowSoft).
+				Transition(trColorMicro).
 				Disabled(a.editing()).Label("切换笔记本").Children(func() {
 				ui.Icon(c, icBook).Size(14, 14).TextColor(p.accent).Shrink(0)
 				ui.Text(c, a.tree.book.Title).Grow(1).MinWidth(0).SingleLine().Ellipsis("…").
 					FontSize(13).FontWeight(650).LetterSpacing(-0.15).TextColor(p.ink)
 				ui.Icon(c, icChevronDown).Size(13, 13).TextColor(p.quiet).Shrink(0)
 			})
+			applyPressPose(b.Trigger, b.Trigger.Pressed(), a.editing())
 			b.Popup(func(panel ui.Element) {
 				panel.Background(p.elevated).Border(1, p.border).Radius(10).Padding(5).MaxHeight(300).
-					Shadow(0, 10, 30, -6, p.shadow)
+					Shadow(0, 10, 30, -6, p.shadow).Transition(trPopover)
 				ui.Scroll(c).Shrink(1).Gap(2).Children(func() {
 					for _, book := range a.books {
 						active := book.ID == a.bookID
@@ -540,7 +631,11 @@ func (a *workspace) sidebar(c *ui.Context, p palette, width float32, showBrandBa
 				kicker = fmt.Sprintf("搜索结果 · %d", len(searchIDs))
 			}
 		}
-		sectionKicker(c, p, kicker)
+		kickerText := ui.Text(c, kicker).FontSize(11).FontWeight(600).LetterSpacing(0.45).
+			TextColor(p.quiet).Padding(8, 10, 4).Shrink(0)
+		if queryActive || filtering {
+			kickerText.ContentTransition(ctNumeric(false))
+		}
 
 		ui.Scroll(c.Key("sidebar-scroll")).Grow(1).MinHeight(0).FillWidth().Gap(2).Children(func() {
 			if queryActive || filtering {
@@ -582,10 +677,13 @@ func (a *workspace) sidebar(c *ui.Context, p palette, width float32, showBrandBa
 		horizontalRule(c, p)
 		settings := ui.ButtonBase(c).Height(36).FillWidth().Shrink(0).PaddingX(10).Gap(8).
 			AlignItems(ui.Center).Radius(8).Background(p.elevated).Border(1, p.rule).
-			Label("设置").Disabled(a.editing()).OnClick(a.openPreferences)
-		if settings.Hovered() {
+			Label("设置").Disabled(a.editing()).Transition(trColorMicro).OnClick(a.openPreferences)
+		if settings.Pressed() && !a.editing() {
+			settings.Background(p.pressed)
+		} else if settings.Hovered() && !a.editing() {
 			settings.Background(p.hover)
 		}
+		applyPressPose(settings, settings.Pressed(), a.editing())
 		settings.Children(func() {
 			ui.Icon(c, icSettings).Size(15, 15).TextColor(p.quiet)
 			ui.Text(c, "设置").FontSize(13).FontWeight(550).TextColor(p.secondary).Grow(1)
@@ -602,7 +700,8 @@ func (a *workspace) sidebar(c *ui.Context, p palette, width float32, showBrandBa
 func (a *workspace) navItem(c *ui.Context, p palette, label string, icon *ui.SVG, count string, selected bool, onClick func()) {
 	row := ui.ButtonBase(c).FillWidth().MinHeight(36).Padding(0, 10).Gap(8).
 		Justify(ui.Start).AlignItems(ui.Center).Radius(8).
-		Label(label).Disabled(a.editing()).Selected(selected).FocusRingColor(p.accent).OnClick(onClick)
+		Label(label).Disabled(a.editing()).Selected(selected).FocusRingColor(p.accent).
+		Transition(trColorMicro).OnClick(onClick)
 	fg := p.secondary
 	icColor := p.quiet
 	weight := 500
@@ -625,6 +724,7 @@ func (a *workspace) navItem(c *ui.Context, p palette, label string, icon *ui.SVG
 	default:
 		row.Border(1, ui.Color{})
 	}
+	applyPressPose(row, row.Pressed(), a.editing())
 	row.Children(func() {
 		if icon != nil {
 			ui.Icon(c, icon).Size(14, 14).TextColor(icColor).Shrink(0)
@@ -632,7 +732,8 @@ func (a *workspace) navItem(c *ui.Context, p palette, label string, icon *ui.SVG
 		ui.Text(c, label).SingleLine().Ellipsis("…").FontSize(13).FontWeight(weight).LetterSpacing(-0.1).
 			TextColor(fg).Grow(1).MinWidth(0)
 		if count != "" {
-			ui.Text(c, count).FontSize(11).FontWeight(550).FontFeatures("tnum").TextColor(p.quiet).Shrink(0)
+			ui.Text(c, count).FontSize(11).FontWeight(550).FontFeatures("tnum").
+				TextColor(p.quiet).Shrink(0).ContentTransition(ctNumeric(false))
 		}
 	})
 }
@@ -656,7 +757,7 @@ func (a *workspace) filterButton(c *ui.Context, p palette) {
 	}
 	btn := ui.ButtonBase(c.Key("filter-btn")).Height(36).Padding(0, 10).Radius(8).Center().Shrink(0).
 		Label(label).Tooltip("按颜色、标签或附件筛选笔记").Disabled(a.editing()).FocusRingColor(p.accent).
-		Selected(cnt > 0).OnClick(func() { a.filterPopoverOpen = !a.filterPopoverOpen })
+		Selected(cnt > 0).Transition(trColorMicro).OnClick(func() { a.filterPopoverOpen = !a.filterPopoverOpen })
 	fg := p.secondary
 	switch {
 	case cnt > 0 || a.filterPopoverOpen:
@@ -671,12 +772,13 @@ func (a *workspace) filterButton(c *ui.Context, p palette) {
 	default:
 		btn.Background(p.inputBg).Border(1, p.rule)
 	}
+	applyPressPose(btn, btn.Pressed(), a.editing())
 	btn.Children(func() {
-		ui.Text(c, label).FontSize(12).FontWeight(550).TextColor(fg).SingleLine()
+		ui.Text(c, label).FontSize(12).FontWeight(550).TextColor(fg).SingleLine().ContentTransition(ctNumeric(false))
 	})
 	ui.PopoverBase(c.Key("filter-popover"), btn, &a.filterPopoverOpen, func(panel ui.Element) {
 		panel.Width(252).MaxHeight(380).Radius(12).Clip().Background(p.elevated).
-			Border(1, p.border).Shadow(0, 12, 30, -6, p.shadow)
+			Border(1, p.border).Shadow(0, 12, 30, -6, p.shadow).Transition(trPopover)
 		ui.Scroll(c.Key("filter-scroll")).FillWidth().MaxHeight(380).Padding(12).Gap(10).Children(func() {
 			ui.Row(c).FillWidth().AlignItems(ui.Center).Children(func() {
 				ui.Text(c, "筛选笔记").FontSize(12.5).FontWeight(650).TextColor(p.ink).Grow(1)
@@ -690,7 +792,7 @@ func (a *workspace) filterButton(c *ui.Context, p palette) {
 					ui.Text(c, "颜色").FontSize(11).FontWeight(600).TextColor(p.quiet)
 					ui.Row(c).FillWidth().Wrap().Gap(6).Children(func() {
 						allBtn := ui.ButtonBase(c.Key("fcol-all")).Height(24).PaddingX(8).Radius(99).Center().
-							Label("全部颜色").OnClick(func() {
+							Label("全部颜色").Transition(trColorMicro).OnClick(func() {
 							a.filterColorSet, a.filterColor = false, 0
 							a.invalidateSearch()
 						})
@@ -699,6 +801,7 @@ func (a *workspace) filterButton(c *ui.Context, p palette) {
 						} else {
 							allBtn.Background(p.shell).Border(1, p.rule)
 						}
+						applyPressPose(allBtn, allBtn.Pressed(), false)
 						allBtn.Children(func() { ui.Text(c, "全部").FontSize(11).TextColor(p.secondary) })
 						for _, ci := range usedColors {
 							ci := ci
@@ -708,7 +811,7 @@ func (a *workspace) filterButton(c *ui.Context, p palette) {
 							}
 							sel := a.filterColorSet && a.filterColor == ci
 							sw := ui.ButtonBase(c.Key(fmt.Sprintf("fcol-%d", ci))).Size(24, 24).Radius(99).
-								Center().Label(fmt.Sprintf("筛选颜色 %d", ci)).OnClick(func() {
+								Center().Label(fmt.Sprintf("筛选颜色 %d", ci)).Transition(trColorMicro).OnClick(func() {
 								if sel {
 									a.filterColorSet, a.filterColor = false, 0
 								} else {
@@ -716,6 +819,7 @@ func (a *workspace) filterButton(c *ui.Context, p palette) {
 								}
 								a.invalidateSearch()
 							})
+							applySelectScalePose(sw, sel, sw.Pressed())
 							sw.Children(func() {
 								dot := ui.Box(c).Size(16, 16).Radius(99).Background(ct.accent)
 								if sel {
@@ -735,7 +839,7 @@ func (a *workspace) filterButton(c *ui.Context, p palette) {
 							tag := tag
 							sel := a.filterTag == tag
 							pill := ui.ButtonBase(c.Key("ftag-"+tag)).Height(24).Padding(0, 8).Radius(99).
-								Center().Label("#"+tag).OnClick(func() { a.applyTagFilter(tag) })
+								Center().Label("#"+tag).Transition(trColorMicro).OnClick(func() { a.applyTagFilter(tag) })
 							fg := p.secondary
 							if sel {
 								pill.Background(p.tint).Border(1, p.tintBorder)
@@ -743,6 +847,7 @@ func (a *workspace) filterButton(c *ui.Context, p palette) {
 							} else {
 								pill.Background(p.shell).Border(1, p.rule)
 							}
+							applyPressPose(pill, pill.Pressed(), false)
 							pill.Children(func() { ui.Text(c, "#"+tag).FontSize(11).TextColor(fg).SingleLine() })
 						}
 					})
@@ -772,7 +877,8 @@ func (a *workspace) searchNavItem(c *ui.Context, p palette, label, subtitle stri
 	}
 	row := ui.ButtonBase(c).FillWidth().MinHeight(46).Padding(6, 10).Gap(2).
 		Justify(ui.Center).Radius(8).
-		Label(label).Disabled(a.editing()).Selected(selected).FocusRingColor(p.accent).OnClick(onClick)
+		Label(label).Disabled(a.editing()).Selected(selected).FocusRingColor(p.accent).
+		Transition(trColorMicro).OnClick(onClick)
 	fg := p.secondary
 	weight := 500
 	switch {
@@ -791,6 +897,7 @@ func (a *workspace) searchNavItem(c *ui.Context, p palette, label, subtitle stri
 	default:
 		row.Border(1, ui.Color{})
 	}
+	applyPressPose(row, row.Pressed(), a.editing())
 	row.Children(func() {
 		ui.Column(c).FillWidth().Gap(2).Children(func() {
 			ui.Text(c, label).SingleLine().Ellipsis("…").FontSize(13).FontWeight(weight).LetterSpacing(-0.1).TextColor(fg)
@@ -800,6 +907,7 @@ func (a *workspace) searchNavItem(c *ui.Context, p palette, label, subtitle stri
 }
 
 func (a *workspace) selectScope(id string) {
+	a.pageDir = -1
 	a.scope, a.query, a.page = id, "", browse
 	a.cardMenuOpen = false
 	a.outlineScroll = ui.ScrollState{}
@@ -816,26 +924,26 @@ func (a *workspace) noteModal(c *ui.Context, p palette, paneW, paneH float32) {
 	modalW := min(maxW, clamp(paneW-96, min(maxW, 540), 820))
 	maxH := max(160, paneH-16)
 	modalH := min(maxH, clamp(paneH-64, min(maxH, 420), 740))
-	ui.Box(c.Key("note-modal-layer")).Absolute().Left(0).Top(0).Right(0).Bottom(0).ZIndex(10).Center().Children(func() {
-		// Translucent scrim backdrop dismisses the modal when clicked outside.
-		ui.ButtonBase(c.Key("note-modal-scrim")).Absolute().Left(0).Top(0).Right(0).Bottom(0).
-			Label("关闭笔记卡片").Background(p.scrim).
-			OnClick(func() {
-				if a.editing() {
-					a.requestCancelEdit()
-				} else {
-					a.page = browse
-				}
-			})
-
-		// Centered floating editorial card
-		ui.Column(c.Key("note-modal-card")).ZIndex(11).Width(modalW).Height(modalH).Radius(16).Clip().
-			Background(p.surface).Border(1, p.border).
-			InsetShadow(0, 1, 0, 0, p.specular).
-			Shadow(0, 24, 60, -14, p.modalShadow).
-			Shadow(0, 4, 14, -2, p.shadow).Children(func() {
-			a.readerPanel(c, p, modalW, modalH, true, true)
+	// Translucent scrim backdrop dismisses the modal when clicked outside.
+	ui.ButtonBase(c.Key("note-modal-scrim")).Absolute().Left(0).Top(0).Right(0).Bottom(0).
+		Label("关闭笔记卡片").Background(p.scrim).Transition(trScrim).
+		OnClick(func() {
+			if a.editing() {
+				a.requestCancelEdit()
+			} else {
+				a.pageDir = -1
+				a.page = browse
+			}
 		})
+
+	// Centered floating editorial card
+	ui.Column(c.Key("note-modal-card")).ZIndex(11).Width(modalW).Height(modalH).Radius(16).Clip().
+		Background(p.surface).Border(1, p.border).
+		InsetShadow(0, 1, 0, 0, p.specular).
+		Shadow(0, 24, 60, -14, p.modalShadow).
+		Shadow(0, 4, 14, -2, p.shadow).
+		Transition(trModalCard).Children(func() {
+		a.readerPanel(c, p, modalW, modalH, true, true)
 	})
 }
 
@@ -878,15 +986,22 @@ func (a *workspace) readerPanel(c *ui.Context, p palette, width, height float32,
 						ancTrail := slices.Clone(trail[:i+1])
 						crumb := ui.ButtonBase(c.Key("crumb-"+ancID)).Label("跳转到"+noteTitle(a.tree.notes[ancID])).
 							Height(30).Padding(0, 6).Radius(6).AlignItems(ui.Center).Gap(4).
-							Disabled(a.editing()).OnClick(func() {
+							Disabled(a.editing()).Transition(trColorMicro).OnClick(func() {
 							a.setNoteWithTrail(ancID, ancTrail)
+							a.pageDir = 1
 							a.page = detail
 						})
 						fg := p.quiet
-						if crumb.Hovered() && !a.editing() {
-							crumb.Background(p.hover)
-							fg = p.ink
+						if !a.editing() {
+							if crumb.Pressed() {
+								crumb.Background(p.pressed)
+								fg = p.ink
+							} else if crumb.Hovered() {
+								crumb.Background(p.hover)
+								fg = p.ink
+							}
 						}
+						applyPressPose(crumb, crumb.Pressed(), a.editing())
 						crumb.Children(func() {
 							ui.Text(c, noteTitle(a.tree.notes[ancID])).FontSize(12).FontWeight(500).
 								TextColor(fg).SingleLine().Ellipsis("…").Shrink(1)
@@ -908,7 +1023,10 @@ func (a *workspace) readerPanel(c *ui.Context, p palette, width, height float32,
 			}
 			if showClose {
 				ui.Box(c).Width(1).Height(18).Background(p.rule).Shrink(0)
-				iconButton(c, p, icClose, "关闭笔记卡片", false, a.editing(), func() { a.page = browse })
+				iconButton(c, p, icClose, "关闭笔记卡片", false, a.editing(), func() {
+					a.pageDir = -1
+					a.page = browse
+				})
 			}
 		})
 		horizontalRule(c, p)
@@ -925,7 +1043,7 @@ func (a *workspace) readerPanel(c *ui.Context, p palette, width, height float32,
 			titleSize = 26
 		}
 		ui.Scroll(c.Key("reader-scroll")).Grow(1).MinHeight(0).FillWidth().TrackScroll(&a.readerScroll).
-			Padding(26, padX, 36).Gap(18).Children(func() {
+			Padding(26, padX, 36).Gap(18).Transition(trCrossfade).Children(func() {
 			hasPage := n.Page != nil && *n.Page > 0
 			bookTitle := strings.TrimSpace(n.BookTitle)
 			if hasPage || bookTitle != "" {
@@ -940,7 +1058,7 @@ func (a *workspace) readerPanel(c *ui.Context, p palette, width, height float32,
 							btn := ui.ButtonBase(c.Key("reader-page-jump")).Height(jumpH).Padding(0, 10).Radius(99).
 								AlignItems(ui.Center).Gap(5).Shrink(0).
 								Label(pageLabel + " ↗").Disabled(a.editing()).FocusRingColor(p.accent).
-								OnClick(func() { a.jumpToNotePDF(n) })
+								Transition(trColorMicro).OnClick(func() { a.jumpToNotePDF(n) })
 							bg, bdr, fg := p.tint, p.tintBorder, p.accent
 							if !a.editing() {
 								if btn.Pressed() {
@@ -949,6 +1067,7 @@ func (a *workspace) readerPanel(c *ui.Context, p palette, width, height float32,
 									bg = p.hover
 								}
 							}
+							applyPressPose(btn, btn.Pressed(), a.editing())
 							btn.Background(bg).Border(1, bdr).Children(func() {
 								ui.Icon(c, icPage).Size(11, 11).TextColor(fg)
 								ui.Text(c, pageLabel+" ↗").FontSize(11).FontWeight(600).
@@ -985,10 +1104,11 @@ func (a *workspace) readerPanel(c *ui.Context, p palette, width, height float32,
 				if !a.revealedNotes[n.ID] {
 					occlude := ui.ButtonBase(c.Key("recite-detail-reveal")).FillWidth().MinHeight(104).
 						Radius(10).Center().Background(p.tint).Border(1, p.tintBorder).
-						Label("点击揭晓正文").OnClick(func() {
+						Label("点击揭晓正文").Transition(trCrossfade).OnClick(func() {
 						a.setNoteRevealed(n.ID, true)
 						hapticLight()
 					})
+					applyPressPose(occlude, occlude.Pressed(), false)
 					occlude.Children(func() {
 						ui.Column(c).Center().Gap(4).Children(func() {
 							ui.Text(c, "背诵模式：已隐藏正文与附图").FontSize(13).FontWeight(600).TextColor(p.accent)
@@ -996,10 +1116,13 @@ func (a *workspace) readerPanel(c *ui.Context, p palette, width, height float32,
 						})
 					})
 				} else {
-					a.noteContent(c, p, n, width-padX*2-2)
-					pillButton(c, p, "重新遮盖", icBook, false, false, func() {
-						a.setNoteRevealed(n.ID, false)
-					}).Height(26)
+					ui.Column(c.Key("recite-detail-revealed")).FillWidth().Gap(18).Shrink(0).
+						Transition(trCrossfade).Children(func() {
+						a.noteContent(c, p, n, width-padX*2-2)
+						pillButton(c, p, "重新遮盖", icBook, false, false, func() {
+							a.setNoteRevealed(n.ID, false)
+						}).Height(26)
+					})
 				}
 			} else {
 				a.noteContent(c, p, n, width-padX*2-2)
@@ -1034,7 +1157,7 @@ func (a *workspace) readerPanel(c *ui.Context, p palette, width, height float32,
 								chip := ui.ButtonBase(c.Key("link-"+targetID)).Height(chipH).Padding(0, 11).Radius(8).
 									AlignItems(ui.Center).Gap(4).Shrink(0).
 									Label("跳转到关联笔记 " + targetTitle).Disabled(a.editing()).FocusRingColor(p.accent).
-									OnClick(func() { a.openNote(targetID) })
+									Transition(trColorMicro).OnClick(func() { a.openNote(targetID) })
 								bg, bdr, fg := p.shell, p.rule, p.secondary
 								if !a.editing() {
 									if chip.Pressed() {
@@ -1043,6 +1166,7 @@ func (a *workspace) readerPanel(c *ui.Context, p palette, width, height float32,
 										bg, bdr, fg = p.tint, p.tintBorder, p.accent
 									}
 								}
+								applyPressPose(chip, chip.Pressed(), a.editing())
 								chip.Background(bg).Border(1, bdr).Children(func() {
 									ui.Text(c, targetTitle).FontSize(12).FontWeight(550).
 										TextColor(fg).SingleLine().Ellipsis("…").MaxWidth(260)
@@ -1096,7 +1220,8 @@ func (a *workspace) readerPanel(c *ui.Context, p palette, width, height float32,
 func (a *workspace) childRow(c *ui.Context, p palette, label string, onClick func()) {
 	row := ui.ButtonBase(c).FillWidth().MinHeight(38).Padding(0, 12).Gap(8).
 		Justify(ui.SpaceBetween).AlignItems(ui.Center).Radius(8).
-		Label(label).Disabled(a.editing()).FocusRingColor(p.accent).OnClick(onClick)
+		Label(label).Disabled(a.editing()).FocusRingColor(p.accent).
+		Transition(trColorMicro).OnClick(onClick)
 	fg := p.ink
 	if row.Pressed() {
 		row.Background(p.pressed).Border(1, p.rule)
@@ -1105,6 +1230,7 @@ func (a *workspace) childRow(c *ui.Context, p palette, label string, onClick fun
 	} else {
 		row.Background(p.shell).Border(1, p.rule)
 	}
+	applyPressPose(row, row.Pressed(), a.editing())
 	row.Children(func() {
 		ui.Text(c, label).SingleLine().Ellipsis("…").FontSize(13).FontWeight(550).LetterSpacing(-0.1).
 			TextColor(fg).Grow(1).MinWidth(0)
@@ -1170,10 +1296,15 @@ func (a *workspace) addImage(c *ui.Context, p palette, ref, label string, width 
 	card := ui.ButtonBase(c.Key(ref)).Label("放大"+label).AlignSelf(ui.Start).Shrink(0).Radius(10).
 		Background(ui.Hex("#ffffff")).Border(1, p.rule).Padding(10).
 		Shadow(0, 2, 8, -2, p.shadowSoft).
-		OnClick(func() { a.preview = ref })
+		Transition(trColorMicro).
+		OnClick(func() {
+			a.previewDir = 0
+			a.preview = ref
+		})
 	if card.Hovered() {
 		card.Border(1, p.accent.Alpha(.5)).Shadow(0, 4, 14, -2, p.shadow)
 	}
+	applyPressPose(card, card.Pressed(), false)
 	card.Children(func() {
 		ui.Box(c).Size(imgW, imgH).Draw(func(p *ui.Painter, rect ui.Rect) {
 			a.paintMediaThumbnail(p, rect, ref)
@@ -1205,6 +1336,11 @@ func (a *workspace) stepPreviewImage(delta int) {
 	if len(imgs) <= 1 {
 		return
 	}
+	if delta < 0 {
+		a.previewDir = -1
+	} else if delta > 0 {
+		a.previewDir = 1
+	}
 	idx := slices.Index(imgs, a.preview)
 	if idx < 0 {
 		idx = 0
@@ -1229,72 +1365,112 @@ func (a *workspace) imageView(c *ui.Context, p palette, width, height float32) {
 	closePreview := func() {
 		a.preview = ""
 		a.previewZoom = 1
+		a.previewDir = 0
 	}
-	ui.Row(c).Height(52).FillWidth().PaddingX(16).Gap(8).AlignItems(ui.Center).Background(p.surface).Children(func() {
-		pillButton(c, p, "返回", icArrowLeft, true, false, closePreview)
-		if len(imgs) > 1 {
-			designToolbarButton(c, p, icChevronLeft, "上一张", btnSz, false, false, func() { a.stepPreviewImage(-1) })
-			ui.Text(c, fmt.Sprintf("%d / %d", imgIdx+1, len(imgs))).FontSize(12.5).FontWeight(550).
-				FontFeatures("tnum").TextColor(p.secondary).SingleLine()
-			designToolbarButton(c, p, icChevronRight, "下一张", btnSz, false, false, func() { a.stepPreviewImage(1) })
-		}
-		ui.Box(c).Grow(1).MinWidth(0)
-		designToolbarButton(c, p, icMinus, "缩小图片", btnSz, false, a.previewZoom <= 0.5, func() {
-			a.previewZoom = clamp(a.previewZoom/1.25, 0.5, 4)
-		})
-		pctBtn := ui.ButtonBase(c.Key("img-zoom-reset")).Height(btnSz).MinWidth(46).PaddingX(6).Radius(7).Center().
-			Label("重置图片缩放").Tooltip("重置为适应尺寸").OnClick(func() { a.previewZoom = 1 })
-		if pctBtn.Pressed() {
-			pctBtn.Background(p.pressed)
-		} else if pctBtn.Hovered() {
-			pctBtn.Background(p.hover)
-		}
-		pctBtn.Children(func() {
-			ui.Text(c, fmt.Sprintf("%d%%", int(a.previewZoom*100+.5))).FontSize(12).FontWeight(600).
-				FontFeatures("tnum").TextColor(p.secondary).SingleLine()
-		})
-		designToolbarButton(c, p, icPlus, "放大图片", btnSz, false, a.previewZoom >= 4, func() {
-			a.previewZoom = clamp(a.previewZoom*1.25, 0.5, 4)
-		})
-	})
-	horizontalRule(c, p)
-	if bitmap == nil {
-		ui.ButtonBase(c.Key("img-backdrop-loading")).Grow(1).FillWidth().Center().Background(p.canvas).
-			Label("关闭图片预览").OnClick(closePreview).Children(func() {
-			message := "正在加载原图…"
-			if ready {
-				message = "无法加载原图"
+
+	ui.ButtonBase(c.Key("img-backdrop")).Absolute().Fill().ZIndex(0).Background(p.canvas).
+		Label("关闭图片预览").Transition(trScrim).OnClick(closePreview)
+
+	ui.Column(c.Key("img-toolbar")).Absolute().Top(0).Left(0).Right(0).ZIndex(2).
+		Transition(trScrim).Children(func() {
+		ui.Row(c).Height(52).FillWidth().PaddingX(16).Gap(8).AlignItems(ui.Center).Background(p.surface).Children(func() {
+			pillButton(c, p, "返回", icArrowLeft, true, false, closePreview)
+			if len(imgs) > 1 {
+				designToolbarButton(c, p, icChevronLeft, "上一张", btnSz, false, false, func() { a.stepPreviewImage(-1) })
+				ui.Text(c, fmt.Sprintf("%d / %d", imgIdx+1, len(imgs))).FontSize(12.5).FontWeight(550).
+					FontFeatures("tnum").TextColor(p.secondary).SingleLine().ContentTransition(ctNumeric(a.previewDir < 0))
+				designToolbarButton(c, p, icChevronRight, "下一张", btnSz, false, false, func() { a.stepPreviewImage(1) })
 			}
-			ui.Text(c, message).FontSize(13).TextColor(p.quiet)
+			ui.Box(c).Grow(1).MinWidth(0)
+			designToolbarButton(c, p, icMinus, "缩小图片", btnSz, false, a.previewZoom <= 0.5, func() {
+				a.previewZoom = clamp(a.previewZoom/1.25, 0.5, 4)
+			})
+			pctBtn := ui.ButtonBase(c.Key("img-zoom-reset")).Height(btnSz).MinWidth(46).PaddingX(6).Radius(7).Center().
+				Label("重置图片缩放").Tooltip("重置为适应尺寸").Transition(trColorMicro).OnClick(func() { a.previewZoom = 1 })
+			if pctBtn.Pressed() {
+				pctBtn.Background(p.pressed)
+			} else if pctBtn.Hovered() {
+				pctBtn.Background(p.hover)
+			}
+			applyPressPose(pctBtn, pctBtn.Pressed(), false)
+			lastZoom := ui.Local(pctBtn, "last-zoom", func() float32 { return a.previewZoom })
+			zoomDown := a.previewZoom < *lastZoom
+			*lastZoom = a.previewZoom
+			pctBtn.Children(func() {
+				ui.Text(c, fmt.Sprintf("%d%%", int(a.previewZoom*100+.5))).FontSize(12).FontWeight(600).
+					FontFeatures("tnum").TextColor(p.secondary).SingleLine().ContentTransition(ctNumeric(zoomDown))
+			})
+			designToolbarButton(c, p, icPlus, "放大图片", btnSz, false, a.previewZoom >= 4, func() {
+				a.previewZoom = clamp(a.previewZoom*1.25, 0.5, 4)
+			})
+		})
+		horizontalRule(c, p)
+	})
+
+	area := ui.Box(c.Key("img-preview-area")).Absolute().Top(53).Left(0).Right(0).Bottom(0).ZIndex(1).Center()
+	jumpZoom := ui.Local(area, "zoom-jump", func() bool { return false })
+	lastPreview := ui.Local(area, "last-preview", func() string { return "" })
+	if *lastPreview != a.preview {
+		*lastPreview = a.preview
+		*jumpZoom = true
+	}
+	if bitmap == nil {
+		area.Children(func() {
+			ui.Row(c.Key("img-loading")).Gap(8).AlignItems(ui.Center).Transition(trCrossfade).Children(func() {
+				if !ready {
+					ui.Spinner(c).Size(15, 15).TextColor(p.quiet).Shrink(0)
+				}
+				message := "正在加载原图…"
+				if ready {
+					message = "无法加载原图"
+				}
+				ui.Text(c, message).FontSize(13).TextColor(p.quiet)
+			})
 		})
 		return
 	}
+	area.HandleInput(func(ev ui.InputEvent) bool {
+		if ev.Kind == ui.InputScroll && ev.DY != 0 {
+			factor := float32(1.12)
+			if ev.DY > 0 {
+				factor = 1 / 1.12
+			}
+			a.previewZoom = clamp(a.previewZoom*factor, 0.5, 4)
+			*jumpZoom = true
+			return true
+		}
+		return false
+	})
+	var renderZoom float32
+	if *jumpZoom {
+		*jumpZoom = false
+		renderZoom = area.Jump("preview-zoom", a.previewZoom)
+	} else {
+		renderZoom = area.AnimateTo("preview-zoom", a.previewZoom, animControl)
+	}
 	w, h := bitmap.Size()
 	baseSize := max(1, min(width-56, float32(w)))
-	size := max(24, baseSize*a.previewZoom)
+	size := max(24, baseSize*renderZoom)
+	imgW, imgH := size, size*float32(h)/float32(w)
 	paperBg := ui.Hex("#ffffff")
 	if p.dark {
 		paperBg = ui.Hex("#e8eaef")
 	}
-	ui.Box(c.Key("img-preview-area")).Grow(1).FillWidth().Background(p.canvas).
-		HandleInput(func(ev ui.InputEvent) bool {
-			if ev.Kind == ui.InputScroll && ev.DY != 0 {
-				factor := float32(1.12)
-				if ev.DY > 0 {
-					factor = 1 / 1.12
-				}
-				a.previewZoom = clamp(a.previewZoom*factor, 0.5, 4)
-				return true
-			}
-			return false
-		}).Children(func() {
-		ui.Scroll(c).Fill().AlignItems(ui.Center).Children(func() {
-			ui.ButtonBase(c.Key("img-backdrop")).FillWidth().MinHeight(max(200, height-53)).
-				Center().Padding(24).Label("关闭图片预览").OnClick(closePreview).Children(func() {
+	dir := float32(a.previewDir)
+	area.Children(func() {
+		ui.Scroll(c.Key("img-scroll")).Fill().AlignItems(ui.Center).Children(func() {
+			ui.Box(c.Key("img-scroll-center")).FillWidth().MinHeight(max(200, height-53)).
+				Center().Padding(24).Children(func() {
 				ui.ButtonBase(c.Key("img-card-frame")).MinHeight(min(120, height-96)).Padding(14).Radius(12).
 					Background(paperBg).Border(1, p.rule).Shadow(0, 12, 32, -8, p.shadow).
-					Label("笔记原图").OnClick(func() {}).Children(func() {
-					ui.Image(c, bitmap).Size(size, size*float32(h)/float32(w)).Fit(ui.Contain).Label("笔记原图")
+					Label("笔记原图").Transition(trModalCard).OnClick(func() {}).Children(func() {
+					ui.Box(c.Key("img-slide-stage")).Size(imgW, imgH).Clip().
+						ChildExit(childExitSlide(dir)).Children(func() {
+						ui.Box(c.Key("img-slide-"+a.preview)).Absolute().Fill().
+							Transition(trPageSlide(dir)).Children(func() {
+							ui.Image(c, bitmap).Fill().Fit(ui.Contain).Label("笔记原图")
+						})
+					})
 				})
 			})
 		})
@@ -1317,8 +1493,8 @@ func (a *workspace) editor(c *ui.Context, p palette, availH float32) {
 		pad = 16
 	}
 	bodyH := max(96, availH-2*pad-280)
-	ui.Column(c).FillWidth().Grow(1).MinHeight(0).Children(func() {
-		ui.Scroll(c.Key("editor")).Grow(1).MinHeight(0).FillWidth().Padding(pad, pad, 12).Gap(10).Children(func() {
+	ui.Column(c.Key("editor-pane")).FillWidth().Grow(1).MinHeight(0).Transition(trCrossfade).Children(func() {
+		ui.Scroll(c.Key("editor")).Grow(1).MinHeight(0).FillWidth().Padding(pad, pad, 12).Gap(10).Transition(trCrossfade).Children(func() {
 			ui.Column(c).FillWidth().Gap(3).Children(func() {
 				ui.Text(c, heading).FontSize(19).FontWeight(700).LetterSpacing(-0.35).TextColor(p.ink)
 				if parentTitle != "" {
@@ -1326,8 +1502,11 @@ func (a *workspace) editor(c *ui.Context, p palette, availH float32) {
 				}
 			})
 			if a.discardPrompt {
-				ui.Row(c.Key("editor-discard-guard")).FillWidth().Padding(10, 12).Gap(8).Radius(10).
-					AlignItems(ui.Center).Background(p.dangerWash).Border(1, p.danger.Alpha(.3)).Children(func() {
+				guard := ui.Row(c.Key("editor-discard-guard")).FillWidth().Padding(10, 12).Gap(8).Radius(10).
+					AlignItems(ui.Center).Background(p.dangerWash).Border(1, p.danger.Alpha(.3)).
+					Transition(trPanelSlideV)
+				applyErrorShake(guard, a.discardShakeRun)
+				guard.Children(func() {
 					ui.Icon(c, icAlert).Size(15, 15).TextColor(p.danger).Shrink(0)
 					ui.Text(c, "有未保存的修改，确定放弃吗？").FontSize(12.5).FontWeight(550).TextColor(p.danger).Grow(1).MinWidth(0)
 					pillButton(c, p, "继续编辑", nil, true, false, func() { a.discardPrompt = false }).Height(28)
@@ -1358,12 +1537,13 @@ func (a *workspace) editor(c *ui.Context, p palette, availH float32) {
 				}
 				ui.Row(c).FillWidth().Wrap().Gap(6).AlignItems(ui.Center).Children(func() {
 					noneBtn := ui.ButtonBase(c.Key("ed-col-none")).Height(26).PaddingX(10).Radius(99).
-						Center().Label("无色").OnClick(func() { a.draftColorSet, a.draftColor = false, 0 })
+						Center().Label("无色").Transition(trColorMicro).OnClick(func() { a.draftColorSet, a.draftColor = false, 0 })
 					if !a.draftColorSet {
 						noneBtn.Background(p.tint).Border(1, p.tintBorder)
 					} else {
 						noneBtn.Background(p.inputBg).Border(1, p.border)
 					}
+					applyPressPose(noneBtn, noneBtn.Pressed(), false)
 					noneBtn.Children(func() { ui.Text(c, "无色").FontSize(11.5).TextColor(p.secondary) })
 					for _, ci := range swatches {
 						ci := ci
@@ -1373,9 +1553,10 @@ func (a *workspace) editor(c *ui.Context, p palette, availH float32) {
 						}
 						sel := a.draftColorSet && a.draftColor == ci
 						btn := ui.ButtonBase(c.Key(fmt.Sprintf("ed-col-%d", ci))).Size(26, 26).Radius(99).
-							Center().Label(fmt.Sprintf("卡片颜色 %d", ci)).OnClick(func() {
+							Center().Label(fmt.Sprintf("卡片颜色 %d", ci)).Transition(trColorMicro).OnClick(func() {
 							a.draftColorSet, a.draftColor = true, ci
 						})
+						applySelectScalePose(btn, sel, btn.Pressed())
 						btn.Children(func() {
 							dot := ui.Box(c).Size(18, 18).Radius(99).Background(ct.accent)
 							if sel {
@@ -1400,7 +1581,7 @@ func (a *workspace) editor(c *ui.Context, p palette, availH float32) {
 							tag := tag
 							has := slices.Contains(current, tag)
 							pill := ui.ButtonBase(c.Key("ed-tag-"+tag)).Height(22).Padding(0, 8).Radius(99).
-								Center().Label("切换标签 " + tag).OnClick(func() {
+								Center().Label("切换标签 " + tag).Transition(trColorMicro).OnClick(func() {
 								cur := parseTagsInput(a.draftTags)
 								if slices.Contains(cur, tag) {
 									cur = slices.DeleteFunc(cur, func(v string) bool { return v == tag })
@@ -1416,6 +1597,7 @@ func (a *workspace) editor(c *ui.Context, p palette, availH float32) {
 							} else {
 								pill.Background(p.shell).Border(1, p.rule)
 							}
+							applyPressPose(pill, pill.Pressed(), false)
 							pill.Children(func() { ui.Text(c, "#"+tag).FontSize(11).TextColor(fg).SingleLine() })
 						}
 					})
@@ -1432,7 +1614,8 @@ func (a *workspace) editor(c *ui.Context, p palette, availH float32) {
 					}
 					moveBtn := ui.ButtonBase(c.Key("ed-move-parent")).Height(30).Padding(0, 10).Radius(8).
 						Background(p.inputBg).Border(1, p.border).Center().
-						Label("移动归属：" + parentLabel)
+						Label("移动归属：" + parentLabel).Transition(trColorMicro)
+					applyPressPose(moveBtn, moveBtn.Pressed(), false)
 					moveBtn.Children(func() {
 						ui.Row(c).Gap(5).AlignItems(ui.Center).Children(func() {
 							ui.Text(c, parentLabel).FontSize(12.5).TextColor(p.ink).SingleLine().Ellipsis("…").MaxWidth(220)
