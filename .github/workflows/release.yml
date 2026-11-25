@@ -54,6 +54,21 @@ jobs:
           echo "version=$ver" >> "$GITHUB_OUTPUT"
           echo "prerelease=$prerelease" >> "$GITHUB_OUTPUT"
 
+  test:
+    needs: prepare
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Vet and run tests
+        run: |
+          go vet ./...
+          go test -count=1 ./...
+
   build-macos:
     needs: prepare
     runs-on: macos-latest
@@ -65,6 +80,12 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
+
+      - uses: actions/cache@v4
+        with:
+          path: ~/Library/Caches/mygo
+          key: macos-mygo-${{ hashFiles('go.sum') }}
+          restore-keys: macos-mygo-
 
       - name: Sync mygo.json version
         env:
@@ -79,12 +100,6 @@ jobs:
               json.dump(data, f, ensure_ascii=False, indent=2)
               f.write("\n")
           PY
-
-      - name: Run vet and unit tests
-        run: |
-          sh scripts/build-ink.sh
-          go vet ./...
-          go test -count=1 ./...
 
       - name: Build macOS app & DMG
         env:
@@ -125,6 +140,14 @@ jobs:
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: "8.0.x"
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~\AppData\Local\mygo
+            ~\.nuget\packages
+          key: windows-mygo-${{ hashFiles('go.sum', 'scripts/render-pdf-win.cs') }}
+          restore-keys: windows-mygo-
 
       - name: Sync mygo.json version
         shell: pwsh
@@ -181,10 +204,20 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - uses: actions/setup-java@v4
+      - uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: "17"
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+            ~/.cache/mygo
+            .mygo
+          key: android-gradle-mygo-${{ hashFiles('go.sum', 'internal/androidopen/**') }}
+          restore-keys: android-gradle-mygo-
 
       - name: Ensure Android NDK
         shell: bash
@@ -288,7 +321,7 @@ jobs:
           if-no-files-found: error
 
   publish:
-    needs: [prepare, build-macos, build-windows, build-android]
+    needs: [prepare, test, build-macos, build-windows, build-android]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
