@@ -159,18 +159,31 @@ func sectionKicker(c *ui.Context, p palette, text string) {
 		TextColor(p.quiet).Padding(8, 10, 4).Shrink(0)
 }
 
+func hasDigit(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] >= '0' && s[i] <= '9' {
+			return true
+		}
+	}
+	return false
+}
+
 func badgePill(c *ui.Context, p palette, text string) {
 	ui.Row(c).Height(20).Padding(0, 7).Radius(99).Center().Shrink(0).
 		Background(p.badgeBg).Border(1, p.rule).Children(func() {
-		ui.Text(c, text).FontSize(11).FontWeight(550).FontFeatures("tnum").
+		t := ui.Text(c, text).FontSize(11).FontWeight(550).FontFeatures("tnum").
 			TextColor(p.quiet).SingleLine()
+		if hasDigit(text) {
+			t.ContentTransition(ctNumeric(false))
+		}
 	})
 }
 
 // primaryButton renders a Linear-inspired gradient CTA with specular top bevel.
 func primaryButton(c *ui.Context, p palette, label string, icon *ui.SVG, disabled bool, pressed func()) ui.Element {
 	b := ui.ButtonBase(c).Label(label).MinHeight(36).Padding(0, 14).Radius(8).Center().Gap(6).
-		Disabled(disabled).FocusRingColor(p.accent).OnClick(pressed)
+		Disabled(disabled).FocusRingColor(p.accent).OnClick(pressed).
+		Transition(trColorMicro)
 	if disabled {
 		b.Background(p.accent.Alpha(.45))
 	} else {
@@ -182,6 +195,7 @@ func primaryButton(c *ui.Context, p palette, label string, icon *ui.SVG, disable
 			b.Background(p.accentBot)
 		}
 	}
+	applyPressPose(b, b.Pressed(), disabled)
 	b.Children(func() {
 		if icon != nil {
 			ui.Icon(c, icon).Size(14, 14).TextColor(p.onAccent)
@@ -198,7 +212,8 @@ func pillButton(c *ui.Context, p palette, label string, icon *ui.SVG, elevated, 
 		minH = 38
 	}
 	b := ui.ButtonBase(c).Label(label).Tooltip(label).MinHeight(minH).Padding(0, 10).Radius(8).Center().Gap(5).
-		Disabled(disabled).FocusRingColor(p.accent).OnClick(pressed)
+		Disabled(disabled).FocusRingColor(p.accent).OnClick(pressed).
+		Transition(trColorMicro)
 	fg := p.secondary
 	if elevated {
 		fg = p.ink
@@ -217,6 +232,7 @@ func pillButton(c *ui.Context, p palette, label string, icon *ui.SVG, elevated, 
 	} else {
 		fg = p.quiet.Alpha(.45)
 	}
+	applyPressPose(b, b.Pressed(), disabled)
 	b.Children(func() {
 		if icon != nil {
 			ui.Icon(c, icon).Size(14, 14).TextColor(fg)
@@ -233,7 +249,8 @@ func iconButton(c *ui.Context, p palette, icon *ui.SVG, label string, danger, di
 		sz = 38
 	}
 	b := ui.ButtonBase(c).Label(label).Tooltip(label).Size(sz, sz).Radius(8).Center().Shrink(0).
-		Disabled(disabled).FocusRingColor(p.accent).OnClick(pressed)
+		Disabled(disabled).FocusRingColor(p.accent).OnClick(pressed).
+		Transition(trColorMicro)
 	fg := p.quiet
 	if !disabled {
 		if b.Pressed() {
@@ -256,6 +273,7 @@ func iconButton(c *ui.Context, p palette, icon *ui.SVG, label string, danger, di
 	} else {
 		fg = p.quiet.Alpha(.4)
 	}
+	applyPressPose(b, b.Pressed(), disabled)
 	b.Children(func() {
 		ui.Icon(c, icon).Size(15, 15).TextColor(fg)
 	})

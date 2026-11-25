@@ -161,6 +161,19 @@ type workspace struct {
 	toastActionLabel string
 	toastActionFn    func()
 
+	camAnim         cameraSpring
+	pageDir         int8
+	reviewDir       int8
+	reviewStep      uint64
+	previewDir      int8
+	pdfPageDir      int8
+	toastShakeRun   uint64
+	discardShakeRun uint64
+	pdfPageShakeRun uint64
+	maskFades       fadeTracker
+	shapeSnapAt     time.Time
+	shapeSnapKey    string
+
 	pdfPageSaveMu    sync.Mutex
 	pdfPageSaveTimer *time.Timer
 	pendingPDFSave   struct {
@@ -874,6 +887,7 @@ func (a *workspace) showMessage(text string, failed bool) {
 	a.toastActionLabel, a.toastActionFn = "", nil
 	if failed {
 		a.messageUntil = time.Time{}
+		a.toastShakeRun++
 	} else {
 		a.messageUntil = time.Now().Add(4 * time.Second)
 	}
@@ -1755,6 +1769,7 @@ func (a *workspace) requestCancelEdit() {
 		return
 	}
 	a.discardPrompt = true
+	a.discardShakeRun++
 }
 
 func (a *workspace) saveEditor() {
