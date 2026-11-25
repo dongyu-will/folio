@@ -853,6 +853,12 @@ func cleanReleaseNoteLine(ln string) string {
 	if s == "" || strings.HasPrefix(s, "```") {
 		return ""
 	}
+	if strings.HasPrefix(s, "|") && strings.HasSuffix(s, "|") {
+		return ""
+	}
+	if strings.Contains(s, "|") && strings.Trim(s, "|-: ") == "" {
+		return ""
+	}
 	if len(s) >= 3 && (strings.Trim(s, "- ") == "" || strings.Trim(s, "* ") == "" || strings.Trim(s, "_ ") == "") {
 		return ""
 	}

@@ -1522,6 +1522,10 @@ func TestSettingsAboutCompactAndHelpers(t *testing.T) {
 	if !strings.Contains(notes, "• 第一项 说明") || !strings.Contains(notes, "• 第二项") || strings.Contains(notes, "第五项") || !strings.HasSuffix(notes, "…") {
 		t.Fatalf("unexpected formatted release notes: %q", notes)
 	}
+	tableNotes := formatReleaseNotesPreview("### 下载安装\n\n| 平台 | 下载 | 说明 |\n| --- | --- | --- |\n| **macOS** | [folio-0.3.1-arm64.dmg](https://example.com/folio.dmg) | 拖拽到 Applications |\n\n- 修复若干已知问题\n- 优化性能")
+	if strings.Contains(tableNotes, "|") || !strings.Contains(tableNotes, "下载安装") || !strings.Contains(tableNotes, "• 修复若干已知问题") || !strings.Contains(tableNotes, "• 优化性能") {
+		t.Fatalf("unexpected formatted release notes with table: %q", tableNotes)
+	}
 
 	// Verify compact Settings modal layout (< 540px card width) renders and handles clicks cleanly.
 	app := &workspace{store: notebook.NewStore(t.TempDir()), forceTouchUI: true}

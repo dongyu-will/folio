@@ -112,7 +112,7 @@ jobs:
       - name: Collect macOS release artifacts
         run: |
           mkdir -p release-macos
-          for pattern in "*.dmg" "*.tar.gz" "*.delta" "update-*.json" "install.sh"; do
+          for pattern in "*.dmg" "*.tar.gz" "*.delta" "update-*.json"; do
             for f in build/darwin-arm64/$pattern build/$pattern; do
               [ -f "$f" ] && cp "$f" release-macos/
             done
@@ -181,8 +181,7 @@ jobs:
             $_.Name -like "*setup*.exe" -or
             $_.Name -like "*.tar.gz" -or
             $_.Name -like "*.delta" -or
-            $_.Name -like "update-*.json" -or
-            $_.Name -eq "install.ps1"
+            $_.Name -like "update-*.json"
           } | ForEach-Object { Copy-Item $_.FullName -Destination release-windows }
           Get-ChildItem release-windows
 
@@ -349,6 +348,53 @@ jobs:
           fi
           ls -lh
 
+      - name: Generate release download notes
+        shell: bash
+        env:
+          TAG: ${{ needs.prepare.outputs.tag }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import glob, os
+
+          tag = os.environ["TAG"]
+          repo = os.environ["REPO"]
+
+          def first_match(pattern):
+              matches = sorted(glob.glob(os.path.join("dist", pattern)))
+              return os.path.basename(matches[0]) if matches else None
+
+          rows = []
+          dmg = first_match("*.dmg")
+          if dmg:
+              rows.append(("**macOS (Apple Silicon / M 系列)**", dmg, "拖拽到 Applications"))
+          exe = first_match("*setup*.exe")
+          if exe:
+              rows.append(("**Windows (64 位)**", exe, "安装程序"))
+          apk = first_match("*.apk")
+          if apk:
+              rows.append(("**Android (arm64)**", apk, "直接安装"))
+
+          if rows:
+              lines = [
+                  "### 下载安装",
+                  "",
+                  "| 平台 | 下载 | 说明 |",
+                  "| --- | --- | --- |",
+              ]
+              for label, fname, note in rows:
+                  url = f"https://github.com/{repo}/releases/download/{tag}/{fname}"
+                  lines.append(f"| {label} | [{fname}]({url}) | {note} |")
+              lines.extend([
+                  "",
+                  "> 下方 Assets 中的 `.delta`、`.tar.gz`、`update-*.json` 等文件仅用于应用内自动更新，普通用户无需手动下载。校验值见 `SHA256SUMS`。",
+                  "",
+              ])
+              with open("release-downloads.md", "w", encoding="utf-8") as f:
+                  f.write("\n".join(lines))
+          PY
+
       - name: Create & upload GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -359,6 +405,9 @@ jobs:
           set -euo pipefail
           if ! gh release view "$TAG" >/dev/null 2>&1; then
             flags=(--draft --title "$TAG" --generate-notes)
+            if [ -s release-downloads.md ]; then
+              flags+=(--notes "$(cat release-downloads.md)")
+            fi
             if [ "$PRERELEASE" = "true" ]; then
               flags+=(--prerelease)
             fi
