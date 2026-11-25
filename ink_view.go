@@ -71,6 +71,10 @@ type drawingState struct {
 	strokeConsumed   bool
 	canvas           inkLayers
 	pdf              inkLayers
+	shapeSnapAt      time.Time
+	shapeSnapKey     string
+	shapeSnapPoints  []inkPoint
+	shapeSnapWidth   float32
 }
 
 func (d *drawingState) canvasToolActive() bool {
@@ -94,6 +98,8 @@ var dockIcons = [2][8]*ui.SVG{
 
 func (a *workspace) loadDrawing(bookID string) {
 	a.drawing = drawingState{}
+	a.shapeSnapAt = time.Time{}
+	a.shapeSnapKey = ""
 	if a.store == nil || bookID == "" {
 		return
 	}
@@ -210,6 +216,8 @@ func (a *workspace) stepDrawing(undo bool) {
 	*from = (*from)[:last]
 	d.data = next
 	d.lasso, d.selected = nil, nil
+	d.shapeSnapAt, d.shapeSnapPoints = time.Time{}, nil
+	a.shapeSnapAt = time.Time{}
 	if key := diffDrawingPageKey(prevData.Pages, next.Pages); key != "" {
 		if colon := strings.LastIndex(key, ":"); colon > 0 {
 			docID := key[:colon]
@@ -293,6 +301,8 @@ func (a *workspace) inkInput(ev ui.InputEvent, key string, point inkPoint, scale
 		}
 		if ev.Canceled {
 			*gesture = inkGesture{}
+			d.shapeSnapAt, d.shapeSnapPoints = time.Time{}, nil
+			a.shapeSnapAt = time.Time{}
 			return true
 		}
 		points := gesture.stroke.Points
@@ -304,11 +314,15 @@ func (a *workspace) inkInput(ev ui.InputEvent, key string, point inkPoint, scale
 			}
 			if dist >= 1.8 {
 				gesture.lastMove, gesture.regularized, gesture.shapeTried = ev.Time, nil, false
+				d.shapeSnapAt, d.shapeSnapPoints = time.Time{}, nil
+				a.shapeSnapAt = time.Time{}
 			}
 			return true
 		}
 		if distance(point, last)*scale > 4 {
 			gesture.regularized = nil
+			d.shapeSnapAt, d.shapeSnapPoints = time.Time{}, nil
+			a.shapeSnapAt = time.Time{}
 		}
 		if distance(point, last)*scale > 1 {
 			point.Pressure = last.Pressure
@@ -357,6 +371,15 @@ func (a *workspace) checkShape(c *ui.Context) {
 	for i := range g.regularized {
 		g.regularized[i].X /= g.scale
 		g.regularized[i].Y /= g.scale
+	}
+	if len(g.regularized) > 1 && !c.Instant() && !c.Preferences().ReduceMotion {
+		now := c.Now()
+		a.shapeSnapAt = now
+		a.shapeSnapKey = g.key
+		d.shapeSnapAt = now
+		d.shapeSnapKey = g.key
+		d.shapeSnapPoints = slices.Clone(g.regularized)
+		d.shapeSnapWidth = g.stroke.Width
 	}
 }
 
@@ -428,6 +451,25 @@ func (d *drawingState) drawInk(paint *ui.Painter, rect ui.Rect, p palette, key s
 	paintStrokes(paint, rect, p, strokes, active, liveMarker, key, ox, oy, scale, layers)
 	if drawing && gesture.tool == penTool {
 		paintStroke(paint, active, ox, oy, scale, strokeColor(active, p))
+	}
+	const shapeSnapDur = 240 * time.Millisecond
+	if d.shapeSnapKey == key && !d.shapeSnapAt.IsZero() && len(d.shapeSnapPoints) > 1 {
+		if paint.Preferences().ReduceMotion {
+			d.shapeSnapAt = time.Time{}
+			d.shapeSnapPoints = nil
+		} else {
+			elapsed := paint.Now().Sub(d.shapeSnapAt)
+			if elapsed >= 0 && elapsed < shapeSnapDur {
+				t := ui.EaseOut(float32(elapsed) / float32(shapeSnapDur))
+				alpha := 0.55 * (1 - t)
+				haloW := max(2, d.shapeSnapWidth*scale) + 10*t
+				paint.StrokePath(inkPath(d.shapeSnapPoints, ox, oy, scale), haloW, p.accent.Alpha(alpha))
+				paint.AnimationFrame()
+			} else if elapsed >= shapeSnapDur {
+				d.shapeSnapAt = time.Time{}
+				d.shapeSnapPoints = nil
+			}
+		}
 	}
 	if gesture.key == key && len(gesture.stroke.Points) > 0 {
 		switch gesture.tool {
@@ -512,8 +554,8 @@ func (a *workspace) inkDock(c *ui.Context, p palette, mode workspaceMode, width 
 		if a.touchUI() {
 			dockBtnSize = 44
 		}
-		ui.Box(c).Absolute().Left(16).Bottom(16).ZIndex(4).Radius(99).Background(p.elevated).Border(1, p.border).
-			Shadow(0, 4, 12, -2, p.shadow).Children(func() {
+		ui.Box(c.Key("ink-fab")).Absolute().Left(16).Bottom(16).ZIndex(4).Radius(99).Background(p.elevated).Border(1, p.border).
+			Shadow(0, 4, 12, -2, p.shadow).Transition(trFloatingBarStatic).Children(func() {
 			designToolbarButton(c, p, icons[1], "打开笔盒", dockBtnSize, false, a.editing(), func() { d.pdfDockCollapsed = false })
 		})
 		return
@@ -539,18 +581,22 @@ func (a *workspace) inkDock(c *ui.Context, p palette, mode workspaceMode, width 
 		closeSize = min(closeSize, size)
 	}
 	ui.Column(c.Key("ink-dock")).Absolute().Bottom(16).Left(0).Right(0).ZIndex(4).
-		AlignItems(ui.Center).Gap(10).Children(func() {
+		AlignItems(ui.Center).Gap(10).Transition(trFloatingBarStatic).Children(func() {
 		if d.loadErr != nil {
 			errPill := ui.ButtonBase(c.Key("ink-load-retry")).Height(28).PaddingX(12).Radius(14).Center().
 				Background(p.dangerWash).Border(1, p.danger.Alpha(.35)).Label("手写读取异常 · 重试").
+				Transition(trFloatingBarStatic).
 				OnClick(func() { a.loadDrawing(a.bookID) })
+			applyPressPose(errPill, errPill.Pressed(), false)
 			errPill.Children(func() {
 				ui.Text(c, "手写读取异常 · 重试").FontSize(11.5).FontWeight(550).TextColor(p.danger).SingleLine()
 			})
 		} else if d.saveFailed {
 			savePill := ui.ButtonBase(c.Key("ink-save-retry")).Height(28).PaddingX(12).Radius(14).Center().
 				Background(p.dangerWash).Border(1, p.danger.Alpha(.35)).Label("有未保存笔迹 · 重试").
+				Transition(trFloatingBarStatic).
 				OnClick(func() { a.saveDrawing(d.data) })
+			applyPressPose(savePill, savePill.Pressed(), false)
 			savePill.Children(func() {
 				ui.Text(c, "有未保存笔迹 · 重试").FontSize(11.5).FontWeight(550).TextColor(p.danger).SingleLine()
 			})
@@ -612,7 +658,7 @@ func (a *workspace) inkDock(c *ui.Context, p palette, mode workspaceMode, width 
 
 func (a *workspace) inkButton(c *ui.Context, p palette, size, height float32, icon *ui.SVG, label string, active, disabled bool, action func()) {
 	b := ui.ButtonBase(c.Key(label)).Size(size, height).Center().Shrink(0).Radius(8).Label(label).Tooltip(label).
-		FocusRingColor(p.accent).Selected(active).Disabled(disabled).OnClick(action)
+		FocusRingColor(p.accent).Selected(active).Disabled(disabled).Transition(trColorMicro).OnClick(action)
 	fg := p.secondary
 	if active {
 		b.Background(p.tint).Border(1, p.tintBorder)
@@ -620,6 +666,7 @@ func (a *workspace) inkButton(c *ui.Context, p palette, size, height float32, ic
 	} else if b.Hovered() {
 		b.Background(p.hover)
 	}
+	applyPressPose(b, b.Pressed(), disabled)
 	icSize := float32(16)
 	if height >= 36 {
 		icSize = 18
@@ -631,7 +678,9 @@ func (a *workspace) penOptions(c *ui.Context, p palette) {
 	d := &a.drawing
 	touch := a.touchUI()
 	if d.tool == strokeEraser || d.tool == partialEraser {
-		segmentsSized(c, p, touch, []segment[inkTool]{{"整笔橡皮", strokeEraser}, {"局部橡皮", partialEraser}}, d.tool, func(value inkTool) { d.tool = value })
+		ui.Row(c.Key("pen-options")).Transition(trFloatingBarStatic).Children(func() {
+			segmentsSized(c, p, touch, []segment[inkTool]{{"整笔橡皮", strokeEraser}, {"局部橡皮", partialEraser}}, d.tool, func(value inkTool) { d.tool = value })
+		})
 		return
 	}
 	if d.tool != penTool && d.tool != markerTool {
@@ -647,16 +696,19 @@ func (a *workspace) penOptions(c *ui.Context, p palette) {
 	if touch {
 		barH, swBtnW, swBtnH, swDot, wBtnW, wBtnH = 40, 30, 32, 18, 32, 32
 	}
-	ui.Row(c).Height(barH).PaddingX(10).Radius(barH / 2).Gap(5).AlignItems(ui.Center).Background(p.elevated).
-		Border(1, p.border).Shadow(0, 4, 12, -2, p.shadow).Children(func() {
+	ui.Row(c.Key("pen-options")).Height(barH).PaddingX(10).Radius(barH / 2).Gap(5).AlignItems(ui.Center).Background(p.elevated).
+		Border(1, p.border).Shadow(0, 4, 12, -2, p.shadow).Transition(trFloatingBarStatic).Children(func() {
 		for i, label := range labels {
 			color := strokeColor(inkStroke{Color: colors[i]}, p)
-			btn := ui.ButtonBase(c.Key(label)).Size(swBtnW, swBtnH).Center().Label(label).Selected(d.color == i).OnClick(func() {
+			selected := d.color == i
+			btn := ui.ButtonBase(c.Key(label)).Size(swBtnW, swBtnH).Center().Label(label).Selected(selected).
+				Transition(trColorMicro).OnClick(func() {
 				d.color = i
 			})
+			applySelectScalePose(btn, selected, btn.Pressed())
 			btn.Children(func() {
-				sw := ui.Box(c).Size(swDot, swDot).Radius(swDot / 2).Background(color)
-				if d.color == i {
+				sw := ui.Box(c).Size(swDot, swDot).Radius(swDot / 2).Background(color).Transition(trColorMicro)
+				if selected {
 					sw.Border(2, p.ink)
 				}
 			})
@@ -669,12 +721,13 @@ func (a *workspace) penOptions(c *ui.Context, p palette) {
 		for i, width := range penWidths {
 			selected := activeW == width
 			btn := ui.ButtonBase(c.Key(width)).Size(wBtnW, wBtnH).Radius(7).Center().Label(penWidthLabels[i]).
-				Selected(selected).OnClick(func() { d.penWidth = width })
+				Selected(selected).Transition(trColorMicro).OnClick(func() { d.penWidth = width })
 			if selected {
 				btn.Background(p.tint).Border(1, p.tintBorder)
 			} else if btn.Hovered() {
 				btn.Background(p.hover)
 			}
+			applySelectScalePose(btn, selected, btn.Pressed())
 			dotColor := p.quiet
 			if selected {
 				dotColor = p.accent
@@ -683,7 +736,7 @@ func (a *workspace) penOptions(c *ui.Context, p palette) {
 			if touch {
 				r += 1.5
 			}
-			btn.Children(func() { ui.Box(c).Size(r, r).Radius(r / 2).Background(dotColor) })
+			btn.Children(func() { ui.Box(c).Size(r, r).Radius(r / 2).Background(dotColor).Transition(trColorMicro) })
 		}
 		if d.tool == penTool {
 			shapeH := float32(24)
@@ -696,7 +749,8 @@ func (a *workspace) penOptions(c *ui.Context, p palette) {
 			if !d.shapeOff {
 				shapeBtn.Background(p.tint).Border(1, p.tintBorder)
 			}
-			shapeBtn.Tooltip("画完停顿自动规整直线与几何图形")
+			shapeBtn.Transition(trColorMicro).Tooltip("画完停顿自动规整直线与几何图形")
+			applyPressPose(shapeBtn, shapeBtn.Pressed(), false)
 		}
 	})
 }

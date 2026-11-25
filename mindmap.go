@@ -1313,6 +1313,13 @@ func (a *workspace) graph(c *ui.Context, p palette, width, height float32) {
 	layoutMode := a.settings.LayoutMode()
 	nodes, sections, picked := a.mapLayout()
 	world := a.withInkAndCardBounds(layoutBounds(nodes, sections))
+	firstOpen := !a.canvasReady || a.camAnim.at.IsZero()
+	prevScale, prevPanX, prevPanY := a.scale, a.panX, a.panY
+	if !firstOpen {
+		prevScale = float32(a.camAnim.s.target)
+		prevPanX = float32(a.camAnim.x.target)
+		prevPanY = float32(a.camAnim.y.target)
+	}
 	if a.scale == 0 {
 		fitW := (width - 2*mapInset) / max(1, world.W)
 		fitH := (height - 2*mapInset) / max(1, world.H)
@@ -1384,8 +1391,29 @@ func (a *workspace) graph(c *ui.Context, p palette, width, height float32) {
 		a.jumpToCard = ""
 	}
 
+	now := c.Now()
+	reduceMotion := c.Instant() || c.Preferences().ReduceMotion
+	if firstOpen || reduceMotion {
+		a.syncCamera(a.scale, a.panX, a.panY, now)
+	} else if a.scale != prevScale || a.panX != prevPanX || a.panY != prevPanY {
+		curS, curX, curY := prevScale, prevPanX, prevPanY
+		if a.camAnim.active {
+			curS = float32(a.camAnim.s.pos)
+			curX = float32(a.camAnim.x.pos)
+			curY = float32(a.camAnim.y.pos)
+		}
+		a.camAnim.start(curS, curX, curY, a.scale, a.panX, a.panY, now)
+	}
+
 	a.checkShape(c)
 	scale, x, y := a.scale, a.panX, a.panY
+	if a.camAnim.active {
+		var moving bool
+		scale, x, y, moving = a.camAnim.step(now, reduceMotion)
+		if moving {
+			c.AnimationFrame()
+		}
+	}
 	var selectedBox ui.Rect
 	var selectedNode mapNode
 	hasSelectedBox := false
@@ -1482,6 +1510,7 @@ func (a *workspace) graph(c *ui.Context, p palette, width, height float32) {
 							toggle := ui.ButtonBase(c.Key("sec-toggle-"+secID)).
 								Height(secToggleH).MinWidth(secToggleMinW).PaddingX(max(6*scale, 7)).Gap(2.5*scale).Radius(99).Center().
 								Background(p.elevated.Alpha(.88)).Border(max(.75, 1*scale), ct.border).Shrink(0).
+								Transition(trColorMicro).
 								Label("折叠框架" + secTitle).Disabled(a.editing()).
 								HandleInput(func(ev ui.InputEvent) bool {
 									return a.cardOverlayInput(ev, box.X+box.W-46*scale, box.Y, false)
@@ -1490,10 +1519,14 @@ func (a *workspace) graph(c *ui.Context, p palette, width, height float32) {
 							if toggle.Hovered() {
 								toggle.Background(p.hover)
 							}
+							applyPressPose(toggle, toggle.Pressed(), a.editing())
+							secExpanded := a.expanded == nil || a.expanded[secID]
 							toggle.Children(func() {
-								ui.Icon(c, icChevronDown).Size(9.5*scale, 9.5*scale).TextColor(ct.headerInk.Alpha(.75)).Shrink(0)
+								ic := ui.Icon(c, icChevronRight).Size(9.5*scale, 9.5*scale).TextColor(ct.headerInk.Alpha(.75)).Shrink(0)
+								applyChevronPose(ic, secExpanded)
 								ui.Text(c, fmt.Sprint(secCount)).FontSize(10 * scale).
-									FontWeight(650).FontFeatures("tnum").TextColor(ct.headerInk.Alpha(.75)).SingleLine()
+									FontWeight(650).FontFeatures("tnum").TextColor(ct.headerInk.Alpha(.75)).SingleLine().
+									ContentTransition(ctNumeric(false))
 							})
 						}
 					})
@@ -1539,12 +1572,13 @@ func (a *workspace) graph(c *ui.Context, p palette, width, height float32) {
 			a.cardActionBar(c, p, selectedNode, selectedBox, width, height)
 		}
 		if len(a.drawing.selected) != 0 {
-			a.lassoMenu(c, p, width, height)
+			a.lassoMenu(c, p, x, y, scale, width, height)
 		}
 		if a.drawing.dockOpen || a.mode == splitMode {
 			a.inkDock(c, p, a.mode, width)
 		} else {
-			ui.Box(c).Absolute().Bottom(16).Left(16).ZIndex(5).Children(func() {
+			ui.Box(c.Key("ink-fab")).Absolute().Bottom(16).Left(16).ZIndex(5).
+				Transition(trFloatingBarStatic).Children(func() {
 				icons := dockIcons[0]
 				if p.dark {
 					icons = dockIcons[1]
@@ -1558,7 +1592,7 @@ func (a *workspace) graph(c *ui.Context, p palette, width, height float32) {
 				})
 			})
 		}
-		a.minimap(c, p, nodes, sections, world, width, height)
+		a.minimap(c, p, nodes, sections, world, x, y, scale, width, height)
 	})
 }
 
@@ -1596,10 +1630,11 @@ func (a *workspace) cardActionBar(c *ui.Context, p palette, node mapNode, box ui
 		Height(barH).PaddingX(6).Gap(2).AlignItems(ui.Center).Radius(10).
 		Background(p.elevated).Border(1, p.border).
 		InsetShadow(0, 1, 0, 0, p.specular).
-		Shadow(0, 8, 22, -4, p.modalShadow).Children(func() {
-		actionBtn := func(key, textLabel, a11yLabel string, icon *ui.SVG, danger, disabled bool, onClick func()) {
+		Shadow(0, 8, 22, -4, p.modalShadow).
+		Transition(trFloatingBar).Children(func() {
+		actionBtn := func(key, textLabel, a11yLabel string, icon *ui.SVG, rotateExpanded, danger, disabled bool, onClick func()) {
 			btn := ui.ButtonBase(c.Key(key)).Height(btnH).PaddingX(btnPadX).Gap(4).Radius(6).Center().
-				Label(a11yLabel).Tooltip(a11yLabel).Disabled(disabled).OnClick(onClick)
+				Label(a11yLabel).Tooltip(a11yLabel).Disabled(disabled).Transition(trColorMicro).OnClick(onClick)
 			fg := p.ink
 			icFg := p.secondary
 			if danger {
@@ -1620,9 +1655,13 @@ func (a *workspace) cardActionBar(c *ui.Context, p palette, node mapNode, box ui
 					btn.Background(p.hover)
 				}
 			}
+			applyPressPose(btn, btn.Pressed(), disabled)
 			btn.Children(func() {
 				if icon != nil {
-					ui.Icon(c, icon).Size(icSize, icSize).TextColor(icFg).Shrink(0)
+					ic := ui.Icon(c, icon).Size(icSize, icSize).TextColor(icFg).Shrink(0)
+					if key == "act-fold" {
+						applyChevronPose(ic, rotateExpanded)
+					}
 				}
 				if textLabel != "" {
 					ui.Text(c, textLabel).FontSize(fontSize).FontWeight(550).TextColor(fg).SingleLine()
@@ -1630,33 +1669,31 @@ func (a *workspace) cardActionBar(c *ui.Context, p palette, node mapNode, box ui
 			})
 		}
 
-		actionBtn("act-detail", "详情", "查看笔记详情", icBook, false, false, func() {
+		actionBtn("act-detail", "详情", "查看笔记详情", icBook, false, false, false, func() {
 			a.cardMenuOpen = false
 			a.page = detail
 		})
-		actionBtn("act-edit", "编辑", "编辑笔记", icEdit, false, a.busy, a.startEditNote)
-		actionBtn("act-child", "子笔记", "新建子笔记", icPlus, false, a.busy, a.startAddChild)
+		actionBtn("act-edit", "编辑", "编辑笔记", icEdit, false, false, a.busy, a.startEditNote)
+		actionBtn("act-child", "子笔记", "新建子笔记", icPlus, false, false, a.busy, a.startAddChild)
 		if len(imgs) > 0 {
-			actionBtn("act-img", "原图", "查看大图", icPage, false, false, func() {
+			actionBtn("act-img", "原图", "查看大图", icPage, false, false, false, func() {
 				a.preview = imgs[0]
 			})
 		}
 		if node.hasKids && node.depth > 0 && a.settings.LayoutMode() != notebook.LayoutCompact {
 			foldLabel := "折叠"
 			foldTooltip := "折叠下级分支"
-			foldIcon := icChevronDown
 			if !node.expanded {
 				foldLabel = "展开"
 				foldTooltip = "展开下级分支"
-				foldIcon = icChevronRight
 			}
-			actionBtn("act-fold", foldLabel, foldTooltip, foldIcon, false, false, func() {
+			actionBtn("act-fold", foldLabel, foldTooltip, icChevronRight, node.expanded, false, false, func() {
 				a.toggleBranch(node.id)
 			})
 		}
 		if n.ID != "" {
 			ui.Box(c).Width(1).Height(14).Background(p.rule).Margin(0, 2)
-			actionBtn("act-del", "", "删除笔记", icTrash, true, a.busy, a.confirmDeleteNote)
+			actionBtn("act-del", "", "删除笔记", icTrash, false, true, a.busy, a.confirmDeleteNote)
 		}
 	})
 }
@@ -1772,6 +1809,7 @@ func (a *workspace) pinchZoomCanvas(ev ui.InputEvent, sx, sy float32) {
 		}
 	}
 	a.zoomAt(a.scale*ev.Scale, sx, sy)
+	a.cancelCameraAnim()
 	a.lastZoomX, a.lastZoomY, a.lastZoomAt = sx, sy, ev.Time
 	a.canvasPointer = canvasPointer{}
 }
@@ -1804,6 +1842,7 @@ func (a *workspace) cardOverlayInput(ev ui.InputEvent, ox, oy float32, allowPan 
 			a.panX -= ev.DX
 			a.panY -= ev.DY
 		}
+		a.cancelCameraAnim()
 		return true
 	}
 	if !allowPan {
@@ -1828,6 +1867,7 @@ func (a *workspace) cardOverlayInput(ev ui.InputEvent, ox, oy float32, allowPan 
 		}
 		if g.dragged {
 			a.panX, a.panY = g.left+dx, g.top+dy
+			a.cancelCameraAnim()
 			return true
 		}
 		return false
@@ -1866,11 +1906,13 @@ func (a *workspace) canvasInput(ev ui.InputEvent, nodes []mapNode) bool {
 			a.panX -= ev.DX
 			a.panY -= ev.DY
 		}
+		a.cancelCameraAnim()
 	case ui.InputPointerDown:
 		a.lastZoomAt = time.Time{}
 		if ev.Button != 0 && ev.Button != 2 {
 			return false
 		}
+		a.cancelCameraAnim()
 		*g = canvasPointer{active: true, startX: ev.X, startY: ev.Y, left: a.panX, top: a.panY}
 	case ui.InputPointerMove:
 		if !g.active {
@@ -1880,6 +1922,7 @@ func (a *workspace) canvasInput(ev ui.InputEvent, nodes []mapNode) bool {
 		g.dragged = g.dragged || abs(dx)+abs(dy) > 4
 		if g.dragged {
 			a.panX, a.panY = g.left+dx, g.top+dy
+			a.cancelCameraAnim()
 		}
 	case ui.InputPointerUp:
 		if !g.active {
@@ -1904,6 +1947,24 @@ func (a *workspace) canvasInput(ev ui.InputEvent, nodes []mapNode) bool {
 		return false
 	}
 	return true
+}
+
+func (a *workspace) syncCamera(s, x, y float32, now time.Time) {
+	a.camAnim.cancel()
+	a.camAnim.s = spring1D{pos: float64(s), target: float64(s)}
+	a.camAnim.x = spring1D{pos: float64(x), target: float64(x)}
+	a.camAnim.y = spring1D{pos: float64(y), target: float64(y)}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	a.camAnim.at = now
+}
+
+func (a *workspace) cancelCameraAnim() {
+	a.camAnim.cancel()
+	a.camAnim.s = spring1D{pos: float64(a.scale), target: float64(a.scale)}
+	a.camAnim.x = spring1D{pos: float64(a.panX), target: float64(a.panX)}
+	a.camAnim.y = spring1D{pos: float64(a.panY), target: float64(a.panY)}
 }
 
 func (a *workspace) zoom(scale float32) {
@@ -2051,6 +2112,7 @@ func (a *workspace) graphNode(c *ui.Context, p palette, node mapNode, box ui.Rec
 		IgnoreInput(a.drawing.canvasToolActive()).
 		Padding(0, 10*scale, 0, 0).Radius(9*scale).AlignItems(ui.Center).Gap(6*scale).
 		Label(title).Disabled(a.editing()).FocusRingColor(p.accent).
+		Transition(trColorMicro).
 		HandleInput(func(ev ui.InputEvent) bool {
 			return a.cardOverlayInput(ev, box.X, box.Y, true)
 		}).OnClick(func() {
@@ -2137,7 +2199,7 @@ func (a *workspace) richGraphNode(c *ui.Context, p palette, node mapNode, box ui
 	}
 	card := ui.Box(c).Absolute().Left(box.X).Top(box.Y).Size(box.W, box.H).Radius(radius).Clip().
 		IgnoreInput(a.drawing.canvasToolActive()).
-		Background(bg).Border(borderW, border)
+		Background(bg).Border(borderW, border).Transition(trColorMicro)
 	if selected && !node.isFrameHead {
 		// Draw extra ring thickness outward via zero-blur spread shadow so inner layout stays pixel-identical.
 		card.Shadow(0, 0, 0, max(.8, 1*scale), p.accent).
@@ -2185,6 +2247,7 @@ func (a *workspace) richGraphNode(c *ui.Context, p palette, node mapNode, box ui
 			pb := ui.ButtonBase(c.Key("page-badge")).Height(badgeH).PaddingX(badgePadX).Radius(99).Center().Shrink(0).
 				Label(label).Disabled(a.editing()).FocusRingColor(p.accent).
 				Background(badgeBg).Border(max(.75, 1*scale), badgeBorder).
+				Transition(trColorMicro).
 				HandleInput(func(ev ui.InputEvent) bool {
 					return a.cardOverlayInput(ev, box.X+box.W-50*scale, box.Y+7*scale, false)
 				}).
@@ -2192,6 +2255,7 @@ func (a *workspace) richGraphNode(c *ui.Context, p palette, node mapNode, box ui
 			if pb.Hovered() && !a.editing() {
 				pb.Background(p.hover)
 			}
+			applyPressPose(pb, pb.Pressed(), a.editing())
 			pb.Children(func() {
 				ui.Text(c, label).FontSize(9.5 * scale).
 					FontWeight(600).FontFeatures("tnum").TextColor(badgeFg).SingleLine()
@@ -2337,13 +2401,11 @@ func (a *workspace) richGraphNode(c *ui.Context, p palette, node mapNode, box ui
 
 		// MarginNote branch expand/collapse toggle pill scaled smoothly with canvas zoom.
 		if showFold {
-			icon := icChevronRight
 			toggleBg := p.tint
 			toggleBorder := p.accent.Alpha(.55)
 			toggleFg := p.accent
 			labelTxt := fmt.Sprintf("+%d", count)
 			if node.expanded {
-				icon = icChevronDown
 				toggleBg = p.elevated.Alpha(.92)
 				toggleBorder = ct.border
 				toggleFg = p.secondary
@@ -2363,6 +2425,7 @@ func (a *workspace) richGraphNode(c *ui.Context, p palette, node mapNode, box ui
 				Right(7*scale).Top(topOffset).ZIndex(3).
 				Height(pillH).PaddingX(pillPadX).Gap(2.5*scale).Radius(99).Center().
 				Background(toggleBg).Border(max(.75, 1*scale), toggleBorder).
+				Transition(trColorMicro).
 				Label("展开或折叠" + title).Disabled(a.editing()).
 				HandleInput(func(ev ui.InputEvent) bool {
 					return a.cardOverlayInput(ev, box.X+box.W-40*scale, box.Y+topOffset, false)
@@ -2371,10 +2434,13 @@ func (a *workspace) richGraphNode(c *ui.Context, p palette, node mapNode, box ui
 			if toggle.Hovered() {
 				toggle.Background(p.hover)
 			}
+			applyPressPose(toggle, toggle.Pressed(), a.editing())
 			toggle.Children(func() {
-				ui.Icon(c, icon).Size(10*scale, 10*scale).TextColor(toggleFg).Shrink(0)
+				ic := ui.Icon(c, icChevronRight).Size(10*scale, 10*scale).TextColor(toggleFg).Shrink(0)
+				applyChevronPose(ic, node.expanded)
 				ui.Text(c, labelTxt).FontSize(10 * scale).
-					FontWeight(650).FontFeatures("tnum").TextColor(toggleFg).SingleLine()
+					FontWeight(650).FontFeatures("tnum").TextColor(toggleFg).SingleLine().
+					ContentTransition(ctNumeric(!node.expanded))
 			})
 		}
 	})
@@ -2404,7 +2470,7 @@ func (a *workspace) withInkAndCardBounds(world ui.Rect) ui.Rect {
 	return world
 }
 
-func (a *workspace) minimap(c *ui.Context, p palette, nodes []mapNode, sections []boardSection, extent ui.Rect, width, height float32) {
+func (a *workspace) minimap(c *ui.Context, p palette, nodes []mapNode, sections []boardSection, extent ui.Rect, camX, camY, camScale, width, height float32) {
 	miniW, miniH, inset := float32(126), float32(82), float32(9)
 	if width < 700 {
 		miniW, miniH, inset = 104, 66, 7
@@ -2416,7 +2482,7 @@ func (a *workspace) minimap(c *ui.Context, p palette, nodes []mapNode, sections 
 	if a.drawing.dockOpen {
 		bottomPad = 78
 	}
-	cam := ui.Rect{X: -a.panX / a.scale, Y: -a.panY / a.scale, W: width / a.scale, H: height / a.scale}
+	cam := ui.Rect{X: -camX / camScale, Y: -camY / camScale, W: width / camScale, H: height / camScale}
 	extent = unionRect(extent, cam)
 	extent = a.withInkAndCardBounds(extent)
 	ink := &a.drawing.canvas.bounds
@@ -2428,9 +2494,16 @@ func (a *workspace) minimap(c *ui.Context, p palette, nodes []mapNode, sections 
 	center := func(x, y float32) {
 		a.panX = width/2 - (extent.X+(x-x0)/k)*a.scale
 		a.panY = height/2 - (extent.Y+(y-y0)/k)*a.scale
+		a.cancelCameraAnim()
 	}
 	button := ui.ButtonBase(c.Key("minimap")).Absolute().Right(16).Bottom(bottomPad).ZIndex(5).Size(miniW, miniH).
 		Radius(10).Background(p.elevated).Border(1, p.border).Shadow(0, 3, 12, -2, p.shadow).
+		Transition(ui.ElementTransition{
+			Position:  true,
+			Colors:    true,
+			Shadows:   true,
+			Animation: &animLayout,
+		}).
 		Label("导航缩略图").
 		HandleInput(func(ev ui.InputEvent) bool {
 			switch ev.Kind {
@@ -2501,24 +2574,24 @@ func rectPath(b ui.Rect) *ui.Path {
 		LineTo(b.X+b.W, b.Y+b.H).LineTo(b.X, b.Y+b.H).Close()
 }
 
-func (a *workspace) lassoMenu(c *ui.Context, p palette, width, height float32) {
+func (a *workspace) lassoMenu(c *ui.Context, p palette, camX, camY, camScale, width, height float32) {
 	b := inkBounds(a.drawing.lasso)
 	touch := a.touchUI()
 	barH, btnH, btnPadX, fontSize, menuW := float32(30), float32(24), float32(4), float32(11.5), float32(190)
 	if touch {
 		barH, btnH, btnPadX, fontSize, menuW = 40, 32, 9, 12.5, 236
 	}
-	x := clamp(a.panX+(b.X+b.W/2)*a.scale-menuW/2, 4, max(4, width-menuW))
-	y := clamp(a.panY+b.Y*a.scale-(barH+6), 4, max(4, height-barH-4))
-	ui.Row(c).Absolute().Left(x).Top(y).ZIndex(6).Height(barH).PaddingX(6).Gap(3).
+	x := clamp(camX+(b.X+b.W/2)*camScale-menuW/2, 4, max(4, width-menuW))
+	y := clamp(camY+b.Y*camScale-(barH+6), 4, max(4, height-barH-4))
+	ui.Row(c.Key("lasso-menu")).Absolute().Left(x).Top(y).ZIndex(6).Height(barH).PaddingX(6).Gap(3).
 		AlignItems(ui.Center).Background(p.elevated).Radius(10).Border(1, p.border).
-		Shadow(0, 4, 14, -2, p.shadow).Children(func() {
+		Shadow(0, 4, 14, -2, p.shadow).Transition(trFloatingBar).Children(func() {
 		for _, opt := range []segment[string]{{"转成脑图卡片", "card"}, {"换色", "color"}, {"删除", "delete"}} {
 			if opt.value == "delete" {
 				ui.Box(c).Width(1).Height(14).Background(p.rule).Margin(0, 2)
 			}
 			btn := ui.ButtonBase(c.Key(opt.value)).Height(btnH).PaddingX(btnPadX).Center().Radius(6).
-				Label(opt.title).OnClick(func() {
+				Label(opt.title).Transition(trColorMicro).OnClick(func() {
 				a.editLasso(opt.value)
 				if opt.value == "delete" {
 					a.showActionMessage("已删除选中笔迹", "撤销", func() { a.stepDrawing(true) })
@@ -2541,6 +2614,7 @@ func (a *workspace) lassoMenu(c *ui.Context, p palette, width, height float32) {
 					btn.Background(p.hover)
 				}
 			}
+			applyPressPose(btn, btn.Pressed(), false)
 			btn.Children(func() { ui.Text(c, opt.title).FontSize(fontSize).TextColor(fg) })
 		}
 	})
@@ -2551,6 +2625,7 @@ func (a *workspace) canvasCard(c *ui.Context, p palette, card notebook.CanvasCar
 		IgnoreInput(a.drawing.canvasToolActive()).
 		Background(p.elevated).Border(max(1, 1.5*scale), p.accent).Radius(12*scale).
 		Shadow(0, 6*scale, 16*scale, -4*scale, p.accent.Alpha(.18)).
+		Transition(trFloatingBarStatic).
 		ContextMenu(func(m *ui.Menu) {
 			if m.Item("删除画布卡片").Danger().Chosen() {
 				next := a.drawing.data
@@ -2576,10 +2651,15 @@ func (a *workspace) canvasCard(c *ui.Context, p palette, card notebook.CanvasCar
 				}
 				b := ui.ButtonBase(c).Height(pillH).PaddingX(max(7*scale, 8)).Center().Radius(pillH/2).
 					Background(p.tint).Border(max(.75, 1*scale), p.tintBorder).Label(label).
+					Transition(trColorMicro).
 					HandleInput(func(ev ui.InputEvent) bool {
 						return a.cardOverlayInput(ev, box.X+box.W-52*scale, box.Y+7*scale, false)
 					}).
 					OnClick(func() { a.jumpToPDF(*r) })
+				if b.Hovered() {
+					b.Background(p.hover)
+				}
+				applyPressPose(b, b.Pressed(), a.editing())
 				b.Children(func() { ui.Text(c, label).FontSize(max(10.5, 11*scale)).TextColor(p.accent).SingleLine() })
 			}
 		})
