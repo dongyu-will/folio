@@ -1,7 +1,7 @@
 {
   "name": "Folio",
   "identifier": "app.folio.mgnote",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "buildCommand": "sh scripts/build-ink.sh",
   "out": "build",
   "resourcesExclude": ["icon.png", "figma"],
