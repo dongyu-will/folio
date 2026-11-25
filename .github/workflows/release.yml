@@ -98,7 +98,7 @@ jobs:
         run: |
           mkdir -p release-macos
           for pattern in "*.dmg" "*.tar.gz" "*.delta" "update-*.json" "install.sh"; do
-            for f in build/$pattern; do
+            for f in build/darwin-arm64/$pattern build/$pattern; do
               [ -f "$f" ] && cp "$f" release-macos/
             done
           done
@@ -154,8 +154,8 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path release-windows | Out-Null
-          Get-ChildItem -Path build -File | Where-Object {
-            $_.Name -like "*.exe" -or
+          Get-ChildItem -Path build/windows-amd64 -File | Where-Object {
+            $_.Name -like "*setup*.exe" -or
             $_.Name -like "*.tar.gz" -or
             $_.Name -like "*.delta" -or
             $_.Name -like "update-*.json" -or
@@ -245,7 +245,7 @@ jobs:
           set -euo pipefail
           mkdir -p release-android
           apk_name="folio-${VERSION}-android-arm64.apk"
-          cp "build/folio-${VERSION}.apk" "release-android/${apk_name}"
+          cp "build/android/folio-${VERSION}.apk" "release-android/${apk_name}"
           python3 - <<'PY'
           import hashlib, json, os
           ver = os.environ["VERSION"]
