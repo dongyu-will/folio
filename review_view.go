@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math/rand/v2"
 	"slices"
+	"strings"
 
 	"github.com/dongyu-will/folio/internal/notebook"
 	"github.com/egoist/mygo/ui"
@@ -41,20 +42,8 @@ func (a *workspace) setNoteRevealed(id string, revealed bool) {
 }
 
 func (a *workspace) noteHasReviewBody(n notebook.Note) bool {
-	return stringsTrimAny(n.Body, n.Excerpt) || n.Clip != "" || len(noteCardImages(n)) > 0 || blockHasAnyText(n)
-}
-
-func stringsTrimAny(values ...string) bool {
-	for _, v := range values {
-		if len(v) > 0 {
-			for i := 0; i < len(v); i++ {
-				if v[i] > ' ' {
-					return true
-				}
-			}
-		}
-	}
-	return false
+	return slices.ContainsFunc([]string{n.Body, n.Excerpt}, func(s string) bool { return strings.TrimSpace(s) != "" }) ||
+		n.Clip != "" || len(noteCardImages(n)) > 0 || blockHasAnyText(n)
 }
 
 func blockHasAnyText(n notebook.Note) bool {
@@ -162,10 +151,7 @@ func (a *workspace) markReviewCard(known bool) {
 }
 
 func (a *workspace) reviewModal(c *ui.Context, p palette, paneW, paneH float32) {
-	maxW := max(260, paneW-24)
-	modalW := min(maxW, clamp(paneW-96, min(maxW, 520), 760))
-	maxH := max(220, paneH-16)
-	modalH := min(maxH, clamp(paneH-56, min(maxH, 460), 680))
+	modalW, modalH := modalDimensions(paneW, paneH, 96, 520, 760, 56, 460, 680)
 	closeReview := func() { a.reviewOpen = false }
 
 	ui.ButtonBase(c.Key("review-modal-scrim")).Absolute().Left(0).Top(0).Right(0).Bottom(0).

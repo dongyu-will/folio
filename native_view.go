@@ -657,11 +657,11 @@ func (a *workspace) sidebar(c *ui.Context, p palette, width float32, showBrandBa
 				}
 				for _, id := range searchIDs {
 					sub := a.searchResultSubtitle(id, a.query)
-					a.searchNavItem(c.Key(id), p, noteTitle(a.tree.notes[id]), sub, id == a.selected, func() { a.openNote(id) })
+					a.sidebarRow(c.Key(id), p, noteTitle(a.tree.notes[id]), sub, nil, "", id == a.selected, func() { a.openNote(id) })
 				}
 				return
 			}
-			a.navItem(c.Key("all-notes"), p, "全部笔记", icLayers, fmt.Sprint(len(a.tree.order)), a.scope == "", func() { a.selectScope("") })
+			a.sidebarRow(c.Key("all-notes"), p, "全部笔记", "", icLayers, fmt.Sprint(len(a.tree.order)), a.scope == "", func() { a.selectScope("") })
 			for _, id := range a.tree.kids[a.tree.root] {
 				n := a.tree.notes[id]
 				if n.Title == "" && len(a.tree.kids[id]) == 0 && !hasNoteContent(n) {
@@ -671,7 +671,7 @@ func (a *workspace) sidebar(c *ui.Context, p palette, width float32, showBrandBa
 				if kids := len(a.tree.kids[id]); kids > 0 {
 					countLabel = fmt.Sprint(kids)
 				}
-				a.navItem(c.Key(id), p, noteTitle(n), icFolder, countLabel, id == a.scope, func() { a.selectScope(id) })
+				a.sidebarRow(c.Key(id), p, noteTitle(n), "", icFolder, countLabel, id == a.scope, func() { a.selectScope(id) })
 			}
 		})
 		horizontalRule(c, p)
@@ -697,11 +697,15 @@ func (a *workspace) sidebar(c *ui.Context, p palette, width float32, showBrandBa
 	})
 }
 
-func (a *workspace) navItem(c *ui.Context, p palette, label string, icon *ui.SVG, count string, selected bool, onClick func()) {
-	row := ui.ButtonBase(c).FillWidth().MinHeight(36).Padding(0, 10).Gap(8).
-		Justify(ui.Start).AlignItems(ui.Center).Radius(8).
+func (a *workspace) sidebarRow(c *ui.Context, p palette, label, subtitle string, icon *ui.SVG, count string, selected bool, onClick func()) {
+	row := ui.ButtonBase(c).FillWidth().AlignItems(ui.Center).Radius(8).
 		Label(label).Disabled(a.editing()).Selected(selected).FocusRingColor(p.accent).
 		Transition(trColorMicro).OnClick(onClick)
+	if subtitle != "" {
+		row.MinHeight(46).Padding(6, 10).Gap(2).Justify(ui.Center)
+	} else {
+		row.MinHeight(36).Padding(0, 10).Gap(8).Justify(ui.Start)
+	}
 	fg := p.secondary
 	icColor := p.quiet
 	weight := 500
@@ -726,6 +730,13 @@ func (a *workspace) navItem(c *ui.Context, p palette, label string, icon *ui.SVG
 	}
 	applyPressPose(row, row.Pressed(), a.editing())
 	row.Children(func() {
+		if subtitle != "" {
+			ui.Column(c).FillWidth().Gap(2).Children(func() {
+				ui.Text(c, label).SingleLine().Ellipsis("…").FontSize(13).FontWeight(weight).LetterSpacing(-0.1).TextColor(fg)
+				ui.Text(c, subtitle).SingleLine().Ellipsis("…").FontSize(11).TextColor(p.quiet)
+			})
+			return
+		}
 		if icon != nil {
 			ui.Icon(c, icon).Size(14, 14).TextColor(icColor).Shrink(0)
 		}
@@ -736,6 +747,20 @@ func (a *workspace) navItem(c *ui.Context, p palette, label string, icon *ui.SVG
 				TextColor(p.quiet).Shrink(0).ContentTransition(ctNumeric(false))
 		}
 	})
+}
+
+func selectablePill(c *ui.Context, p palette, key, text, label string, h, padX, fontSize float32, selected bool, selFg, idleFg, idleBg, idleBorder ui.Color, onClick func()) {
+	pill := ui.ButtonBase(c.Key(key)).Height(h).PaddingX(padX).Radius(99).
+		Center().Label(label).Transition(trColorMicro).OnClick(onClick)
+	fg := idleFg
+	if selected {
+		pill.Background(p.tint).Border(1, p.tintBorder)
+		fg = selFg
+	} else {
+		pill.Background(idleBg).Border(1, idleBorder)
+	}
+	applyPressPose(pill, pill.Pressed(), false)
+	pill.Children(func() { ui.Text(c, text).FontSize(fontSize).TextColor(fg).SingleLine() })
 }
 
 func (a *workspace) applyTagFilter(tag string) {
@@ -791,18 +816,10 @@ func (a *workspace) filterButton(c *ui.Context, p palette) {
 				ui.Column(c).FillWidth().Gap(6).Children(func() {
 					ui.Text(c, "颜色").FontSize(11).FontWeight(600).TextColor(p.quiet)
 					ui.Row(c).FillWidth().Wrap().Gap(6).Children(func() {
-						allBtn := ui.ButtonBase(c.Key("fcol-all")).Height(24).PaddingX(8).Radius(99).Center().
-							Label("全部颜色").Transition(trColorMicro).OnClick(func() {
+						selectablePill(c, p, "fcol-all", "全部", "全部颜色", 24, 8, 11, !a.filterColorSet, p.secondary, p.secondary, p.shell, p.rule, func() {
 							a.filterColorSet, a.filterColor = false, 0
 							a.invalidateSearch()
 						})
-						if !a.filterColorSet {
-							allBtn.Background(p.tint).Border(1, p.tintBorder)
-						} else {
-							allBtn.Background(p.shell).Border(1, p.rule)
-						}
-						applyPressPose(allBtn, allBtn.Pressed(), false)
-						allBtn.Children(func() { ui.Text(c, "全部").FontSize(11).TextColor(p.secondary) })
 						for _, ci := range usedColors {
 							ci := ci
 							ct := mnCardLight[ci]
@@ -810,21 +827,13 @@ func (a *workspace) filterButton(c *ui.Context, p palette) {
 								ct = mnCardDark[ci]
 							}
 							sel := a.filterColorSet && a.filterColor == ci
-							sw := ui.ButtonBase(c.Key(fmt.Sprintf("fcol-%d", ci))).Size(24, 24).Radius(99).
-								Center().Label(fmt.Sprintf("筛选颜色 %d", ci)).Transition(trColorMicro).OnClick(func() {
+							colorSwatchDot(c, p, fmt.Sprintf("fcol-%d", ci), fmt.Sprintf("筛选颜色 %d", ci), 24, 16, 2, ct.accent, sel, func() {
 								if sel {
 									a.filterColorSet, a.filterColor = false, 0
 								} else {
 									a.filterColorSet, a.filterColor = true, ci
 								}
 								a.invalidateSearch()
-							})
-							applySelectScalePose(sw, sel, sw.Pressed())
-							sw.Children(func() {
-								dot := ui.Box(c).Size(16, 16).Radius(99).Background(ct.accent)
-								if sel {
-									dot.Border(2, p.ink)
-								}
 							})
 						}
 					})
@@ -837,18 +846,9 @@ func (a *workspace) filterButton(c *ui.Context, p palette) {
 					ui.Row(c).FillWidth().Wrap().Gap(6).Children(func() {
 						for _, tag := range usedTags {
 							tag := tag
-							sel := a.filterTag == tag
-							pill := ui.ButtonBase(c.Key("ftag-"+tag)).Height(24).Padding(0, 8).Radius(99).
-								Center().Label("#"+tag).Transition(trColorMicro).OnClick(func() { a.applyTagFilter(tag) })
-							fg := p.secondary
-							if sel {
-								pill.Background(p.tint).Border(1, p.tintBorder)
-								fg = p.accent
-							} else {
-								pill.Background(p.shell).Border(1, p.rule)
-							}
-							applyPressPose(pill, pill.Pressed(), false)
-							pill.Children(func() { ui.Text(c, "#"+tag).FontSize(11).TextColor(fg).SingleLine() })
+							selectablePill(c, p, "ftag-"+tag, "#"+tag, "#"+tag, 24, 8, 11, a.filterTag == tag, p.accent, p.secondary, p.shell, p.rule, func() {
+								a.applyTagFilter(tag)
+							})
 						}
 					})
 				})
@@ -870,42 +870,6 @@ func (a *workspace) filterButton(c *ui.Context, p palette) {
 	})
 }
 
-func (a *workspace) searchNavItem(c *ui.Context, p palette, label, subtitle string, selected bool, onClick func()) {
-	if subtitle == "" {
-		a.navItem(c, p, label, nil, "", selected, onClick)
-		return
-	}
-	row := ui.ButtonBase(c).FillWidth().MinHeight(46).Padding(6, 10).Gap(2).
-		Justify(ui.Center).Radius(8).
-		Label(label).Disabled(a.editing()).Selected(selected).FocusRingColor(p.accent).
-		Transition(trColorMicro).OnClick(onClick)
-	fg := p.secondary
-	weight := 500
-	switch {
-	case selected:
-		row.Background(p.selectedBg).Border(1, p.rule).
-			InsetShadow(0, 1, 0, 0, p.specular).
-			Shadow(0, 1, 2, 0, p.shadowSoft)
-		fg = p.ink
-		weight = 600
-	case row.Pressed():
-		row.Background(p.pressed).Border(1, ui.Color{})
-		fg = p.ink
-	case row.Hovered():
-		row.Background(p.hover).Border(1, ui.Color{})
-		fg = p.ink
-	default:
-		row.Border(1, ui.Color{})
-	}
-	applyPressPose(row, row.Pressed(), a.editing())
-	row.Children(func() {
-		ui.Column(c).FillWidth().Gap(2).Children(func() {
-			ui.Text(c, label).SingleLine().Ellipsis("…").FontSize(13).FontWeight(weight).LetterSpacing(-0.1).TextColor(fg)
-			ui.Text(c, subtitle).SingleLine().Ellipsis("…").FontSize(11).TextColor(p.quiet)
-		})
-	})
-}
-
 func (a *workspace) selectScope(id string) {
 	a.pageDir = -1
 	a.scope, a.query, a.page = id, "", browse
@@ -920,10 +884,7 @@ func (a *workspace) selectScope(id string) {
 
 // noteModal renders the Apple x Linear centered focus card over the live mindmap.
 func (a *workspace) noteModal(c *ui.Context, p palette, paneW, paneH float32) {
-	maxW := max(260, paneW-24)
-	modalW := min(maxW, clamp(paneW-96, min(maxW, 540), 820))
-	maxH := max(160, paneH-16)
-	modalH := min(maxH, clamp(paneH-64, min(maxH, 420), 740))
+	modalW, modalH := modalDimensions(paneW, paneH, 96, 540, 820, 64, 420, 740)
 	// Translucent scrim backdrop dismisses the modal when clicked outside.
 	ui.ButtonBase(c.Key("note-modal-scrim")).Absolute().Left(0).Top(0).Right(0).Bottom(0).
 		Label("关闭笔记卡片").Background(p.scrim).Transition(trScrim).
@@ -1536,15 +1497,9 @@ func (a *workspace) editor(c *ui.Context, p palette, availH float32) {
 					swatches = append(swatches, a.draftColor)
 				}
 				ui.Row(c).FillWidth().Wrap().Gap(6).AlignItems(ui.Center).Children(func() {
-					noneBtn := ui.ButtonBase(c.Key("ed-col-none")).Height(26).PaddingX(10).Radius(99).
-						Center().Label("无色").Transition(trColorMicro).OnClick(func() { a.draftColorSet, a.draftColor = false, 0 })
-					if !a.draftColorSet {
-						noneBtn.Background(p.tint).Border(1, p.tintBorder)
-					} else {
-						noneBtn.Background(p.inputBg).Border(1, p.border)
-					}
-					applyPressPose(noneBtn, noneBtn.Pressed(), false)
-					noneBtn.Children(func() { ui.Text(c, "无色").FontSize(11.5).TextColor(p.secondary) })
+					selectablePill(c, p, "ed-col-none", "无色", "无色", 26, 10, 11.5, !a.draftColorSet, p.secondary, p.secondary, p.inputBg, p.border, func() {
+						a.draftColorSet, a.draftColor = false, 0
+					})
 					for _, ci := range swatches {
 						ci := ci
 						ct := mnCardLight[ci]
@@ -1552,16 +1507,8 @@ func (a *workspace) editor(c *ui.Context, p palette, availH float32) {
 							ct = mnCardDark[ci]
 						}
 						sel := a.draftColorSet && a.draftColor == ci
-						btn := ui.ButtonBase(c.Key(fmt.Sprintf("ed-col-%d", ci))).Size(26, 26).Radius(99).
-							Center().Label(fmt.Sprintf("卡片颜色 %d", ci)).Transition(trColorMicro).OnClick(func() {
+						colorSwatchDot(c, p, fmt.Sprintf("ed-col-%d", ci), fmt.Sprintf("卡片颜色 %d", ci), 26, 18, 2.5, ct.accent, sel, func() {
 							a.draftColorSet, a.draftColor = true, ci
-						})
-						applySelectScalePose(btn, sel, btn.Pressed())
-						btn.Children(func() {
-							dot := ui.Box(c).Size(18, 18).Radius(99).Background(ct.accent)
-							if sel {
-								dot.Border(2.5, p.ink)
-							}
 						})
 					}
 				})
@@ -1579,9 +1526,7 @@ func (a *workspace) editor(c *ui.Context, p palette, availH float32) {
 								break
 							}
 							tag := tag
-							has := slices.Contains(current, tag)
-							pill := ui.ButtonBase(c.Key("ed-tag-"+tag)).Height(22).Padding(0, 8).Radius(99).
-								Center().Label("切换标签 " + tag).Transition(trColorMicro).OnClick(func() {
+							selectablePill(c, p, "ed-tag-"+tag, "#"+tag, "切换标签 "+tag, 22, 8, 11, slices.Contains(current, tag), p.accent, p.quiet, p.shell, p.rule, func() {
 								cur := parseTagsInput(a.draftTags)
 								if slices.Contains(cur, tag) {
 									cur = slices.DeleteFunc(cur, func(v string) bool { return v == tag })
@@ -1590,15 +1535,6 @@ func (a *workspace) editor(c *ui.Context, p palette, availH float32) {
 								}
 								a.draftTags = strings.Join(cur, " ")
 							})
-							fg := p.quiet
-							if has {
-								pill.Background(p.tint).Border(1, p.tintBorder)
-								fg = p.accent
-							} else {
-								pill.Background(p.shell).Border(1, p.rule)
-							}
-							applyPressPose(pill, pill.Pressed(), false)
-							pill.Children(func() { ui.Text(c, "#"+tag).FontSize(11).TextColor(fg).SingleLine() })
 						}
 					})
 				}
