@@ -73,16 +73,38 @@ func (s *Store) DocumentPath(id string) string {
 	return filepath.Join(s.dir, "documents", id+".pdf")
 }
 
-func (s *Store) saveDocument(ctx context.Context, source io.Reader, title string, expectedSize int64, onProgress func(done, total int64)) (Document, string, error) {
+func openPDFReader(ctx context.Context, r io.Reader) (*bufio.Reader, error) {
 	if ctx != nil {
 		if err := ctx.Err(); err != nil {
-			return Document{}, "", err
+			return nil, err
 		}
 	}
-	input := bufio.NewReaderSize(withContextReader(ctx, source), 64<<10)
+	input := bufio.NewReaderSize(withContextReader(ctx, r), 64<<10)
 	header, _ := input.Peek(1024)
 	if !bytes.Contains(header, []byte("%PDF-")) {
-		return Document{}, "", errors.New("文件不包含可读取的 PDF")
+		return nil, errors.New("文件不包含可读取的 PDF")
+	}
+	return input, nil
+}
+
+func copyAndHashPDF(dst io.Writer, input io.Reader, expectedSize int64, onProgress func(done, total int64)) (docID, docMD5 string, err error) {
+	hash := sha256.New()
+	md5Hash := md5.New()
+	mw := io.MultiWriter(hash, md5Hash)
+	if dst != nil {
+		mw = io.MultiWriter(dst, hash, md5Hash)
+	}
+	buf := make([]byte, copyBufferSize)
+	if _, err := io.CopyBuffer(mw, newProgressReader(input, expectedSize, onProgress), buf); err != nil {
+		return "", "", err
+	}
+	return fmt.Sprintf("%x", hash.Sum(nil)), fmt.Sprintf("%x", md5Hash.Sum(nil)), nil
+}
+
+func (s *Store) saveDocument(ctx context.Context, source io.Reader, title string, expectedSize int64, onProgress func(done, total int64)) (Document, string, error) {
+	input, err := openPDFReader(ctx, source)
+	if err != nil {
+		return Document{}, "", err
 	}
 	dir := filepath.Join(s.dir, "documents")
 	if err := checkAvailableSpace(dir, expectedSize); err != nil {
@@ -96,15 +118,11 @@ func (s *Store) saveDocument(ctx context.Context, source io.Reader, title string
 		return Document{}, "", mapDiskSpaceError(err)
 	}
 	defer os.Remove(temp.Name())
-	hash := sha256.New()
-	md5Hash := md5.New()
-	buf := make([]byte, copyBufferSize)
-	_, copyErr := io.CopyBuffer(io.MultiWriter(temp, hash, md5Hash), newProgressReader(input, expectedSize, onProgress), buf)
+	docID, docMD5, copyErr := copyAndHashPDF(temp, input, expectedSize, onProgress)
 	if err := mapDiskSpaceError(errors.Join(copyErr, temp.Sync(), temp.Close())); err != nil {
 		return Document{}, "", err
 	}
-	doc := Document{ID: fmt.Sprintf("%x", hash.Sum(nil)), Title: title}
-	docMD5 := fmt.Sprintf("%x", md5Hash.Sum(nil))
+	doc := Document{ID: docID, Title: title}
 	dst := s.DocumentPath(doc.ID)
 	if _, err := os.Stat(dst); err == nil {
 		return doc, docMD5, nil
@@ -134,22 +152,16 @@ func (s *Store) saveDocumentFromPath(ctx context.Context, path, title string, ca
 		return s.saveDocument(ctx, f, title, expectedSize, onProgress)
 	}
 
-	input := bufio.NewReaderSize(withContextReader(ctx, f), 64<<10)
-	header, _ := input.Peek(1024)
-	if !bytes.Contains(header, []byte("%PDF-")) {
+	input, err := openPDFReader(ctx, f)
+	if err != nil {
 		_ = f.Close()
-		return Document{}, "", errors.New("文件不包含可读取的 PDF")
-	}
-	hash := sha256.New()
-	md5Hash := md5.New()
-	buf := make([]byte, copyBufferSize)
-	_, copyErr := io.CopyBuffer(io.MultiWriter(hash, md5Hash), newProgressReader(input, expectedSize, onProgress), buf)
-	closeErr := f.Close()
-	if err := errors.Join(copyErr, closeErr); err != nil {
 		return Document{}, "", err
 	}
-	doc := Document{ID: fmt.Sprintf("%x", hash.Sum(nil)), Title: title}
-	docMD5 := fmt.Sprintf("%x", md5Hash.Sum(nil))
+	docID, docMD5, copyErr := copyAndHashPDF(nil, input, expectedSize, onProgress)
+	if err := errors.Join(copyErr, f.Close()); err != nil {
+		return Document{}, "", err
+	}
+	doc := Document{ID: docID, Title: title}
 	dst := s.DocumentPath(doc.ID)
 	if _, err := os.Stat(dst); err == nil {
 		return doc, docMD5, nil
@@ -176,12 +188,7 @@ func (s *Store) importPDF(path string, opts ImportOptions) (ImportResult, error)
 	if title == "" {
 		title = "未命名 PDF"
 	}
-	var progressFn func(done, total int64)
-	if opts.OnProgress != nil {
-		progressFn = func(done, total int64) {
-			opts.OnProgress(ImportProgress{Stage: ImportStageImportPDF, Done: done, Total: total, Index: 1, Count: 1})
-		}
-	}
+	progressFn := stageProgressFn(opts.OnProgress, ImportStageImportPDF, 1, 1)
 	doc, _, err := s.saveDocumentFromPath(opts.Ctx, path, title, opts.CanMoveSource, progressFn)
 	if err != nil {
 		return ImportResult{}, err
@@ -229,14 +236,7 @@ func (s *Store) importPackagePDFs(ctx context.Context, path string, configs *boo
 	if len(pdfEntries) == 0 {
 		return nil, nil
 	}
-	neededBytes := int64(-1)
-	if totalExpected > 0 {
-		if totalExpected > math.MaxInt64 {
-			neededBytes = math.MaxInt64
-		} else {
-			neededBytes = int64(totalExpected)
-		}
-	}
+	neededBytes := clampInt64Size(totalExpected)
 	if err := checkAvailableSpace(filepath.Join(s.dir, "documents"), neededBytes); err != nil {
 		return nil, err
 	}
@@ -250,14 +250,7 @@ func (s *Store) importPackagePDFs(ctx context.Context, path string, configs *boo
 			}
 		}
 		name := filepath.Base(entry.Name)
-		entrySize := int64(-1)
-		if entry.UncompressedSize64 > 0 {
-			if entry.UncompressedSize64 > math.MaxInt64 {
-				entrySize = math.MaxInt64
-			} else {
-				entrySize = int64(entry.UncompressedSize64)
-			}
-		}
+		entrySize := entryUncompressedSize(entry)
 		file, err := entry.Open()
 		if err != nil {
 			return nil, err
@@ -268,14 +261,7 @@ func (s *Store) importPackagePDFs(ctx context.Context, path string, configs *boo
 		if hashNamed {
 			title = fmt.Sprintf("文档 %d", len(documents)+1)
 		}
-		var progressFn func(done, total int64)
-		if onProgress != nil {
-			idx := i + 1
-			totalCount := len(pdfEntries)
-			progressFn = func(done, total int64) {
-				onProgress(ImportProgress{Stage: ImportStageImportPDF, Done: done, Total: total, Index: idx, Count: totalCount})
-			}
-		}
+		progressFn := stageProgressFn(onProgress, ImportStageImportPDF, i+1, len(pdfEntries))
 		doc, docMD5, err := s.saveDocument(ctx, file, title, entrySize, progressFn)
 		if err := errors.Join(err, file.Close()); err != nil {
 			return nil, fmt.Errorf("无法导入 PDF %s：%w", name, err)

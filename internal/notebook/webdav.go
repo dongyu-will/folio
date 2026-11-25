@@ -67,7 +67,16 @@ func (c WebDAVConfig) normalize() (string, *http.Client, error) {
 	return base, client, nil
 }
 
-func (c WebDAVConfig) do(ctx context.Context, client *http.Client, method, targetURL string, body []byte, contentType string) (*http.Response, error) {
+var errWebDAVAuth = errors.New("WebDAV 认证失败，请检查用户名或密码")
+
+func checkWebDAVAuth(status int) error {
+	if status == http.StatusUnauthorized || status == http.StatusForbidden {
+		return errWebDAVAuth
+	}
+	return nil
+}
+
+func (c WebDAVConfig) do(ctx context.Context, client *http.Client, method, targetURL string, body []byte, contentType string, headers ...[2]string) (*http.Response, error) {
 	var bodyReader io.Reader
 	if body != nil {
 		bodyReader = bytes.NewReader(body)
@@ -82,6 +91,9 @@ func (c WebDAVConfig) do(ctx context.Context, client *http.Client, method, targe
 	if contentType != "" {
 		req.Header.Set("Content-Type", contentType)
 	}
+	for _, h := range headers {
+		req.Header.Set(h[0], h[1])
+	}
 	return client.Do(req)
 }
 
@@ -91,11 +103,12 @@ func (c WebDAVConfig) ensureDir(ctx context.Context, client *http.Client, dirURL
 		return err
 	}
 	_ = resp.Body.Close()
+	if err := checkWebDAVAuth(resp.StatusCode); err != nil {
+		return err
+	}
 	switch resp.StatusCode {
 	case http.StatusOK, http.StatusCreated, http.StatusNoContent, http.StatusMovedPermanently, http.StatusMethodNotAllowed:
 		return nil
-	case http.StatusUnauthorized, http.StatusForbidden:
-		return errors.New("WebDAV 认证失败，请检查用户名或密码")
 	default:
 		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 			return nil
@@ -110,13 +123,10 @@ func (c WebDAVConfig) headExists(ctx context.Context, client *http.Client, targe
 		return false, err
 	}
 	_ = resp.Body.Close()
-	if resp.StatusCode == http.StatusOK {
-		return true, nil
+	if err := checkWebDAVAuth(resp.StatusCode); err != nil {
+		return false, err
 	}
-	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
-		return false, errors.New("WebDAV 认证失败，请检查用户名或密码")
-	}
-	return false, nil
+	return resp.StatusCode == http.StatusOK, nil
 }
 
 func (c WebDAVConfig) getBytes(ctx context.Context, client *http.Client, targetURL string) ([]byte, bool, error) {
@@ -128,8 +138,8 @@ func (c WebDAVConfig) getBytes(ctx context.Context, client *http.Client, targetU
 	if resp.StatusCode == http.StatusNotFound {
 		return nil, false, nil
 	}
-	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
-		return nil, false, errors.New("WebDAV 认证失败，请检查用户名或密码")
+	if err := checkWebDAVAuth(resp.StatusCode); err != nil {
+		return nil, false, err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return nil, false, fmt.Errorf("WebDAV 下载失败（HTTP %d）", resp.StatusCode)
@@ -144,8 +154,8 @@ func (c WebDAVConfig) putBytes(ctx context.Context, client *http.Client, targetU
 		return err
 	}
 	_ = resp.Body.Close()
-	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
-		return errors.New("WebDAV 认证失败，请检查用户名或密码")
+	if err := checkWebDAVAuth(resp.StatusCode); err != nil {
+		return err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return fmt.Errorf("WebDAV 上传失败（HTTP %d）", resp.StatusCode)
@@ -159,31 +169,23 @@ func TestWebDAV(ctx context.Context, cfg WebDAVConfig) error {
 	if err != nil {
 		return err
 	}
-	parentURL := strings.TrimSuffix(base, "/FolioSync")
-	req, err := http.NewRequestWithContext(ctx, "PROPFIND", strings.TrimRight(parentURL, "/")+"/", nil)
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Depth", "0")
-	if cfg.Username != "" || cfg.Password != "" {
-		req.SetBasicAuth(cfg.Username, cfg.Password)
-	}
-	resp, err := client.Do(req)
+	parentURL := strings.TrimRight(strings.TrimSuffix(base, "/FolioSync"), "/") + "/"
+	resp, err := cfg.do(ctx, client, "PROPFIND", parentURL, nil, "", [2]string{"Depth", "0"})
 	if err != nil {
 		return fmt.Errorf("无法连接 WebDAV 服务器：%w", err)
 	}
 	_ = resp.Body.Close()
 	if resp.StatusCode == http.StatusMethodNotAllowed || resp.StatusCode == http.StatusNotImplemented {
 		// Fall back to OPTIONS when servers disable PROPFIND.
-		optResp, optErr := cfg.do(ctx, client, http.MethodOptions, strings.TrimRight(parentURL, "/")+"/", nil, "")
+		optResp, optErr := cfg.do(ctx, client, http.MethodOptions, parentURL, nil, "")
 		if optErr != nil {
 			return fmt.Errorf("无法连接 WebDAV 服务器：%w", optErr)
 		}
 		_ = optResp.Body.Close()
 		resp = optResp
 	}
-	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
-		return errors.New("WebDAV 认证失败，请检查用户名或密码")
+	if err := checkWebDAVAuth(resp.StatusCode); err != nil {
+		return err
 	}
 	if resp.StatusCode >= 400 {
 		return fmt.Errorf("WebDAV 服务返回异常状态（HTTP %d）", resp.StatusCode)
@@ -324,77 +326,21 @@ func (s *Store) SyncWebDAV(ctx context.Context, cfg WebDAVConfig) (WebDAVSyncRes
 	}
 
 	for name := range mediaSet {
-		localPath := s.MediaPath(name)
-		if localPath == "" {
-			continue
-		}
-		remoteURL := base + "/media/" + name
-		if _, err := os.Stat(localPath); errors.Is(err, os.ErrNotExist) {
-			data, found, err := cfg.getBytes(ctx, client, remoteURL)
-			if err != nil {
-				return WebDAVSyncResult{}, err
-			}
-			if found {
-				if err := os.MkdirAll(s.mediaDir(), 0700); err != nil {
-					return WebDAVSyncResult{}, err
-				}
-				if _, err := writeImmutableFile(localPath, data); err != nil {
-					return WebDAVSyncResult{}, err
-				}
-				res.DownloadedFiles++
-			}
-			continue
-		}
-		exists, err := cfg.headExists(ctx, client, remoteURL)
+		dl, ul, err := cfg.syncImmutableFile(ctx, client, s.MediaPath(name), base+"/media/"+name, "application/octet-stream")
 		if err != nil {
 			return WebDAVSyncResult{}, err
 		}
-		if !exists {
-			data, err := os.ReadFile(localPath)
-			if err == nil {
-				if err := cfg.putBytes(ctx, client, remoteURL, data, "application/octet-stream"); err != nil {
-					return WebDAVSyncResult{}, err
-				}
-				res.UploadedFiles++
-			}
-		}
+		res.DownloadedFiles += dl
+		res.UploadedFiles += ul
 	}
 
 	for docID := range docSet {
-		localPath := s.DocumentPath(docID)
-		if localPath == "" {
-			continue
-		}
-		remoteURL := base + "/documents/" + docID + ".pdf"
-		if _, err := os.Stat(localPath); errors.Is(err, os.ErrNotExist) {
-			data, found, err := cfg.getBytes(ctx, client, remoteURL)
-			if err != nil {
-				return WebDAVSyncResult{}, err
-			}
-			if found {
-				if err := os.MkdirAll(filepath.Join(s.dir, "documents"), 0700); err != nil {
-					return WebDAVSyncResult{}, err
-				}
-				if _, err := writeImmutableFile(localPath, data); err != nil {
-					return WebDAVSyncResult{}, err
-				}
-				res.DownloadedFiles++
-			}
-			continue
-		}
-		exists, err := cfg.headExists(ctx, client, remoteURL)
+		dl, ul, err := cfg.syncImmutableFile(ctx, client, s.DocumentPath(docID), base+"/documents/"+docID+".pdf", "application/pdf")
 		if err != nil {
 			return WebDAVSyncResult{}, err
 		}
-		if !exists {
-			data, err := os.ReadFile(localPath)
-			if err == nil {
-				if err := cfg.putBytes(ctx, client, remoteURL, data, "application/pdf"); err != nil {
-					return WebDAVSyncResult{}, err
-				}
-				res.UploadedFiles++
-			}
-		}
+		res.DownloadedFiles += dl
+		res.UploadedFiles += ul
 	}
 
 	// Sync per-book drawings by content hash & richness.
@@ -414,7 +360,7 @@ func (s *Store) SyncWebDAV(ctx context.Context, cfg WebDAVConfig) (WebDAVSyncRes
 			return WebDAVSyncResult{}, err
 		}
 		if !found {
-			if len(localDrawing.Ink) > 0 || len(localDrawing.Pages) > 0 || len(localDrawing.Cards) > 0 {
+			if !isEmptyDrawing(localDrawing) {
 				if err := cfg.putBytes(ctx, client, remoteURL, localData, "application/json"); err != nil {
 					return WebDAVSyncResult{}, err
 				}
@@ -435,32 +381,18 @@ func (s *Store) SyncWebDAV(ctx context.Context, cfg WebDAVConfig) (WebDAVSyncRes
 			continue
 		}
 
-		localEmpty := len(localDrawing.Ink) == 0 && len(localDrawing.Pages) == 0 && len(localDrawing.Cards) == 0
-		remoteEmpty := len(remoteDrawing.Ink) == 0 && len(remoteDrawing.Pages) == 0 && len(remoteDrawing.Cards) == 0
+		localEmpty := isEmptyDrawing(localDrawing)
+		remoteEmpty := isEmptyDrawing(remoteDrawing)
 		prevHash := remoteManifest.Drawings[fileKey]
 
 		switch {
-		case localEmpty && !remoteEmpty:
+		case (localEmpty && !remoteEmpty) || (prevHash == localHash && prevHash != remoteHash):
 			if err := s.SaveDrawing(b.ID, remoteDrawing); err != nil {
 				return WebDAVSyncResult{}, err
 			}
 			res.DownloadedFiles++
 			newDrawingHashes[fileKey] = remoteHash
-		case remoteEmpty && !localEmpty:
-			if err := cfg.putBytes(ctx, client, remoteURL, localData, "application/json"); err != nil {
-				return WebDAVSyncResult{}, err
-			}
-			res.UploadedFiles++
-			newDrawingHashes[fileKey] = localHash
-		case prevHash == localHash && prevHash != remoteHash:
-			// Only remote changed since last sync.
-			if err := s.SaveDrawing(b.ID, remoteDrawing); err != nil {
-				return WebDAVSyncResult{}, err
-			}
-			res.DownloadedFiles++
-			newDrawingHashes[fileKey] = remoteHash
-		case prevHash == remoteHash && prevHash != localHash:
-			// Only local changed since last sync.
+		case (remoteEmpty && !localEmpty) || (prevHash == remoteHash && prevHash != localHash):
 			if err := cfg.putBytes(ctx, client, remoteURL, localData, "application/json"); err != nil {
 				return WebDAVSyncResult{}, err
 			}
@@ -526,6 +458,41 @@ func (s *Store) SyncWebDAV(ctx context.Context, cfg WebDAVConfig) (WebDAVSyncRes
 	res.Library = mergedLib
 	res.SyncedAt = now
 	return res, nil
+}
+
+func (c WebDAVConfig) syncImmutableFile(ctx context.Context, client *http.Client, localPath, remoteURL, contentType string) (downloaded, uploaded int, err error) {
+	if localPath == "" {
+		return 0, 0, nil
+	}
+	if _, err := os.Stat(localPath); errors.Is(err, os.ErrNotExist) {
+		data, found, err := c.getBytes(ctx, client, remoteURL)
+		if err != nil || !found {
+			return 0, 0, err
+		}
+		if err := os.MkdirAll(filepath.Dir(localPath), 0700); err != nil {
+			return 0, 0, err
+		}
+		if _, err := writeImmutableFile(localPath, data); err != nil {
+			return 0, 0, err
+		}
+		return 1, 0, nil
+	}
+	exists, err := c.headExists(ctx, client, remoteURL)
+	if err != nil || exists {
+		return 0, 0, err
+	}
+	data, err := os.ReadFile(localPath)
+	if err != nil {
+		return 0, 0, nil
+	}
+	if err := c.putBytes(ctx, client, remoteURL, data, contentType); err != nil {
+		return 0, 0, err
+	}
+	return 0, 1, nil
+}
+
+func isEmptyDrawing(d Drawing) bool {
+	return len(d.Ink) == 0 && len(d.Pages) == 0 && len(d.Cards) == 0
 }
 
 func sha256Hex(data []byte) string {
@@ -602,17 +569,8 @@ func mergeBooksForSync(local, remote Book) (merged Book, localChanged, remoteCha
 					loser = ln
 				}
 			}
-			for _, childID := range loser.Children {
-				if !slices.Contains(winner.Children, childID) {
-					winner.Children = append(winner.Children, childID)
-				}
-			}
-			for _, tag := range loser.Tags {
-				if !slices.Contains(winner.Tags, tag) {
-					winner.Tags = append(winner.Tags, tag)
-				}
-			}
-			winner.Tags = NormalizeTags(winner.Tags)
+			winner.Children = appendUnique(winner.Children, loser.Children)
+			winner.Tags = NormalizeTags(appendUnique(winner.Tags, loser.Tags))
 			if len(winner.MaskRects) == 0 && len(loser.MaskRects) > 0 {
 				winner.MaskRects = slices.Clone(loser.MaskRects)
 			}
@@ -620,16 +578,21 @@ func mergeBooksForSync(local, remote Book) (merged Book, localChanged, remoteCha
 		}
 	}
 	merged.Notes = mergedNotes
-	for _, rootID := range remote.Roots {
-		if !slices.Contains(merged.Roots, rootID) {
-			merged.Roots = append(merged.Roots, rootID)
-		}
-	}
+	merged.Roots = appendUnique(merged.Roots, remote.Roots)
 
 	mergedBytes, _ := json.Marshal(merged)
 	localChanged = !bytes.Equal(lbBytes, mergedBytes)
 	remoteChanged = !bytes.Equal(rbBytes, mergedBytes)
 	return merged, localChanged, remoteChanged
+}
+
+func appendUnique(dst, src []string) []string {
+	for _, v := range src {
+		if !slices.Contains(dst, v) {
+			dst = append(dst, v)
+		}
+	}
+	return dst
 }
 
 func boolScore(v bool) int {
