@@ -669,6 +669,22 @@ func validateNoteInput(title, body string) (string, error) {
 	return title, nil
 }
 
+func (s *Store) readBookShard(bookID string) (Book, bool, error) {
+	idx, _, err := s.readIndex()
+	if err != nil {
+		return Book{}, false, err
+	}
+	pos := slices.IndexFunc(idx.Books, func(e bookEntry) bool { return e.ID == bookID })
+	if pos < 0 {
+		return Book{}, false, nil
+	}
+	book, err := s.readBookFile(idx.Books[pos].File)
+	if err != nil {
+		return Book{}, false, err
+	}
+	return book, true, nil
+}
+
 // SaveDocumentPage persists the last viewed page (1-based) for a single document.
 func (s *Store) SaveDocumentPage(bookID, docID string, lastPage int) error {
 	if bookID == "" || docID == "" || lastPage < 1 {
@@ -677,16 +693,8 @@ func (s *Store) SaveDocumentPage(bookID, docID string, lastPage int) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	idx, _, err := s.readIndex()
-	if err != nil {
-		return err
-	}
-	pos := slices.IndexFunc(idx.Books, func(e bookEntry) bool { return e.ID == bookID })
-	if pos < 0 {
-		return nil
-	}
-	book, err := s.readBookFile(idx.Books[pos].File)
-	if err != nil {
+	book, found, err := s.readBookShard(bookID)
+	if err != nil || !found {
 		return err
 	}
 	changed := false
@@ -781,17 +789,12 @@ func (s *Store) saveNote(bookID, noteID, title, body string, updateMeta bool, co
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	idx, _, err := s.readIndex()
+	book, found, err := s.readBookShard(bookID)
 	if err != nil {
 		return Library{}, err
 	}
-	pos := slices.IndexFunc(idx.Books, func(e bookEntry) bool { return e.ID == bookID })
-	if pos < 0 {
+	if !found {
 		return Library{}, errors.New("找不到这条笔记")
-	}
-	book, err := s.readBookFile(idx.Books[pos].File)
-	if err != nil {
-		return Library{}, err
 	}
 	j := indexNote(&book, noteID)
 	if j < 0 {
@@ -851,17 +854,12 @@ func (s *Store) AddNoteWithMeta(bookID, parentID, title, body string, color *int
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	idx, _, err := s.readIndex()
+	book, found, err := s.readBookShard(bookID)
 	if err != nil {
 		return Library{}, "", err
 	}
-	pos := slices.IndexFunc(idx.Books, func(e bookEntry) bool { return e.ID == bookID })
-	if pos < 0 {
+	if !found {
 		return Library{}, "", errors.New("找不到此笔记本")
-	}
-	book, err := s.readBookFile(idx.Books[pos].File)
-	if err != nil {
-		return Library{}, "", err
 	}
 	now := time.Now().Unix()
 	noteID := userNotePrefix + uuid.NewString()
@@ -1123,34 +1121,32 @@ func writeImmutableFile(path string, data []byte) (created bool, err error) {
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return false, err
 	}
-	f, err := os.CreateTemp(filepath.Dir(path), ".mgnote-media-*")
-	if err != nil {
-		return false, err
-	}
-	tmpName := f.Name()
-	defer os.Remove(tmpName)
-	_, writeErr := f.Write(data)
-	closeErr := f.Close()
-	if err := errors.Join(writeErr, closeErr); err != nil {
-		return false, err
-	}
-	if err := os.Rename(tmpName, path); err != nil {
+	if err := writeAtomicFile(path, ".mgnote-media-*", data, false); err != nil {
 		return false, err
 	}
 	return true, nil
 }
 
 func WriteFile(path string, data []byte) error {
-	f, err := os.CreateTemp(filepath.Dir(path), ".mgnote-*")
+	return writeAtomicFile(path, ".mgnote-*", data, true)
+}
+
+func writeAtomicFile(path, pattern string, data []byte, sync bool) error {
+	f, err := os.CreateTemp(filepath.Dir(path), pattern)
 	if err != nil {
 		return err
 	}
-	defer os.Remove(f.Name())
+	tmpName := f.Name()
+	defer os.Remove(tmpName)
 	_, writeErr := f.Write(data)
-	if err := errors.Join(writeErr, f.Sync(), f.Close()); err != nil {
+	var syncErr error
+	if sync {
+		syncErr = f.Sync()
+	}
+	if err := errors.Join(writeErr, syncErr, f.Close()); err != nil {
 		return err
 	}
-	return os.Rename(f.Name(), path)
+	return os.Rename(tmpName, path)
 }
 
 // CleanupStaleTempFiles removes leftover temporary files created by aborted
@@ -1177,14 +1173,7 @@ func (s *Store) CleanupStaleTempFiles(maxAge time.Duration) {
 				continue
 			}
 			name := entry.Name()
-			matched := false
-			for _, prefix := range prefixes {
-				if strings.HasPrefix(name, prefix) {
-					matched = true
-					break
-				}
-			}
-			if !matched {
+			if !slices.ContainsFunc(prefixes, func(p string) bool { return strings.HasPrefix(name, p) }) {
 				continue
 			}
 			info, err := entry.Info()

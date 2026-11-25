@@ -156,12 +156,13 @@ type rawSourceNote struct {
 	sourceKeys []string
 }
 
-func readMarginNote(path, ink string) ([]Book, map[string][]byte, *bookConfigIndex, error) {
-	return readMarginNoteWithCtx(context.Background(), path, ink, nil, nil, nil)
-}
-
-func readMarginNoteWithSink(path, ink string, sink mediaSink, preview func([]Book), onProgress func(ImportProgress)) ([]Book, map[string][]byte, *bookConfigIndex, error) {
-	return readMarginNoteWithCtx(context.Background(), path, ink, sink, preview, onProgress)
+func stageProgressFn(onProgress func(ImportProgress), stage ImportStage, index, count int) func(done, total int64) {
+	if onProgress == nil {
+		return nil
+	}
+	return func(done, total int64) {
+		onProgress(ImportProgress{Stage: stage, Done: done, Total: total, Index: index, Count: count})
+	}
 }
 
 func readMarginNoteWithCtx(ctx context.Context, path, ink string, sink mediaSink, preview func([]Book), onProgress func(ImportProgress)) ([]Book, map[string][]byte, *bookConfigIndex, error) {
@@ -233,10 +234,8 @@ func readMarginNoteWithCtx(ctx context.Context, path, ink string, sink mediaSink
 		}
 		hash := sha256.New()
 		var progressFn func(done, total int64)
-		if onProgress != nil && info.Size() >= 8<<20 {
-			progressFn = func(done, total int64) {
-				onProgress(ImportProgress{Stage: ImportStageExtractDB, Done: done, Total: total})
-			}
+		if info.Size() >= 8<<20 {
+			progressFn = stageProgressFn(onProgress, ImportStageExtractDB, 0, 0)
 		}
 		buf := make([]byte, copyBufferSize)
 		_, copyErr := io.CopyBuffer(hash, newProgressReader(withContextReader(ctx, f), info.Size(), progressFn), buf)
@@ -296,12 +295,7 @@ func readMarginNoteWithCtx(ctx context.Context, path, ink string, sink mediaSink
 		}
 		tempPath := temp.Name()
 		hash := sha256.New()
-		var progressFn func(done, total int64)
-		if onProgress != nil {
-			progressFn = func(done, total int64) {
-				onProgress(ImportProgress{Stage: ImportStageExtractDB, Done: done, Total: total})
-			}
-		}
+		progressFn := stageProgressFn(onProgress, ImportStageExtractDB, 0, 0)
 		buf := make([]byte, copyBufferSize)
 		n, copyErr := io.CopyBuffer(io.MultiWriter(temp, hash), newProgressReader(withContextReader(ctx, read), uncompressedSize, progressFn), buf)
 		closeErr := errors.Join(temp.Close(), read.Close())
@@ -473,19 +467,7 @@ func pruneUnusedMedia(books []Book, files map[string][]byte) map[string][]byte {
 	if len(files) == 0 {
 		return files
 	}
-	used := make(map[string]bool)
-	for _, b := range books {
-		for _, n := range b.Notes {
-			if n.Clip != "" {
-				used[n.Clip] = true
-			}
-			for _, blk := range n.Blocks {
-				if blk.Image != "" {
-					used[blk.Image] = true
-				}
-			}
-		}
-	}
+	used := referencedMedia(books)
 	out := make(map[string][]byte, len(used))
 	for name, data := range files {
 		if used[name] {
@@ -494,13 +476,6 @@ func pruneUnusedMedia(books []Book, files map[string][]byte) map[string][]byte {
 	}
 	return out
 }
-
-type zipPayload struct {
-	io.ReadCloser
-	archive *zip.ReadCloser
-}
-
-func (p zipPayload) Close() error { return errors.Join(p.ReadCloser.Close(), p.archive.Close()) }
 
 // detectImportFormat returns ".marginpkg", ".marginnotes", or ".pdf" based on
 // the file extension, falling back to magic-byte sniffing of the first 16 bytes
@@ -541,14 +516,21 @@ func listPackageDBEntries(archive *zip.Reader) []*zip.File {
 	return out
 }
 
-func entryUncompressedSize(entry *zip.File) int64 {
-	if entry == nil || entry.UncompressedSize64 == 0 {
+func clampInt64Size(size uint64) int64 {
+	if size == 0 {
 		return -1
 	}
-	if entry.UncompressedSize64 > math.MaxInt64 {
+	if size > math.MaxInt64 {
 		return math.MaxInt64
 	}
-	return int64(entry.UncompressedSize64)
+	return int64(size)
+}
+
+func entryUncompressedSize(entry *zip.File) int64 {
+	if entry == nil {
+		return -1
+	}
+	return clampInt64Size(entry.UncompressedSize64)
 }
 
 func mergeBookConfigs(dst, src *bookConfigIndex) {
@@ -561,40 +543,6 @@ func mergeBookConfigs(dst, src *bookConfigIndex) {
 	}
 	for k, v := range src.byTitle {
 		dst.byTitle[k] = v
-	}
-}
-
-func openPayload(path string) (io.ReadCloser, int64, error) {
-	switch detectImportFormat(path) {
-	case ".marginnotes":
-		f, err := os.Open(path)
-		if err != nil {
-			return nil, -1, err
-		}
-		var size int64 = -1
-		if info, err := f.Stat(); err == nil && info.Size() >= 0 {
-			size = info.Size()
-		}
-		return f, size, nil
-	case ".marginpkg":
-		archive, err := zip.OpenReader(path)
-		if err != nil {
-			return nil, -1, fmt.Errorf("无法打开 MarginNote 压缩包：%w", err)
-		}
-		entries := listPackageDBEntries(&archive.Reader)
-		if len(entries) == 0 {
-			archive.Close()
-			return nil, -1, errors.New("压缩包缺少可用的 .marginnotes 数据库")
-		}
-		payload := entries[0]
-		r, err := payload.Open()
-		if err != nil {
-			archive.Close()
-			return nil, -1, err
-		}
-		return zipPayload{r, archive}, entryUncompressedSize(payload), nil
-	default:
-		return nil, -1, errors.New("请选择 .marginpkg、.marginnotes 或 .pdf 文件")
 	}
 }
 
@@ -673,6 +621,13 @@ func tableColumns(ctx context.Context, db *sql.DB, table string) map[string]bool
 	return cols
 }
 
+func sqlColOr(cols map[string]bool, name, fallback string) string {
+	if cols[name] {
+		return "COALESCE(" + name + ", " + fallback + ")"
+	}
+	return fallback
+}
+
 func readBookConfigs(ctx context.Context, db *sql.DB) *bookConfigIndex {
 	var present bool
 	if err := db.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='ZBOOKCONFIG')").Scan(&present); err != nil || !present {
@@ -682,18 +637,12 @@ func readBookConfigs(ctx context.Context, db *sql.DB) *bookConfigIndex {
 	if len(cols) == 0 {
 		return nil
 	}
-	colOr := func(name, fallback string) string {
-		if cols[name] {
-			return "COALESCE(" + name + ", " + fallback + ")"
-		}
-		return fallback
-	}
 	query := "SELECT " +
-		colOr("ZMD5", "''") + ", " +
-		colOr("ZMD5LONG", "''") + ", " +
-		colOr("ZTITLE", "''") + ", " +
-		colOr("ZCURRPAGE", "0") + ", " +
-		colOr("ZOPTIONS", "''") +
+		sqlColOr(cols, "ZMD5", "''") + ", " +
+		sqlColOr(cols, "ZMD5LONG", "''") + ", " +
+		sqlColOr(cols, "ZTITLE", "''") + ", " +
+		sqlColOr(cols, "ZCURRPAGE", "0") + ", " +
+		sqlColOr(cols, "ZOPTIONS", "''") +
 		" FROM ZBOOKCONFIG ORDER BY Z_PK"
 	rows, err := db.QueryContext(ctx, query)
 	if err != nil {
@@ -952,12 +901,6 @@ func readRawNotes(ctx context.Context, db *sql.DB, configs *bookConfigIndex) ([]
 	if hasMedia {
 		mediaExpr = "ZHIGHLIGHT_PIC, ZNOTES"
 	}
-	colOr := func(name, fallback string) string {
-		if cols[name] {
-			return "COALESCE(" + name + ", " + fallback + ")"
-		}
-		return fallback
-	}
 	dateOrNull := func(name string) string {
 		if cols[name] {
 			return name
@@ -970,14 +913,14 @@ func readRawNotes(ctx context.Context, db *sql.DB, configs *bookConfigIndex) ([]
 		       COALESCE(ZNOTETITLE, ''), COALESCE(ZNOTES_TEXT, ''),
 		       COALESCE(ZHIGHLIGHT_TEXT, ''), ZSTARTPAGE, COALESCE(ZMINDLINKS, ''), ` +
 		mediaExpr + `, ` +
-		colOr("ZHIGHLIGHT_STYLE", "''") + `, ` +
-		colOr("ZMINDCLOSE", "0") + `, ` +
-		colOr("ZRECOGNIZE_TEXT", "''") + `, ` +
-		colOr("ZBOOKMD5", "''") + `, ` +
+		sqlColOr(cols, "ZHIGHLIGHT_STYLE", "''") + `, ` +
+		sqlColOr(cols, "ZMINDCLOSE", "0") + `, ` +
+		sqlColOr(cols, "ZRECOGNIZE_TEXT", "''") + `, ` +
+		sqlColOr(cols, "ZBOOKMD5", "''") + `, ` +
 		dateOrNull("ZHIGHLIGHT_DATE") + `, ` +
 		dateOrNull("ZNOTE_DATE") + `, ` +
-		colOr("ZTYPE", "0") + `, ` +
-		colOr("ZZINDEX", "0") + `
+		sqlColOr(cols, "ZTYPE", "0") + `, ` +
+		sqlColOr(cols, "ZZINDEX", "0") + `
 		FROM ZBOOKNOTE WHERE ZNOTEID IS NOT NULL AND ZNOTEID <> ''
 		ORDER BY Z_PK`
 	rows, err := db.QueryContext(ctx, query)

@@ -22,9 +22,11 @@ type backupManifest struct {
 	BookCount  int   `json:"bookCount"`
 }
 
+var backupDirs = []string{"books", "drawings", "media", "documents"}
+
 // ExportBackupZIP writes a full self-contained archive of the library index,
 // book shards, normalized drawings, settings, media attachments, and PDFs.
-func (s *Store) ExportBackupZIP(out io.Writer) error {
+func (s *Store) ExportBackupZIP(out io.Writer) (retErr error) {
 	if s == nil {
 		return errors.New("本地存储未初始化")
 	}
@@ -57,43 +59,38 @@ func (s *Store) ExportBackupZIP(out io.Writer) error {
 	}
 
 	zw := zip.NewWriter(out)
-	writeBytes := func(name string, data []byte, method uint16) error {
-		hdr := &zip.FileHeader{
-			Name:     name,
-			Method:   method,
-			Modified: time.Now(),
+	zwClosed := false
+	defer func() {
+		if !zwClosed && retErr != nil {
+			_ = zw.Close()
 		}
-		w, err := zw.CreateHeader(hdr)
+	}()
+
+	writeBytes := func(name string, data []byte, method uint16) error {
+		return writeZipBytes(zw, name, data, method, time.Now())
+	}
+	writeJSON := func(name string, v any) error {
+		data, err := json.Marshal(v)
 		if err != nil {
 			return err
 		}
-		_, err = w.Write(data)
-		return err
+		return writeBytes(name, data, zip.Deflate)
 	}
 
 	if err := writeBytes(backupManifestFile, manifestData, zip.Deflate); err != nil {
-		_ = zw.Close()
 		return err
 	}
 	if err := writeBytes("index.json", idxData, zip.Deflate); err != nil {
-		_ = zw.Close()
 		return err
 	}
 	if settingsData, err := os.ReadFile(filepath.Join(s.dir, "settings.json")); err == nil {
 		if err := writeBytes("settings.json", settingsData, zip.Deflate); err != nil {
-			_ = zw.Close()
 			return err
 		}
 	}
 
 	for _, book := range lib.Books {
-		data, err := json.Marshal(book)
-		if err != nil {
-			_ = zw.Close()
-			return err
-		}
-		if err := writeBytes("books/"+bookFileName(book.ID), data, zip.Deflate); err != nil {
-			_ = zw.Close()
+		if err := writeJSON("books/"+bookFileName(book.ID), book); err != nil {
 			return err
 		}
 	}
@@ -122,70 +119,73 @@ func (s *Store) ExportBackupZIP(out io.Writer) error {
 			seenDrawings[baseFile] = true
 			drawing, err := s.readDrawing(filepath.Join(drawingsDir, baseFile))
 			if err != nil {
-				_ = zw.Close()
 				return fmt.Errorf("读取手写数据失败：%w", err)
 			}
-			data, err := json.Marshal(drawing)
-			if err != nil {
-				_ = zw.Close()
-				return err
-			}
-			if err := writeBytes("drawings/"+baseFile, data, zip.Deflate); err != nil {
-				_ = zw.Close()
+			if err := writeJSON("drawings/"+baseFile, drawing); err != nil {
 				return err
 			}
 		}
 	}
 
-	copyDirToZip := func(diskDir, zipPrefix string, method uint16) error {
-		entries, err := os.ReadDir(diskDir)
-		if errors.Is(err, os.ErrNotExist) {
-			return nil
+	if err := copyDirToZip(zw, s.mediaDir(), "media", zip.Store); err != nil {
+		return err
+	}
+	if err := copyDirToZip(zw, filepath.Join(s.dir, "documents"), "documents", zip.Store); err != nil {
+		return err
+	}
+
+	zwClosed = true
+	return zw.Close()
+}
+
+func writeZipBytes(zw *zip.Writer, name string, data []byte, method uint16, mod time.Time) error {
+	w, err := zw.CreateHeader(&zip.FileHeader{
+		Name:     name,
+		Method:   method,
+		Modified: mod,
+	})
+	if err != nil {
+		return err
+	}
+	_, err = w.Write(data)
+	return err
+}
+
+func copyDirToZip(zw *zip.Writer, diskDir, zipPrefix string, method uint16) error {
+	entries, err := os.ReadDir(diskDir)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || strings.HasPrefix(entry.Name(), ".") {
+			continue
 		}
+		info, err := entry.Info()
+		if err != nil || !info.Mode().IsRegular() {
+			continue
+		}
+		f, err := os.Open(filepath.Join(diskDir, entry.Name()))
 		if err != nil {
 			return err
 		}
-		for _, entry := range entries {
-			if entry.IsDir() || strings.HasPrefix(entry.Name(), ".") {
-				continue
-			}
-			full := filepath.Join(diskDir, entry.Name())
-			info, err := entry.Info()
-			if err != nil || !info.Mode().IsRegular() {
-				continue
-			}
-			hdr := &zip.FileHeader{
-				Name:     zipPrefix + "/" + entry.Name(),
-				Method:   method,
-				Modified: info.ModTime(),
-			}
-			w, err := zw.CreateHeader(hdr)
-			if err != nil {
-				return err
-			}
-			f, err := os.Open(full)
-			if err != nil {
-				return err
-			}
-			_, copyErr := io.Copy(w, f)
-			closeErr := f.Close()
-			if err := errors.Join(copyErr, closeErr); err != nil {
-				return err
-			}
+		w, err := zw.CreateHeader(&zip.FileHeader{
+			Name:     zipPrefix + "/" + entry.Name(),
+			Method:   method,
+			Modified: info.ModTime(),
+		})
+		if err != nil {
+			_ = f.Close()
+			return err
 		}
-		return nil
+		_, copyErr := io.Copy(w, f)
+		if err := errors.Join(copyErr, f.Close()); err != nil {
+			return err
+		}
 	}
-
-	if err := copyDirToZip(s.mediaDir(), "media", zip.Store); err != nil {
-		_ = zw.Close()
-		return err
-	}
-	if err := copyDirToZip(filepath.Join(s.dir, "documents"), "documents", zip.Store); err != nil {
-		_ = zw.Close()
-		return err
-	}
-
-	return zw.Close()
+	return nil
 }
 
 func validateBackupEntryName(raw string) (string, bool) {
@@ -238,7 +238,7 @@ func (s *Store) RestoreBackupZIP(zipPath string) (Library, Settings, error) {
 	}
 	defer os.RemoveAll(stageDir)
 
-	for _, sub := range []string{"books", "drawings", "media", "documents"} {
+	for _, sub := range backupDirs {
 		if err := os.MkdirAll(filepath.Join(stageDir, sub), 0700); err != nil {
 			return Library{}, Settings{}, err
 		}
@@ -248,7 +248,7 @@ func (s *Store) RestoreBackupZIP(zipPath string) (Library, Settings, error) {
 	for _, f := range r.File {
 		if f.FileInfo().IsDir() {
 			cleanDir := strings.TrimSuffix(f.Name, "/")
-			if cleanDir != "" && !slices.Contains([]string{"books", "drawings", "media", "documents"}, cleanDir) {
+			if cleanDir != "" && !slices.Contains(backupDirs, cleanDir) {
 				return Library{}, Settings{}, fmt.Errorf("备份包含非法目录：%s", f.Name)
 			}
 			continue
@@ -265,18 +265,7 @@ func (s *Store) RestoreBackupZIP(zipPath string) (Library, Settings, error) {
 			return Library{}, Settings{}, fmt.Errorf("备份路径越界：%s", f.Name)
 		}
 
-		rc, err := f.Open()
-		if err != nil {
-			return Library{}, Settings{}, err
-		}
-		out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
-		if err != nil {
-			_ = rc.Close()
-			return Library{}, Settings{}, err
-		}
-		_, copyErr := io.Copy(out, rc)
-		closeErr := errors.Join(out.Close(), rc.Close())
-		if err := errors.Join(copyErr, closeErr); err != nil {
+		if err := extractBackupZipFile(f, dst); err != nil {
 			return Library{}, Settings{}, err
 		}
 		if rel == "index.json" {
@@ -364,4 +353,18 @@ func (s *Store) RestoreBackupZIP(zipPath string) (Library, Settings, error) {
 		_ = json.Unmarshal(data, &settings)
 	}
 	return lib, settings, nil
+}
+
+func extractBackupZipFile(f *zip.File, dst string) error {
+	rc, err := f.Open()
+	if err != nil {
+		return err
+	}
+	out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
+	if err != nil {
+		_ = rc.Close()
+		return err
+	}
+	_, copyErr := io.Copy(out, rc)
+	return errors.Join(copyErr, out.Close(), rc.Close())
 }
