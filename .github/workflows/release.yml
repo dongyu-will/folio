@@ -1,0 +1,359 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version (e.g. 0.3.0 or v0.3.0)"
+        required: true
+        type: string
+      draft:
+        description: "Keep GitHub Release as draft"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+      version: ${{ steps.meta.outputs.version }}
+      prerelease: ${{ steps.meta.outputs.prerelease }}
+    steps:
+      - id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            raw="${{ inputs.version }}"
+          else
+            raw="${{ github.ref_name }}"
+          fi
+          ver="${raw#v}"
+          if ! [[ "$ver" =~ ^[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$ ]]; then
+            echo "Invalid version format: $raw" >&2
+            exit 1
+          fi
+          tag="v${ver}"
+          prerelease="false"
+          if [[ "${ver%%+*}" == *-* ]]; then
+            prerelease="true"
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=$ver" >> "$GITHUB_OUTPUT"
+          echo "prerelease=$prerelease" >> "$GITHUB_OUTPUT"
+
+  build-macos:
+    needs: prepare
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Sync mygo.json version
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          python3 - <<'PY'
+          import json, os
+          with open("mygo.json", "r", encoding="utf-8") as f:
+              data = json.load(f)
+          data["version"] = os.environ["VERSION"]
+          with open("mygo.json", "w", encoding="utf-8") as f:
+              json.dump(data, f, ensure_ascii=False, indent=2)
+              f.write("\n")
+          PY
+
+      - name: Run vet and unit tests
+        run: |
+          sh scripts/build-ink.sh
+          go vet ./...
+          go test -count=1 ./...
+
+      - name: Build macOS app & DMG
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          MYGO_UPDATER_PRIVATE_KEY: ${{ secrets.MYGO_UPDATER_PRIVATE_KEY }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          go tool mygo build -version "$VERSION" -platform darwin/arm64
+
+      - name: Collect macOS release artifacts
+        run: |
+          mkdir -p release-macos
+          for pattern in "*.dmg" "*.tar.gz" "*.delta" "update-*.json" "install.sh"; do
+            for f in build/$pattern; do
+              [ -f "$f" ] && cp "$f" release-macos/
+            done
+          done
+          ls -lh release-macos
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-macos
+          path: release-macos/*
+          if-no-files-found: error
+
+  build-windows:
+    needs: prepare
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+
+      - name: Sync mygo.json version
+        shell: pwsh
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          $cfg = Get-Content mygo.json -Raw -Encoding UTF8 | ConvertFrom-Json
+          $cfg.version = $env:VERSION
+          $cfg | ConvertTo-Json -Depth 10 | Set-Content mygo.json -Encoding UTF8
+
+      - name: Build bundled WinRT PDF helper (optional fallback exists)
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          pwsh -File scripts/build-windows-pdf.ps1
+
+      - name: Build Windows installer & archive
+        shell: pwsh
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          MYGO_UPDATER_PRIVATE_KEY: ${{ secrets.MYGO_UPDATER_PRIVATE_KEY }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          go tool mygo build -version "$env:VERSION" -platform windows/amd64 -skip-build-command
+
+      - name: Collect Windows release artifacts
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path release-windows | Out-Null
+          Get-ChildItem -Path build -File | Where-Object {
+            $_.Name -like "*.exe" -or
+            $_.Name -like "*.tar.gz" -or
+            $_.Name -like "*.delta" -or
+            $_.Name -like "update-*.json" -or
+            $_.Name -eq "install.ps1"
+          } | ForEach-Object { Copy-Item $_.FullName -Destination release-windows }
+          Get-ChildItem release-windows
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-windows
+          path: release-windows/*
+          if-no-files-found: error
+
+  build-android:
+    needs: prepare
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Ensure Android NDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          sdk="${ANDROID_HOME:-$ANDROID_SDK_ROOT}"
+          ndk_dir=""
+          if [ -d "$sdk/ndk" ]; then
+            ndk_dir="$(ls -1d "$sdk/ndk"/* 2>/dev/null | sort -V | tail -n 1 || true)"
+          fi
+          if [ -z "$ndk_dir" ]; then
+            yes | "$sdk/cmdline-tools/latest/bin/sdkmanager" --install "ndk;27.2.12479018" >/dev/null
+            ndk_dir="$sdk/ndk/27.2.12479018"
+          fi
+          echo "ANDROID_NDK_HOME=$ndk_dir" >> "$GITHUB_ENV"
+
+      - name: Configure mygo.json version & Android signing
+        shell: bash
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+        run: |
+          set -euo pipefail
+          if [ -n "${ANDROID_KEYSTORE_BASE64:-}" ]; then
+            printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/folio-release.jks"
+          fi
+          python3 - <<'PY'
+          import json, os
+          with open("mygo.json", "r", encoding="utf-8") as f:
+              data = json.load(f)
+          data["version"] = os.environ["VERSION"]
+          ks_path = os.path.join(os.environ["RUNNER_TEMP"], "folio-release.jks")
+          if os.environ.get("ANDROID_KEYSTORE_BASE64") and os.path.exists(ks_path):
+              android = data.setdefault("android", {})
+              android["keystore"] = ks_path
+              if os.environ.get("ANDROID_KEY_ALIAS"):
+                  android["keyAlias"] = os.environ["ANDROID_KEY_ALIAS"]
+          with open("mygo.json", "w", encoding="utf-8") as f:
+              json.dump(data, f, ensure_ascii=False, indent=2)
+              f.write("\n")
+          PY
+
+      - name: Build Android APK
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          MYGO_ANDROID_KEYSTORE_PASSWORD: ${{ secrets.MYGO_ANDROID_KEYSTORE_PASSWORD }}
+          MYGO_ANDROID_KEY_PASSWORD: ${{ secrets.MYGO_ANDROID_KEY_PASSWORD }}
+        run: |
+          go tool mygo build -version "$VERSION" -platform android -skip-build-command
+
+      - name: Package Android APK & manifest
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          mkdir -p release-android
+          apk_name="folio-${VERSION}-android-arm64.apk"
+          cp "build/folio-${VERSION}.apk" "release-android/${apk_name}"
+          python3 - <<'PY'
+          import hashlib, json, os
+          ver = os.environ["VERSION"]
+          tag = os.environ["TAG"]
+          repo = os.environ["REPO"]
+          apk_name = f"folio-{ver}-android-arm64.apk"
+          apk_path = os.path.join("release-android", apk_name)
+          with open(apk_path, "rb") as f:
+              data = f.read()
+          sha = hashlib.sha256(data).hexdigest()
+          size = len(data)
+          url = f"https://github.com/{repo}/releases/download/{tag}/{apk_name}"
+          manifest = {
+              "version": ver,
+              "notes": f"Folio {tag}",
+              "releaseUrl": f"https://github.com/{repo}/releases/tag/{tag}",
+              "apkUrl": url,
+              "apkName": apk_name,
+              "apkSize": size,
+              "sha256": sha,
+              "apks": {
+                  "arm64": {
+                      "url": url,
+                      "name": apk_name,
+                      "size": size,
+                      "sha256": sha,
+                  }
+              },
+          }
+          with open("release-android/update-android.json", "w", encoding="utf-8") as f:
+              json.dump(manifest, f, ensure_ascii=False, indent=2)
+              f.write("\n")
+          PY
+          ls -lh release-android
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-android
+          path: release-android/*
+          if-no-files-found: error
+
+  publish:
+    needs: [prepare, build-macos, build-windows, build-android]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Generate SHA256SUMS
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          files=()
+          while IFS= read -r -d '' f; do
+            base="$(basename "$f")"
+            case "$base" in
+              SHA256SUMS|update-*.json) continue ;;
+              *) files+=("$base") ;;
+            esac
+          done < <(find . -maxdepth 1 -type f -print0 | sort -z)
+          if [ "${#files[@]}" -gt 0 ]; then
+            sha256sum "${files[@]}" > SHA256SUMS
+          fi
+          ls -lh
+
+      - name: Create & upload GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+          PRERELEASE: ${{ needs.prepare.outputs.prerelease }}
+          KEEP_DRAFT: ${{ github.event_name == 'workflow_dispatch' && inputs.draft || false }}
+        run: |
+          set -euo pipefail
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            flags=(--draft --title "$TAG" --generate-notes)
+            if [ "$PRERELEASE" = "true" ]; then
+              flags+=(--prerelease)
+            fi
+            gh release create "$TAG" "${flags[@]}"
+          fi
+
+          # Upload binaries, installers, deltas, and checksums before manifests.
+          payloads=()
+          manifests=()
+          for f in dist/*; do
+            [ -f "$f" ] || continue
+            base="$(basename "$f")"
+            if [[ "$base" == update-*.json ]]; then
+              manifests+=("$f")
+            else
+              payloads+=("$f")
+            fi
+          done
+          if [ "${#payloads[@]}" -gt 0 ]; then
+            gh release upload "$TAG" --clobber "${payloads[@]}"
+          fi
+          if [ "${#manifests[@]}" -gt 0 ]; then
+            gh release upload "$TAG" --clobber "${manifests[@]}"
+          fi
+          if [ "$KEEP_DRAFT" != "true" ]; then
+            edit_flags=(--draft=false)
+            if [ "$PRERELEASE" = "true" ]; then
+              edit_flags+=(--prerelease)
+            fi
+            gh release edit "$TAG" "${edit_flags[@]}"
+          fi
