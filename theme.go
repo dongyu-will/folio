@@ -115,29 +115,39 @@ func svgIcon(body string) *ui.SVG {
 }
 
 var (
-	icImport       = svgIcon(`<path d="M12 4v11m-4-3.5 4 4 4-4"/><path d="M4.5 16.5v2a1.5 1.5 0 0 0 1.5 1.5h12a1.5 1.5 0 0 0 1.5-1.5v-2"/>`)
-	icBook         = svgIcon(`<path d="M4 19.5v-15A2.5 2.5 0 0 1 6.5 2H19a1 1 0 0 1 1 1v18a1 1 0 0 1-1 1H6.5a2.5 2.5 0 0 1 0-5H20"/>`)
-	icChevronDown  = svgIcon(`<path d="m6.5 9.5 5.5 5.5 5.5-5.5"/>`)
-	icChevronLeft  = svgIcon(`<path d="m14.5 6.5-5.5 5.5 5.5 5.5"/>`)
-	icChevronRight = svgIcon(`<path d="m9.5 6.5 5.5 5.5-5.5 5.5"/>`)
-	icTrash        = svgIcon(`<path d="M3.5 6h17"/><path d="M8.5 6V4.2A1.2 1.2 0 0 1 9.7 3h4.6a1.2 1.2 0 0 1 1.2 1.2V6"/><path d="M6.5 6l.9 13.3A1.7 1.7 0 0 0 9.1 21h5.8a1.7 1.7 0 0 0 1.7-1.7L17.5 6"/>`)
-	icPlus         = svgIcon(`<path d="M12 5v14M5 12h14"/>`)
-	icMinus        = svgIcon(`<path d="M5 12h14"/>`)
-	icEdit         = svgIcon(`<path d="M12 20h8.5"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z"/>`)
-	icLayers       = svgIcon(`<path d="m12 3 9 4.5-9 4.5-9-4.5Z"/><path d="m3 12 9 4.5 9-4.5"/><path d="m3 16.5 9 4.5 9-4.5"/>`)
-	icFolder       = svgIcon(`<path d="M3 6.5A2 2 0 0 1 5 4.5h4.2a1.8 1.8 0 0 1 1.4.7l1 1.3H19a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2Z"/>`)
-	icCheck        = svgIcon(`<circle cx="12" cy="12" r="9"/><path d="m8.5 12.2 2.3 2.3 4.8-5"/>`)
-	icAlert        = svgIcon(`<circle cx="12" cy="12" r="9"/><path d="M12 8v4.5"/><path d="M12 16h.01"/>`)
-	icSidebar      = svgIcon(`<rect x="3" y="4" width="18" height="16" rx="2.5"/><path d="M9 4v16"/>`)
-	icArrowLeft    = svgIcon(`<path d="M19 12H5"/><path d="m11 6-6 6 6 6"/>`)
-	icClose        = svgIcon(`<path d="M18 6 6 18M6 6l12 12"/>`)
-	icPage         = svgIcon(`<path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8Z"/><path d="M14 3v5h5"/>`)
-	icFit          = svgIcon(`<path d="M4 9V6a2 2 0 0 1 2-2h3"/><path d="M15 4h3a2 2 0 0 1 2 2v3"/><path d="M20 15v3a2 2 0 0 1-2 2h-3"/><path d="M9 20H6a2 2 0 0 1-2-2v-3"/>`)
-	icPointer      = svgIcon(`<path d="M5 3.5 17.5 11l-5.3 1.4L9.8 18Z"/><path d="m12.8 12.8 4.4 4.4"/>`)
-	icPDFSearch    = svgIcon(`<circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/>`)
+	icImport        = svgIcon(`<path d="M12 4v11m-4-3.5 4 4 4-4"/><path d="M4.5 16.5v2a1.5 1.5 0 0 0 1.5 1.5h12a1.5 1.5 0 0 0 1.5-1.5v-2"/>`)
+	icBook          = svgIcon(`<path d="M4 19.5v-15A2.5 2.5 0 0 1 6.5 2H19a1 1 0 0 1 1 1v18a1 1 0 0 1-1 1H6.5a2.5 2.5 0 0 1 0-5H20"/>`)
+	icChevronDown   = svgIcon(`<path d="m6.5 9.5 5.5 5.5 5.5-5.5"/>`)
+	icChevronLeft   = svgIcon(`<path d="m14.5 6.5-5.5 5.5 5.5 5.5"/>`)
+	icChevronRight  = svgIcon(`<path d="m9.5 6.5 5.5 5.5-5.5 5.5"/>`)
+	icTrash         = svgIcon(`<path d="M3.5 6h17"/><path d="M8.5 6V4.2A1.2 1.2 0 0 1 9.7 3h4.6a1.2 1.2 0 0 1 1.2 1.2V6"/><path d="M6.5 6l.9 13.3A1.7 1.7 0 0 0 9.1 21h5.8a1.7 1.7 0 0 0 1.7-1.7L17.5 6"/>`)
+	icPlus          = svgIcon(`<path d="M12 5v14M5 12h14"/>`)
+	icMinus         = svgIcon(`<path d="M5 12h14"/>`)
+	icEdit          = svgIcon(`<path d="M12 20h8.5"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z"/>`)
+	icLayers        = svgIcon(`<path d="m12 3 9 4.5-9 4.5-9-4.5Z"/><path d="m3 12 9 4.5 9-4.5"/><path d="m3 16.5 9 4.5 9-4.5"/>`)
+	icFolder        = svgIcon(`<path d="M3 6.5A2 2 0 0 1 5 4.5h4.2a1.8 1.8 0 0 1 1.4.7l1 1.3H19a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2Z"/>`)
+	icCheck         = svgIcon(`<circle cx="12" cy="12" r="9"/><path d="m8.5 12.2 2.3 2.3 4.8-5"/>`)
+	icAlert         = svgIcon(`<circle cx="12" cy="12" r="9"/><path d="M12 8v4.5"/><path d="M12 16h.01"/>`)
+	icSidebar       = svgIcon(`<rect x="3" y="4" width="18" height="16" rx="2.5"/><path d="M9 4v16"/>`)
+	icArrowLeft     = svgIcon(`<path d="M19 12H5"/><path d="m11 6-6 6 6 6"/>`)
+	icClose         = svgIcon(`<path d="M18 6 6 18M6 6l12 12"/>`)
+	icPage          = svgIcon(`<path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8Z"/><path d="M14 3v5h5"/>`)
+	icFit           = svgIcon(`<path d="M4 9V6a2 2 0 0 1 2-2h3"/><path d="M15 4h3a2 2 0 0 1 2 2v3"/><path d="M20 15v3a2 2 0 0 1-2 2h-3"/><path d="M9 20H6a2 2 0 0 1-2-2v-3"/>`)
+	icPointer       = svgIcon(`<path d="M5 3.5 17.5 11l-5.3 1.4L9.8 18Z"/><path d="m12.8 12.8 4.4 4.4"/>`)
+	icPDFSearch     = svgIcon(`<circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/>`)
+	icUpdateRefresh = svgIcon(`<path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v6h-6"/>`)
+	icExternalLink  = svgIcon(`<path d="M14 5h5v5"/><path d="M10 14 19 5"/><path d="M19 13v5a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2h5"/>`)
 )
 
 func clamp(n, low, high float32) float32 { return max(low, min(n, high)) }
+
+func modalDimensions(paneW, paneH, marginW, minW, maxW, marginH, minH, maxH float32) (float32, float32) {
+	capW := max(260, paneW-24)
+	w := min(capW, clamp(paneW-marginW, min(capW, minW), maxW))
+	capH := max(160, paneH-16)
+	h := min(capH, clamp(paneH-marginH, min(capH, minH), maxH))
+	return w, h
+}
 
 func horizontalRule(c *ui.Context, p palette) {
 	ui.Box(c).FillWidth().Height(1).Shrink(0).Background(p.rule)
@@ -152,11 +162,6 @@ func brandMark(c *ui.Context, p palette, size float32) {
 		Children(func() {
 			ui.Icon(c, icFigmaBrand).Size(iconSize, iconSize).TextColor(p.onAccent)
 		})
-}
-
-func sectionKicker(c *ui.Context, p palette, text string) {
-	ui.Text(c, text).FontSize(11).FontWeight(600).LetterSpacing(0.45).
-		TextColor(p.quiet).Padding(8, 10, 4).Shrink(0)
 }
 
 func hasDigit(s string) bool {
@@ -179,9 +184,9 @@ func badgePill(c *ui.Context, p palette, text string) {
 	})
 }
 
-// primaryButton renders a Linear-inspired gradient CTA with specular top bevel.
-func primaryButton(c *ui.Context, p palette, label string, icon *ui.SVG, disabled bool, pressed func()) ui.Element {
-	b := ui.ButtonBase(c).Label(label).MinHeight(36).Padding(0, 14).Radius(8).Center().Gap(6).
+// accentButton renders a Linear-inspired gradient CTA with specular top bevel.
+func accentButton(c *ui.Context, p palette, h, padX, fontSize, iconSize float32, label string, icon *ui.SVG, disabled bool, pressed func()) ui.Element {
+	b := ui.ButtonBase(c).Label(label).Height(h).PaddingX(padX).Radius(8).Center().Gap(6).Shrink(0).
 		Disabled(disabled).FocusRingColor(p.accent).OnClick(pressed).
 		Transition(trColorMicro)
 	if disabled {
@@ -196,13 +201,41 @@ func primaryButton(c *ui.Context, p palette, label string, icon *ui.SVG, disable
 		}
 	}
 	applyPressPose(b, b.Pressed(), disabled)
+	weight := 550
+	if fontSize >= 13 {
+		weight = 600
+	}
 	b.Children(func() {
 		if icon != nil {
-			ui.Icon(c, icon).Size(14, 14).TextColor(p.onAccent)
+			ui.Icon(c, icon).Size(iconSize, iconSize).TextColor(p.onAccent)
 		}
-		ui.Text(c, label).TextColor(p.onAccent).FontSize(13).FontWeight(600).LetterSpacing(-0.1).SingleLine()
+		txt := ui.Text(c, label).TextColor(p.onAccent).FontSize(fontSize).FontWeight(weight).SingleLine()
+		if fontSize >= 13 {
+			txt.LetterSpacing(-0.1)
+		}
 	})
 	return b
+}
+
+// primaryButton renders a Linear-inspired gradient CTA with specular top bevel.
+func primaryButton(c *ui.Context, p palette, label string, icon *ui.SVG, disabled bool, pressed func()) ui.Element {
+	return accentButton(c, p, 36, 14, 13, 14, label, icon, disabled, pressed)
+}
+
+func colorSwatchDot(c *ui.Context, p palette, key, label string, size, dotSize float32, borderW float32, color ui.Color, selected bool, onClick func()) {
+	ctx := c
+	if key != "" {
+		ctx = c.Key(key)
+	}
+	sw := ui.ButtonBase(ctx).Size(size, size).Radius(99).
+		Center().Label(label).Transition(trColorMicro).OnClick(onClick)
+	applySelectScalePose(sw, selected, sw.Pressed())
+	sw.Children(func() {
+		dot := ui.Box(c).Size(dotSize, dotSize).Radius(99).Background(color)
+		if selected {
+			dot.Border(borderW, p.ink)
+		}
+	})
 }
 
 // pillButton renders an Apple/Linear secondary or ghost pill button with optional icon.

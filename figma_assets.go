@@ -27,7 +27,4 @@ var (
 	icSettingExport = designIcon("export")
 	icSettingDelete = designIcon("delete")
 	icFigmaBrand    = designIcon("brand")
-	toggleOn        = designIcon("toggle-on")
-	toggleOnDark    = designIcon("toggle-on-dark")
-	toggleOff       = designIcon("toggle-off")
 )

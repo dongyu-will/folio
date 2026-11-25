@@ -126,9 +126,9 @@ func segments[T comparable](c *ui.Context, p palette, options []segment[T], sele
 }
 
 func segmentsSized[T comparable](c *ui.Context, p palette, touch bool, options []segment[T], selected T, change func(T)) {
-	outerH, btnH, padX, fontSize := float32(31), float32(24), float32(10), float32(12)
+	outerH, btnH, padX, outerR, btnR, fontSize := float32(31), float32(24), float32(10), float32(8), float32(5), float32(12)
 	if touch {
-		outerH, btnH, padX, fontSize = 38, 31, 12, 12.5
+		outerH, btnH, padX, outerR, btnR, fontSize = 36, 28, 12, 9, 6, 12.5
 	}
 	var kb strings.Builder
 	for i, opt := range options {
@@ -139,11 +139,11 @@ func segmentsSized[T comparable](c *ui.Context, p palette, touch bool, options [
 	}
 	groupKey := kb.String()
 	pillTr := trSegmentPill(groupKey)
-	ui.Row(c).Height(outerH).Shrink(0).Padding(3).Gap(2).Radius(8).
+	ui.Row(c).Height(outerH).Shrink(0).Padding(3).Gap(2).Radius(outerR).
 		AlignItems(ui.Center).Background(p.inputBg).Border(1, p.rule).Children(func() {
 		for _, opt := range options {
 			active := opt.value == selected
-			b := ui.ButtonBase(c.Key(opt.title)).Height(btnH).PaddingX(padX).Radius(5).Center().
+			b := ui.ButtonBase(c.Key(opt.title)).Height(btnH).PaddingX(padX).Radius(btnR).Center().
 				Shrink(0).Label(opt.title).Selected(active).Transition(trColorMicro).OnClick(func() { change(opt.value) })
 			applyPressPose(b, b.Pressed(), false)
 			fg := p.quiet
@@ -157,11 +157,14 @@ func segmentsSized[T comparable](c *ui.Context, p palette, touch bool, options [
 			}
 			b.Children(func() {
 				if active {
-					ui.Box(c.Key("seg-pill-"+groupKey)).Absolute().Fill().Radius(5).
+					ui.Box(c.Key("seg-pill-"+groupKey)).Absolute().Fill().Radius(btnR).
 						Background(p.elevated).Border(1, p.border).Shadow(0, 1, 2, 0, p.shadowSoft).
-						Transition(pillTr)
+						IgnoreInput(true).Transition(pillTr)
 				}
-				ui.Text(c, opt.title).FontSize(fontSize).TextColor(fg).SingleLine()
+				txt := ui.Text(c, opt.title).FontSize(fontSize).TextColor(fg).SingleLine()
+				if touch {
+					txt.FontWeight(550)
+				}
 			})
 		}
 	})
@@ -284,57 +287,21 @@ func settingButtonWithHeight(c *ui.Context, p palette, h float32, title string, 
 	return button
 }
 
-func settingButton(c *ui.Context, p palette, title string, icon *ui.SVG, danger, disabled bool, action func()) ui.Element {
-	return settingButtonWithHeight(c, p, settingButtonHeight(isMobilePlatform()), title, icon, danger, disabled, action)
-}
-
 func (a *workspace) settingButton(c *ui.Context, p palette, title string, icon *ui.SVG, danger, disabled bool, action func()) ui.Element {
 	return settingButtonWithHeight(c, p, settingButtonHeight(a.touchUI()), title, icon, danger, disabled, action)
 }
 
-var (
-	icUpdateRefresh = svgIcon(`<path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v6h-6"/>`)
-	icExternalLink  = svgIcon(`<path d="M14 5h5v5"/><path d="M10 14 19 5"/><path d="M19 13v5a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2h5"/>`)
-)
-
-func settingPrimaryButtonWithHeight(c *ui.Context, p palette, h float32, title string, icon *ui.SVG, disabled bool, action func()) ui.Element {
+func (a *workspace) settingPrimaryButton(c *ui.Context, p palette, title string, icon *ui.SVG, disabled bool, action func()) ui.Element {
+	h := settingButtonHeight(a.touchUI())
 	padX := float32(11)
 	if h >= 36 {
 		padX = 13
 	}
-	button := ui.ButtonBase(c).Height(h).PaddingX(padX).Gap(6).Center().Radius(8).Shrink(0).
-		Label(title).Disabled(disabled).FocusRingColor(p.accent).Transition(trColorMicro).OnClick(action)
-	applyPressPose(button, button.Pressed(), disabled)
-	if disabled {
-		button.Background(p.accent.Alpha(.45))
-	} else {
-		button.Gradient(p.accentTop, p.accentBot, 180).
-			Border(1, p.accentBot).
-			InsetShadow(0, 1, 0, 0, ui.Hex("#ffffff").Alpha(.24)).
-			Shadow(0, 1, 3, 0, p.accent.Alpha(.28))
-		if button.Pressed() {
-			button.Background(p.accentBot)
-		}
-	}
-	button.Children(func() {
-		if icon != nil {
-			ui.Icon(c, icon).Size(13, 13).TextColor(p.onAccent)
-		}
-		ui.Text(c, title).FontSize(12).FontWeight(550).TextColor(p.onAccent).SingleLine()
-	})
-	return button
-}
-
-func settingPrimaryButton(c *ui.Context, p palette, title string, icon *ui.SVG, disabled bool, action func()) ui.Element {
-	return settingPrimaryButtonWithHeight(c, p, settingButtonHeight(isMobilePlatform()), title, icon, disabled, action)
-}
-
-func (a *workspace) settingPrimaryButton(c *ui.Context, p palette, title string, icon *ui.SVG, disabled bool, action func()) ui.Element {
-	return settingPrimaryButtonWithHeight(c, p, settingButtonHeight(a.touchUI()), title, icon, disabled, action)
+	return accentButton(c, p, h, padX, 12, 13, title, icon, disabled, action)
 }
 
 func (a *workspace) settingsCard(c *ui.Context, p palette, width, height float32) {
-	cardW, cardH := min(640, width-24), min(746, height-24)
+	cardW, cardH := modalDimensions(width, height, 24, 0, 640, 24, 0, 746)
 	if cardW < 1 || cardH < 1 {
 		return
 	}

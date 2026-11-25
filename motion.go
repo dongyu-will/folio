@@ -72,22 +72,6 @@ var (
 		ExitDuration: 120 * time.Millisecond,
 		ExitEase:     ui.EaseIn,
 	}
-	trCollapseV = ui.ElementTransition{
-		Animation:    &animLayout,
-		Height:       true,
-		Enter:        &ui.Motion{Collapse: true, Opacity: 0},
-		Exit:         &ui.Motion{Collapse: true, Opacity: 0},
-		ExitDuration: 160 * time.Millisecond,
-		ExitEase:     ui.EaseIn,
-	}
-	trCollapseH = ui.ElementTransition{
-		Animation:    &animLayout,
-		Width:        true,
-		Enter:        &ui.Motion{Collapse: true, Opacity: 0},
-		Exit:         &ui.Motion{Collapse: true, Opacity: 0},
-		ExitDuration: 180 * time.Millisecond,
-		ExitEase:     ui.EaseIn,
-	}
 	// Non-collapsing panel transitions keep full layout bounds at t=0 so
 	// newly opened panels can receive clicks immediately while still collapsing on Exit.
 	trPanelSlideV = ui.ElementTransition{
@@ -134,9 +118,8 @@ func ctNumeric(down bool) ui.ContentTransition {
 }
 
 var (
-	ctIcon  = ui.ContentTransition{Animation: &animContent}
-	ctText  = ui.ContentTransition{Animation: &animContent}
-	ctImage = ui.ContentTransition{Animation: &animContent}
+	ctIcon = ui.ContentTransition{Animation: &animContent}
+	ctText = ui.ContentTransition{Animation: &animContent}
 )
 
 // applyPressPose applies a paint-only tactile press scale without triggering layout.

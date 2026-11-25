@@ -166,7 +166,6 @@ type workspace struct {
 	reviewDir       int8
 	reviewStep      uint64
 	previewDir      int8
-	pdfPageDir      int8
 	toastShakeRun   uint64
 	discardShakeRun uint64
 	pdfPageShakeRun uint64
