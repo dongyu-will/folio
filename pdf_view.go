@@ -49,14 +49,14 @@ type pdfState struct {
 	lastZoomVPX, lastZoomVPY float32
 	lastZoomAt               time.Time
 	margin                   float32
-	marginOpen             bool
-	highlight              *notebook.PDFRegion
-	focusHighlight         bool
-	aspect                 float32
-	jumpPageText           string
-	pagePts                map[string][2]float32
-	focusedHighlightNoteID string
-	highlightSelectedAt    string
+	marginOpen               bool
+	highlight                *notebook.PDFRegion
+	focusHighlight           bool
+	aspect                   float32
+	jumpPageText             string
+	pagePts                  map[string][2]float32
+	focusedHighlightNoteID   string
+	highlightSelectedAt      string
 
 	thumbsOpen   bool
 	thumbScroll  ui.ScrollState
@@ -466,7 +466,7 @@ func (a *workspace) documentWorkspace(c *ui.Context, p palette, width, height fl
 			minPane := min(float32(180), max(90, (bodyHeight-gripSize)*.3))
 			pdfHeight := clamp((bodyHeight-gripSize)*a.splitRatio, minPane, max(minPane, bodyHeight-gripSize-minPane))
 			ui.Box(c).FillWidth().Height(pdfHeight).Shrink(0).Children(func() { a.pdfPane(c, p, width, pdfHeight) })
-			a.splitGripVertical(c, p, bodyHeight, pdfHeight, gripSize)
+			a.splitGrip(c, p, true, bodyHeight, pdfHeight, gripSize)
 			ui.Box(c).Grow(1).FillWidth().MinHeight(0).Children(func() { showNotesPane(width, max(1, bodyHeight-pdfHeight-gripSize)) })
 			return
 		}
@@ -485,7 +485,7 @@ func (a *workspace) documentWorkspace(c *ui.Context, p palette, width, height fl
 		ui.Row(c).FillWidth().Grow(1).MinHeight(0).Children(func() {
 			ui.Box(c).Width(pdfWidth).FillHeight().Shrink(0).Children(func() { a.pdfPane(c, p, pdfWidth, bodyHeight) })
 			if a.mode == splitMode {
-				a.splitGrip(c, p, width, pdfWidth, gripSize)
+				a.splitGrip(c, p, false, width, pdfWidth, gripSize)
 				ui.Box(c).Grow(1).MinWidth(0).FillHeight().Children(func() {
 					showNotesPane(max(1, width-pdfWidth-gripSize), bodyHeight)
 				})
@@ -521,7 +521,7 @@ func (a *workspace) workspaceToolbar(c *ui.Context, p palette, width, barH float
 		}
 		ui.Box(c).Grow(1).MinWidth(0)
 		if a.pdf.document != "" {
-			a.modeSegments(c, p, []segment[workspaceMode]{{"PDF", pdfMode}, {"分屏", splitMode}, {"画布", canvasMode}}, a.mode, a.setMode)
+			segmentsSized(c, p, touch, []segment[workspaceMode]{{"PDF", pdfMode}, {"分屏", splitMode}, {"画布", canvasMode}}, a.mode, a.setMode)
 			ui.Box(c).Grow(1).MinWidth(0)
 		}
 		if a.mode != pdfMode {
@@ -557,15 +557,14 @@ func (a *workspace) workspaceToolbar(c *ui.Context, p palette, width, barH float
 			if layout := a.settings.LayoutMode(); layout != notebook.LayoutOutline {
 				showFoldAll := !compact && (!touch || a.mode == canvasMode || width >= 960)
 				if showFoldAll && (layout == notebook.LayoutCards || layout == notebook.LayoutBoard) && a.hasExpandableBranches() {
-					if a.hasCollapsedBranches() {
-						pillButton(c, p, "全部展开", icLayers, false, a.editing(), func() {
-							a.setAllExpanded(true)
-						}).Height(btnSize)
-					} else {
-						pillButton(c, p, "全部收起", icLayers, false, a.editing(), func() {
-							a.setAllExpanded(false)
-						}).Height(btnSize)
+					collapsed := a.hasCollapsedBranches()
+					label := "全部收起"
+					if collapsed {
+						label = "全部展开"
 					}
+					pillButton(c, p, label, icLayers, false, a.editing(), func() {
+						a.setAllExpanded(collapsed)
+					}).Height(btnSize)
 				}
 				a.zoomControl(c, p, max(.10, a.scale), func(factor float32) {
 					switch factor {
@@ -648,39 +647,34 @@ func (a *workspace) layoutSwitcher(c *ui.Context, p palette, btnSize float32) {
 	})
 }
 
-func (a *workspace) modeSegments(c *ui.Context, p palette, options []segment[workspaceMode], selected workspaceMode, change func(workspaceMode)) {
-	if !a.touchUI() {
-		segments(c, p, options, selected, change)
-		return
+func applyHoverPressBg(b ui.Element, p palette, active bool, baseFg, activeFg ui.Color) ui.Color {
+	fg := baseFg
+	switch {
+	case active:
+		fg = activeFg
+	case b.Pressed():
+		b.Background(p.pressed)
+		fg = p.ink
+	case b.Hovered():
+		b.Background(p.hover)
+		fg = p.ink
 	}
-	ui.Row(c).Height(36).Shrink(0).Padding(3).Gap(2).Radius(9).
-		AlignItems(ui.Center).Background(p.inputBg).Border(1, p.rule).Children(func() {
-		for _, opt := range options {
-			active := opt.value == selected
-			b := ui.ButtonBase(c.Key(opt.title)).Height(28).PaddingX(12).Radius(6).Center().
-				Shrink(0).Label(opt.title).Selected(active).Transition(trColorMicro).
-				OnClick(func() { change(opt.value) })
-			fg := p.quiet
-			if active {
-				fg = p.ink
-			} else if b.Pressed() {
-				b.Background(p.pressed)
-				fg = p.ink
-			} else if b.Hovered() {
-				b.Background(p.hover)
-			}
-			applyPressPose(b, b.Pressed(), false)
-			b.Children(func() {
-				if active {
-					ui.Box(c.Key("seg-pill-mode")).Absolute().Top(0).Bottom(0).Left(0).Right(0).
-						Radius(6).Background(p.elevated).Border(1, p.border).
-						Shadow(0, 1, 2, 0, p.shadowSoft).IgnoreInput(true).
-						Transition(trSegmentPill("workspace-mode"))
-				}
-				ui.Text(c, opt.title).FontSize(12.5).FontWeight(550).TextColor(fg).SingleLine()
-			})
-		}
-	})
+	applyPressPose(b, b.Pressed(), false)
+	return fg
+}
+
+func hoverPressSurface(b ui.Element, p palette, active bool, baseBg, baseBorder, activeBg, activeBorder ui.Color) (bg, border ui.Color) {
+	bg, border = baseBg, baseBorder
+	switch {
+	case active:
+		bg, border = activeBg, activeBorder
+	case b.Pressed():
+		bg = p.pressed
+	case b.Hovered():
+		bg = p.hover
+	}
+	applyPressPose(b, b.Pressed(), false)
+	return bg, border
 }
 
 func (a *workspace) zoomControl(c *ui.Context, p palette, scale float32, action func(float32)) {
@@ -700,15 +694,7 @@ func (a *workspace) zoomControlWithLabels(c *ui.Context, p palette, scale float3
 		zoomBtn := func(key string, icon *ui.SVG, label string, onClick func()) {
 			b := ui.ButtonBase(c.Key(keyPrefix+key)).Size(btnSz, btnSz).Radius(6).Center().
 				Label(label).Tooltip(label).FocusRingColor(p.accent).Transition(trColorMicro).OnClick(onClick)
-			fg := p.secondary
-			if b.Pressed() {
-				b.Background(p.pressed)
-				fg = p.ink
-			} else if b.Hovered() {
-				b.Background(p.hover)
-				fg = p.ink
-			}
-			applyPressPose(b, b.Pressed(), false)
+			fg := applyHoverPressBg(b, p, false, p.secondary, p.ink)
 			b.Children(func() {
 				ui.Icon(c, icon).Size(icSz, icSz).TextColor(fg)
 			})
@@ -716,20 +702,12 @@ func (a *workspace) zoomControlWithLabels(c *ui.Context, p palette, scale float3
 
 		zoomBtn("zoom-out", icMinus, "缩小"+suffix, func() { action(1 / 1.18) })
 		resetLabel := "重置为 100%" + suffix
-		pct := ui.ButtonBase(c.Key(keyPrefix+"zoom-reset")).Height(btnSz).MinWidth(pctW).PaddingX(5).Radius(6).Center().
+		pct := ui.ButtonBase(c.Key(keyPrefix + "zoom-reset")).Height(btnSz).MinWidth(pctW).PaddingX(5).Radius(6).Center().
 			Label(resetLabel).Tooltip(resetLabel).FocusRingColor(p.accent).Transition(trColorMicro).OnClick(func() { action(-1) })
 		prevScale := ui.Local(pct, "prevScale", func() float32 { return scale })
 		down := scale < *prevScale
 		*prevScale = scale
-		pctColor := p.secondary
-		if pct.Pressed() {
-			pct.Background(p.pressed)
-			pctColor = p.ink
-		} else if pct.Hovered() {
-			pct.Background(p.hover)
-			pctColor = p.ink
-		}
-		applyPressPose(pct, pct.Pressed(), false)
+		pctColor := applyHoverPressBg(pct, p, false, p.secondary, p.ink)
 		pct.Children(func() {
 			ui.Text(c, fmt.Sprintf("%d%%", int(scale*100+.5))).FontSize(fontSz).FontWeight(600).
 				FontFeatures("tnum").TextColor(pctColor).SingleLine().ContentTransition(ctNumeric(down))
@@ -740,94 +718,65 @@ func (a *workspace) zoomControlWithLabels(c *ui.Context, p palette, scale float3
 	})
 }
 
-func (a *workspace) splitGrip(c *ui.Context, p palette, width, left, gripSize float32) {
+func (a *workspace) splitGrip(c *ui.Context, p palette, vertical bool, total, pos, gripSize float32) {
 	// The retained gesture lives on the workspace because layout rebuilds on each move.
-	avail := max(1, width-gripSize)
-	minPane := min(float32(195), max(120, avail*.3))
-	minR, maxR := minPane/avail, max(minPane, avail-minPane)/avail
+	avail := max(1, total-gripSize)
+	maxMin, floorMin := float32(195), float32(120)
+	key, pillKey, label, axis := "split-grip", "split-grip-pill", "拖动调整分屏宽度", ui.Horizontal
 	handleW, handleH := float32(3), float32(38)
 	if a.touchUI() {
 		handleW, handleH = 4, 44
 	}
-	grip := ui.Box(c.Key("split-grip")).Width(gripSize).FillHeight().Shrink(0).Center().
-		Background(p.shell).Label("拖动调整分屏宽度").Role(ui.RoleSeparator).
-		Draggable(nil, ui.DraggableOptions{Axis: ui.Horizontal, Bounds: &ui.Rect{}, Rigid: true}).
-		HandleInput(func(ev ui.InputEvent) bool {
-			switch ev.Kind {
-			case ui.InputPointerDown:
-				a.splitDragging = ev.Button == 0
-				a.splitStart, a.splitPointerX = a.splitRatio, left+ev.X
-				return a.splitDragging
-			case ui.InputPointerMove:
-				if a.splitDragging {
-					a.splitRatio = clamp(a.splitStart+(left+ev.X-a.splitPointerX)/avail, minR, maxR)
-					return true
-				}
-			case ui.InputPointerUp:
-				if a.splitDragging {
-					a.splitDragging = false
-					if ev.Canceled {
-						a.splitRatio = a.splitStart
-					} else {
-						next := a.settings
-						next.SplitRatioH = a.splitRatio
-						a.saveSettings(next)
-					}
-					return true
-				}
-			}
-			return false
-		})
-	grip.Children(func() {
-		col := p.border
-		pillScale := float32(1)
-		if a.splitDragging {
-			col = p.accent
-			pillScale = 1.35
-		} else if grip.Hovered() {
-			col = p.secondary
-			pillScale = 1.15
-		}
-		ui.Box(c.Key("split-grip-pill")).Width(handleW).Height(handleH).Radius(handleW / 2).
-			Background(col).Transition(trColorMicro).
-			AnimatePose(ui.Pose{Scale: pillScale}, animControl)
-	})
-}
-
-func (a *workspace) splitGripVertical(c *ui.Context, p palette, height, top, gripSize float32) {
-	avail := max(1, height-gripSize)
-	minPane := min(float32(180), max(90, avail*.3))
+	if vertical {
+		maxMin, floorMin = 180, 90
+		key, pillKey, label, axis = "split-grip-v", "split-grip-v-pill", "拖动调整分屏高度", ui.Vertical
+		handleW, handleH = 44, 4
+	}
+	minPane := min(maxMin, max(floorMin, avail*.3))
 	minR, maxR := minPane/avail, max(minPane, avail-minPane)/avail
-	handleW, handleH := float32(44), float32(4)
-	grip := ui.Box(c.Key("split-grip-v")).FillWidth().Height(gripSize).Shrink(0).Center().
-		Background(p.shell).Label("拖动调整分屏高度").Role(ui.RoleSeparator).
-		Draggable(nil, ui.DraggableOptions{Axis: ui.Vertical, Bounds: &ui.Rect{}, Rigid: true}).
-		HandleInput(func(ev ui.InputEvent) bool {
-			switch ev.Kind {
-			case ui.InputPointerDown:
-				a.splitDragging = ev.Button == 0
-				a.splitStart, a.splitPointerX = a.splitRatio, top+ev.Y
-				return a.splitDragging
-			case ui.InputPointerMove:
-				if a.splitDragging {
-					a.splitRatio = clamp(a.splitStart+(top+ev.Y-a.splitPointerX)/avail, minR, maxR)
-					return true
-				}
-			case ui.InputPointerUp:
-				if a.splitDragging {
-					a.splitDragging = false
-					if ev.Canceled {
-						a.splitRatio = a.splitStart
-					} else {
-						next := a.settings
-						next.SplitRatioH = a.splitRatio
-						a.saveSettings(next)
-					}
-					return true
-				}
+
+	grip := ui.Box(c.Key(key)).Shrink(0).Center().
+		Background(p.shell).Label(label).Role(ui.RoleSeparator).
+		Draggable(nil, ui.DraggableOptions{Axis: axis, Bounds: &ui.Rect{}, Rigid: true})
+	if vertical {
+		grip.FillWidth().Height(gripSize)
+	} else {
+		grip.Width(gripSize).FillHeight()
+	}
+	grip.HandleInput(func(ev ui.InputEvent) bool {
+		delta := ev.X
+		if vertical {
+			delta = ev.Y
+		}
+		switch ev.Kind {
+		case ui.InputPointerDown:
+			a.splitDragging = ev.Button == 0
+			a.splitStart, a.splitPointerX = a.splitRatio, pos+delta
+			return a.splitDragging
+		case ui.InputPointerMove:
+			if a.splitDragging {
+				a.splitRatio = clamp(a.splitStart+(pos+delta-a.splitPointerX)/avail, minR, maxR)
+				return true
 			}
-			return false
-		})
+		case ui.InputPointerUp:
+			if a.splitDragging {
+				a.splitDragging = false
+				if ev.Canceled {
+					a.splitRatio = a.splitStart
+				} else {
+					next := a.settings
+					if vertical {
+						next.SplitRatioV = a.splitRatio
+					} else {
+						next.SplitRatioH = a.splitRatio
+					}
+					a.saveSettings(next)
+				}
+				return true
+			}
+		}
+		return false
+	})
 	grip.Children(func() {
 		col := p.border
 		pillScale := float32(1)
@@ -838,7 +787,7 @@ func (a *workspace) splitGripVertical(c *ui.Context, p palette, height, top, gri
 			col = p.secondary
 			pillScale = 1.15
 		}
-		ui.Box(c.Key("split-grip-v-pill")).Width(handleW).Height(handleH).Radius(handleH / 2).
+		ui.Box(c.Key(pillKey)).Width(handleW).Height(handleH).Radius(min(handleW, handleH)/2).
 			Background(col).Transition(trColorMicro).
 			AnimatePose(ui.Pose{Scale: pillScale}, animControl)
 	})
@@ -1137,19 +1086,16 @@ func (a *workspace) pdfNavigation(c *ui.Context, p palette, count int, navH, wid
 			tocBtn := ui.ButtonBase(c.Key("pdf-toc-btn")).Height(btnH).PaddingX(10).Radius(7).Center().
 				Gap(4).Shrink(0).Label("目录").Selected(a.pdfTOCOpen).FocusRingColor(p.accent).
 				Transition(trColorMicro).OnClick(func() { a.pdfTOCOpen = !a.pdfTOCOpen })
-			fg := p.secondary
-			if a.pdfTOCOpen {
-				tocBtn.Background(p.tint).Border(1, p.tintBorder)
-				fg = p.accent
-			} else if tocBtn.Pressed() {
-				tocBtn.Background(p.pressed).Border(1, p.border)
-				fg = p.ink
-			} else if tocBtn.Hovered() {
-				tocBtn.Background(p.hover).Border(1, p.border)
-				fg = p.ink
-			} else {
-				tocBtn.Background(p.elevated).Border(1, p.rule)
+			fg, bg, bdr := p.secondary, p.elevated, p.rule
+			switch {
+			case a.pdfTOCOpen:
+				fg, bg, bdr = p.accent, p.tint, p.tintBorder
+			case tocBtn.Pressed():
+				fg, bg, bdr = p.ink, p.pressed, p.border
+			case tocBtn.Hovered():
+				fg, bg, bdr = p.ink, p.hover, p.border
 			}
+			tocBtn.Background(bg).Border(1, bdr)
 			applyPressPose(tocBtn, tocBtn.Pressed(), false)
 			tocBtn.Children(func() {
 				ui.Icon(c, icLayers).Size(12.5, 12.5).TextColor(fg)
@@ -1185,24 +1131,15 @@ func (a *workspace) pdfNavigation(c *ui.Context, p palette, count int, navH, wid
 									}
 									a.pdfTOCOpen = false
 								})
-							fg := p.secondary
-							weight := 500
+							fg, weight := p.secondary, 500
 							if entry.Level == 0 {
-								fg = p.ink
-								weight = 600
+								fg, weight = p.ink, 600
 							}
 							if active {
 								row.Background(p.tint)
-								fg = p.accent
 								weight = 600
-							} else if row.Pressed() {
-								row.Background(p.pressed)
-								fg = p.ink
-							} else if row.Hovered() {
-								row.Background(p.hover)
-								fg = p.ink
 							}
-							applyPressPose(row, row.Pressed(), false)
+							fg = applyHoverPressBg(row, p, active, fg, p.accent)
 							row.Children(func() {
 								ui.Text(c, entry.Title).FontSize(12.5).FontWeight(weight).
 									TextColor(fg).SingleLine().Ellipsis("…").Grow(1).MinWidth(0)
@@ -1338,16 +1275,8 @@ func (a *workspace) pdfSearchPanel(c *ui.Context, p palette, width float32) {
 					row := ui.ButtonBase(c.Key(fmt.Sprintf("pdf-hit-%d", idx))).
 						FillWidth().Height(28).PaddingX(8).Radius(6).Gap(8).AlignItems(ui.Center).
 						Transition(trColorMicro).OnClick(func() { a.jumpPDFSearchHit(idx) })
-					bg, border := p.canvas, p.rule
-					if active {
-						bg, border = p.selectedBg, p.accent.Alpha(.45)
-					} else if row.Pressed() {
-						bg = p.pressed
-					} else if row.Hovered() {
-						bg = p.hover
-					}
+					bg, border := hoverPressSurface(row, p, active, p.canvas, p.rule, p.selectedBg, p.accent.Alpha(.45))
 					row.Background(bg).Border(1, border)
-					applyPressPose(row, row.Pressed(), false)
 					row.Children(func() {
 						ui.Text(c, fmt.Sprintf("P.%d", hit.Page+1)).FontSize(11).FontWeight(600).
 							TextColor(p.accent).SingleLine().Shrink(0)
@@ -1362,7 +1291,7 @@ func (a *workspace) pdfSearchPanel(c *ui.Context, p palette, width float32) {
 
 func (a *workspace) pdfThumbRail(c *ui.Context, p palette, railW, railH float32, count int) {
 	const (
-		itemH  = float32(132)
+		itemH   = float32(132)
 		itemGap = float32(6)
 		stride  = itemH + itemGap
 	)
@@ -1387,16 +1316,8 @@ func (a *workspace) pdfThumbRail(c *ui.Context, p palette, railW, railH float32,
 					FillWidth().Height(itemH).Shrink(0).Padding(4).Radius(8).
 					Label(fmt.Sprintf("第 %d 页", pageIdx+1)).Transition(trColorMicro).
 					OnClick(func() { a.setPDFPage(pageIdx) })
-				border, bg := p.rule, p.canvas
-				if active {
-					border, bg = p.accent, p.selectedBg
-				} else if cell.Pressed() {
-					bg = p.pressed
-				} else if cell.Hovered() {
-					bg = p.hover
-				}
+				bg, border := hoverPressSurface(cell, p, active, p.canvas, p.rule, p.selectedBg, p.accent)
 				cell.Background(bg).Border(1.5, border)
-				applyPressPose(cell, cell.Pressed(), false)
 				cell.Children(func() {
 					ui.Column(c).Fill().Center().Gap(3).Children(func() {
 						ui.Box(c).Grow(1).MinHeight(0).FillWidth().Radius(5).Clip().

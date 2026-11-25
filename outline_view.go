@@ -92,11 +92,12 @@ func (a *workspace) outlineView(c *ui.Context, p palette, width, height float32)
 			badgePill(c, p, fmt.Sprintf("%d 条笔记", len(items)))
 			ui.Box(c).Grow(1).MinWidth(0)
 			if a.hasExpandableBranches() {
-				if a.hasCollapsedBranches() {
-					pillButton(c, p, "全部展开", icLayers, false, a.editing(), func() { a.setAllExpanded(true) })
-				} else {
-					pillButton(c, p, "全部收起", icLayers, false, a.editing(), func() { a.setAllExpanded(false) })
+				collapsed := a.hasCollapsedBranches()
+				label := "全部收起"
+				if collapsed {
+					label = "全部展开"
 				}
+				pillButton(c, p, label, icLayers, false, a.editing(), func() { a.setAllExpanded(collapsed) })
 			}
 		})
 
@@ -195,7 +196,7 @@ func (a *workspace) outlineCard(c *ui.Context, p palette, item outlineItem, stre
 					ui.Box(c).Size(7, 7).Radius(99).Background(ct.accent).Margin(0, 2, 0, 4).Shrink(0)
 				}
 
-				openHeader := ui.ButtonBase(c.Key("open-"+item.id)).Grow(1).MinWidth(0).
+				openHeader := ui.ButtonBase(c.Key("open-" + item.id)).Grow(1).MinWidth(0).
 					AlignItems(ui.Center).Gap(8).Label(title).
 					Disabled(a.editing()).FocusRingColor(p.accent).
 					OnClick(func() { a.openNote(item.id) })
@@ -242,27 +243,21 @@ func (a *workspace) outlineCard(c *ui.Context, p palette, item outlineItem, stre
 					badgePill(c, p, fmt.Sprintf("%d 项", len(kids)))
 				}
 				if !a.editing() {
-					selectForAction := func() {
-						a.selected = item.id
-						a.activeTrail = a.tree.trail(item.id)
+					selectAnd := func(fn func()) func() {
+						return func() {
+							a.selected = item.id
+							a.activeTrail = a.tree.trail(item.id)
+							fn()
+						}
 					}
 					actSz := float32(26)
 					if a.touchUI() {
 						actSz = 32
 					}
-					designToolbarButton(c, p, icEdit, "编辑笔记", actSz, false, a.busy, func() {
-						selectForAction()
-						a.startEditNote()
-					})
-					designToolbarButton(c, p, icPlus, "新建子笔记", actSz, false, a.busy, func() {
-						selectForAction()
-						a.startAddChild()
-					})
+					designToolbarButton(c, p, icEdit, "编辑笔记", actSz, false, a.busy, selectAnd(a.startEditNote))
+					designToolbarButton(c, p, icPlus, "新建子笔记", actSz, false, a.busy, selectAnd(a.startAddChild))
 					if item.id != "" {
-						iconButton(c, p, icSettingDelete, "删除笔记", false, a.busy, func() {
-							selectForAction()
-							a.confirmDeleteNote()
-						})
+						iconButton(c, p, icSettingDelete, "删除笔记", false, a.busy, selectAnd(a.confirmDeleteNote))
 					}
 				}
 			})
@@ -270,7 +265,7 @@ func (a *workspace) outlineCard(c *ui.Context, p palette, item outlineItem, stre
 			if hasBody {
 				ui.Box(c).FillWidth().Height(1).Background(ct.border.Alpha(.45))
 				if a.reciteMode && !a.revealedNotes[item.id] {
-					occlude := ui.ButtonBase(c.Key("orec-"+item.id)).FillWidth().Padding(14).
+					occlude := ui.ButtonBase(c.Key("orec-" + item.id)).FillWidth().Padding(14).
 						Center().Background(p.tint.Alpha(.7)).Label("点击揭晓内容").
 						Transition(trCrossfade).
 						OnClick(func() {
@@ -298,7 +293,7 @@ func (a *workspace) outlineCard(c *ui.Context, p palette, item outlineItem, stre
 						}
 						imgBtn := ui.ButtonBase(c.Key("oimg-"+ref)).AlignSelf(ui.Start).Radius(8).
 							Padding(8).Background(ui.Hex("#ffffff")).Border(1, ct.border.Alpha(.5)).
-							Transition(trColorMicro).Label("放大"+title+"的附图").OnClick(func() { a.preview = ref })
+							Transition(trColorMicro).Label("放大" + title + "的附图").OnClick(func() { a.preview = ref })
 						if imgBtn.Pressed() {
 							imgBtn.Border(1, p.accent)
 						} else if imgBtn.Hovered() {
@@ -306,9 +301,9 @@ func (a *workspace) outlineCard(c *ui.Context, p palette, item outlineItem, stre
 						}
 						applyPressPose(imgBtn, imgBtn.Pressed(), false)
 						imgBtn.Children(func() {
-						ui.Box(c).Size(dispW, dispH).Draw(func(p *ui.Painter, rect ui.Rect) {
-							a.paintMediaThumbnail(p, rect, ref)
-						})
+							ui.Box(c).Size(dispW, dispH).Draw(func(p *ui.Painter, rect ui.Rect) {
+								a.paintMediaThumbnail(p, rect, ref)
+							})
 						})
 						return true
 					}
@@ -322,29 +317,25 @@ func (a *workspace) outlineCard(c *ui.Context, p palette, item outlineItem, stre
 							TextColor(p.ink).Selectable()
 					}
 					renderedBlocks := 0
-					for bi, blk := range n.Blocks {
-						if blk.Image != "" {
-						if w, h := a.imageDims(blk.Image); w <= 0 || h <= 0 {
-								continue
-							}
-							if renderedBlocks > 0 && useBlocks && len(n.Blocks) > 1 {
-								ui.Box(c.Key(fmt.Sprintf("odiv-%d", bi))).FillWidth().Height(1).
-									Shrink(0).Background(ct.border.Alpha(.38))
-							}
-							if renderOutlineImg(blk.Image) {
-								renderedBlocks++
-							}
-							continue
-						}
-						if !useBlocks || blockPlainText(blk) == "" {
-							continue
-						}
-						if renderedBlocks > 0 && len(n.Blocks) > 1 {
+					addBlockDivider := func(bi int) {
+						if renderedBlocks > 0 && useBlocks && len(n.Blocks) > 1 {
 							ui.Box(c.Key(fmt.Sprintf("odiv-%d", bi))).FillWidth().Height(1).
 								Shrink(0).Background(ct.border.Alpha(.38))
 						}
-						renderRichBlock(c.Key(fmt.Sprintf("oblk-%d", bi)), p, blk, blk.Text, 13.5, 1.62, true)
-						renderedBlocks++
+					}
+					for bi, blk := range n.Blocks {
+						if blk.Image != "" {
+							if w, h := a.imageDims(blk.Image); w > 0 && h > 0 {
+								addBlockDivider(bi)
+								if renderOutlineImg(blk.Image) {
+									renderedBlocks++
+								}
+							}
+						} else if useBlocks && blockPlainText(blk) != "" {
+							addBlockDivider(bi)
+							renderRichBlock(c.Key(fmt.Sprintf("oblk-%d", bi)), p, blk, blk.Text, 13.5, 1.62, true)
+							renderedBlocks++
+						}
 					}
 					if len(n.Tags) > 0 {
 						tagPillsRowAction(c, p, n.Tags, a.applyTagFilter)
@@ -353,10 +344,6 @@ func (a *workspace) outlineCard(c *ui.Context, p palette, item outlineItem, stre
 			}
 		})
 	})
-}
-
-func tagPillsRow(c *ui.Context, p palette, tags []string) {
-	tagPillsRowAction(c, p, tags, nil)
 }
 
 func tagPillsRowAction(c *ui.Context, p palette, tags []string, onTag func(string)) {
@@ -370,20 +357,19 @@ func tagPillsRowAction(c *ui.Context, p palette, tags []string, onTag func(strin
 				continue
 			}
 			label := "#" + clean
+			key := c.Key(fmt.Sprintf("tag-%d", i))
+			var pill ui.Element
 			if onTag != nil {
-				btn := ui.ButtonBase(c.Key(fmt.Sprintf("tag-%d", i))).Height(21).Padding(0, 8).Radius(99).
-					Center().Shrink(0).Background(p.tint).Border(1, p.tintBorder.Alpha(.7)).
-					Transition(trColorMicro).Label(label).Tooltip("按标签筛选").OnClick(func() { onTag(clean) })
-				applyPressPose(btn, btn.Pressed(), false)
-				btn.Children(func() {
-					ui.Text(c, label).FontSize(11).FontWeight(550).TextColor(p.accent).SingleLine()
-				})
+				pill = ui.ButtonBase(key).Transition(trColorMicro).Label(label).Tooltip("按标签筛选").
+					OnClick(func() { onTag(clean) })
+				applyPressPose(pill, pill.Pressed(), false)
 			} else {
-				ui.Row(c.Key(fmt.Sprintf("tag-%d", i))).Height(21).Padding(0, 8).Radius(99).
-					Center().Shrink(0).Background(p.tint).Border(1, p.tintBorder.Alpha(.7)).Children(func() {
-					ui.Text(c, label).FontSize(11).FontWeight(550).TextColor(p.accent).SingleLine()
-				})
+				pill = ui.Row(key)
 			}
+			pill.Height(21).Padding(0, 8).Radius(99).Center().Shrink(0).
+				Background(p.tint).Border(1, p.tintBorder.Alpha(.7)).Children(func() {
+				ui.Text(c, label).FontSize(11).FontWeight(550).TextColor(p.accent).SingleLine()
+			})
 		}
 	})
 }
